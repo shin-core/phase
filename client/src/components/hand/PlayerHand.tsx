@@ -14,34 +14,12 @@ import { dispatchAction } from "../../game/dispatch.ts";
 import type { ManaCost, ObjectId } from "../../adapter/types.ts";
 import { collectObjectActions } from "../../viewmodel/cardActionChoice.ts";
 import { DRAG_PLAY_THRESHOLD } from "../../hooks/useDragToCast.ts";
+import { computeHandInsertionSlot } from "./handInsertionSlot.ts";
 
 function getHandOverlap(handSize: number): string {
   if (handSize <= 5) return "calc(var(--card-w) * -0.25)";
   if (handSize <= 7) return "calc(var(--card-w) * -0.45)";
   return "calc(var(--card-w) * -0.6)";
-}
-
-interface HandSlotRect {
-  objectId: number;
-  left: number;
-  width: number;
-}
-
-export function computeHandInsertionSlot(
-  cards: HandSlotRect[],
-  clientX: number,
-  draggingId: number,
-): number | null {
-  if (cards.length === 0) return null;
-
-  const remaining = cards.filter((card) => card.objectId !== draggingId);
-  for (let slot = 0; slot < remaining.length; slot++) {
-    const card = remaining[slot];
-    const center = card.left + card.width / 2;
-    if (clientX < center) return slot;
-  }
-
-  return remaining.length;
 }
 
 export function PlayerHand() {

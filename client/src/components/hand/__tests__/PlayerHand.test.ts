@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { computeHandInsertionSlot } from "../PlayerHand.tsx";
+import { computeHandInsertionSlot } from "../handInsertionSlot.ts";
 
 const cardRects = [
   { objectId: 1, left: 0, width: 100 },
