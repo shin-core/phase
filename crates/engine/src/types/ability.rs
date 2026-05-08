@@ -1969,6 +1969,10 @@ pub enum PlayerScope {
     /// "enchanted creature gets +1/+1 for each card in its controller's
     /// hand", where "its" refers to the enchanted creature, not the Aura.
     RecipientController,
+    /// CR 508.1b + CR 603.4: The defending player for the source creature's
+    /// attack. Used by attack-trigger intervening-if quantities such as
+    /// "no opponent has more life than that player."
+    DefendingPlayer,
 }
 
 /// Scope selector for object-axis quantities (Round Π-5). Picks WHICH object

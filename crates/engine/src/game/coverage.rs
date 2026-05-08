@@ -679,6 +679,7 @@ fn fmt_player_scope(scope: PlayerScope) -> String {
         PlayerScope::ScopedPlayer => "scoped player".to_string(),
         PlayerScope::Target => "target player".to_string(),
         PlayerScope::RecipientController => "recipient's controller".to_string(),
+        PlayerScope::DefendingPlayer => "defending player".to_string(),
         PlayerScope::Opponent { aggregate } => {
             format!("{} of opponents", fmt_aggregate_function(aggregate))
         }

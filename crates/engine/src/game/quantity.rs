@@ -1823,6 +1823,9 @@ where
                 .and_then(|pid| state.players.iter().find(|p| p.id == pid))
                 .map_or(0, &mut extract)
         }
+        PlayerScope::DefendingPlayer => defending_player_for_quantity_context(state, ctx)
+            .and_then(|pid| state.players.iter().find(|p| p.id == pid))
+            .map_or(0, &mut extract),
         PlayerScope::Opponent { aggregate } => aggregate_over_players(
             state.players.iter().filter(|p| p.id != controller),
             aggregate,
@@ -1832,6 +1835,43 @@ where
             aggregate_over_players(state.players.iter(), aggregate, &mut extract)
         }
     }
+}
+
+fn defending_player_for_quantity_context(
+    state: &GameState,
+    ctx: QuantityContext,
+) -> Option<PlayerId> {
+    crate::game::combat::defending_player_for_attacker(state, ctx.source)
+        .or_else(|| defending_player_from_event(state.current_trigger_event.as_ref(), ctx.source))
+        .or_else(|| defending_player_from_event(detection_trigger_event().as_ref(), ctx.source))
+}
+
+fn defending_player_from_event(
+    event: Option<&crate::types::events::GameEvent>,
+    source_id: ObjectId,
+) -> Option<PlayerId> {
+    let crate::types::events::GameEvent::AttackersDeclared {
+        defending_player,
+        attacks,
+        ..
+    } = event?
+    else {
+        return None;
+    };
+    attacks
+        .iter()
+        .find_map(|(attacker_id, target)| {
+            if *attacker_id == source_id {
+                match target {
+                    crate::game::combat::AttackTarget::Player(pid) => Some(*pid),
+                    crate::game::combat::AttackTarget::Planeswalker(_)
+                    | crate::game::combat::AttackTarget::Battle(_) => None,
+                }
+            } else {
+                None
+            }
+        })
+        .or(Some(*defending_player))
 }
 
 /// CR 107.3e: Reduce a player iterator to a single i32 by aggregate function.

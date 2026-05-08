@@ -8875,6 +8875,75 @@ mod dedup_regression_tests {
         );
     }
 
+    #[test]
+    fn defending_player_life_quantity_reads_attack_event_player_target() {
+        use crate::game::combat::AttackTarget;
+        use crate::types::ability::{
+            AggregateFunction, Comparator, PlayerScope, QuantityExpr, QuantityRef, TriggerCondition,
+        };
+        use crate::types::format::FormatConfig;
+
+        let mut state = GameState::new(FormatConfig::commander(), 3, 42);
+        let controller = PlayerId(0);
+        let attacked_player = PlayerId(1);
+        let other_opponent = PlayerId(2);
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            controller,
+            "Commander".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        state.players[0].life = 40;
+        state.players[1].life = 35;
+        state.players[2].life = 40;
+
+        let condition = TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::Opponent {
+                        aggregate: AggregateFunction::Max,
+                    },
+                },
+            },
+            comparator: Comparator::LE,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::DefendingPlayer,
+                },
+            },
+        };
+        let event = GameEvent::AttackersDeclared {
+            attacker_ids: vec![attacker],
+            defending_player: attacked_player,
+            attacks: vec![(attacker, AttackTarget::Player(attacked_player))],
+        };
+
+        assert!(
+            !check_trigger_condition(&state, &condition, controller, Some(attacker), Some(&event)),
+            "another opponent with more life than the attacked player must fail Guild Artisan's intervening-if"
+        );
+
+        state
+            .players
+            .iter_mut()
+            .find(|p| p.id == other_opponent)
+            .unwrap()
+            .life = 35;
+        assert!(
+            check_trigger_condition(&state, &condition, controller, Some(attacker), Some(&event)),
+            "condition must pass when no opponent has more life than the attacked player"
+        );
+    }
+
     /// CR 603.4 + CR 109.3: Valakut-style "if you control at least five other
     /// Mountains" must exclude the triggering (newly-entered) Mountain from the
     /// count. With exactly 5 Mountains on the battlefield where one of them is

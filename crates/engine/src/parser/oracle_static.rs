@@ -4193,19 +4193,46 @@ fn parse_commander_subject_filter(subject: &str) -> Option<TargetFilter> {
     let (i, other) = opt(tag::<_, _, VE>("other ")).parse(i).ok()?;
     let has_other = other.is_some();
 
-    // The bare commander token (singular or plural).
+    // The bare commander token (singular or plural), optionally as an adjective
+    // on a creature subject ("commander creatures").
     let (i, _) = alt((tag::<_, _, VE>("commanders"), tag::<_, _, VE>("commander")))
         .parse(i)
         .ok()?;
+    let (i, is_creature_subject) = alt((
+        value(true, tag::<_, _, VE>(" creatures")),
+        value(true, tag::<_, _, VE>(" creature")),
+        value(false, tag::<_, _, VE>("")),
+    ))
+    .parse(i)
+    .ok()?;
 
-    // Optional controller suffix.
-    let (i, controller) = alt((
-        value(Some(ControllerRef::You), tag::<_, _, VE>(" you control")),
+    // Optional ownership/controller suffix. Ownership composes as a property
+    // because CR 108.3 ownership and CR 108.4 control are distinct axes.
+    let (i, (controller, owned)) = alt((
         value(
-            Some(ControllerRef::Opponent),
-            tag::<_, _, VE>(" your opponents control"),
+            (
+                Some(ControllerRef::You),
+                Some(FilterProp::Owned {
+                    controller: ControllerRef::You,
+                }),
+            ),
+            tag::<_, _, VE>(" you own and control"),
         ),
-        value(None, tag::<_, _, VE>("")),
+        value((Some(ControllerRef::You), None), tag(" you control")),
+        value(
+            (Some(ControllerRef::Opponent), None),
+            tag(" your opponents control"),
+        ),
+        value(
+            (
+                None,
+                Some(FilterProp::Owned {
+                    controller: ControllerRef::You,
+                }),
+            ),
+            tag(" you own"),
+        ),
+        value((None, None), tag("")),
     ))
     .parse(i)
     .ok()?;
@@ -4219,7 +4246,14 @@ fn parse_commander_subject_filter(subject: &str) -> Option<TargetFilter> {
     if has_other {
         props.push(FilterProp::Another);
     }
-    let mut typed = TypedFilter::permanent().properties(props);
+    if let Some(owned) = owned {
+        props.push(owned);
+    }
+    let mut typed = if is_creature_subject {
+        TypedFilter::creature().properties(props)
+    } else {
+        TypedFilter::permanent().properties(props)
+    };
     if let Some(c) = controller {
         typed = typed.controller(c);
     }
@@ -6125,20 +6159,24 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     };
     let tp = stripped_tp;
     let text_stripped = tp.original;
-    let lower = tp.lower;
+    let unquoted_text = strip_quoted_segments(text_stripped);
+    let unquoted_lower = unquoted_text.to_lowercase();
+    let unquoted_tp = TextPair::new(&unquoted_text, &unquoted_lower);
     let mut modifications = Vec::new();
 
-    if nom_primitives::scan_contains(tp.lower, "lose all abilities")
-        || nom_primitives::scan_contains(tp.lower, "loses all abilities")
-        || nom_primitives::scan_contains(tp.lower, "lose all other abilities")
-        || nom_primitives::scan_contains(tp.lower, "loses all other abilities")
+    if nom_primitives::scan_contains(unquoted_tp.lower, "lose all abilities")
+        || nom_primitives::scan_contains(unquoted_tp.lower, "loses all abilities")
+        || nom_primitives::scan_contains(unquoted_tp.lower, "lose all other abilities")
+        || nom_primitives::scan_contains(unquoted_tp.lower, "loses all other abilities")
     {
         modifications.push(ContinuousModification::RemoveAllAbilities);
     }
 
-    if let Some(dynamic_mods) = parse_dynamic_for_each_pt_modifications(text_stripped) {
+    if let Some(dynamic_mods) = parse_dynamic_for_each_pt_modifications(&unquoted_text) {
         modifications.extend(dynamic_mods);
-    } else if let Some(rest_tp) = nom_tag_tp(&tp, "gets ").or_else(|| nom_tag_tp(&tp, "get ")) {
+    } else if let Some(rest_tp) =
+        nom_tag_tp(&unquoted_tp, "gets ").or_else(|| nom_tag_tp(&unquoted_tp, "get "))
+    {
         let after = rest_tp.original.trim();
         if let Some((p, t)) = parse_pt_mod(after) {
             modifications.push(ContinuousModification::AddPower { value: p });
@@ -6150,7 +6188,7 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     // toughness-combat-damage rule to the same affected object as a P/T
     // modification ("Enchanted creature gets +0/+2 and assigns...").
     if nom_primitives::scan_contains(
-        lower,
+        unquoted_lower.as_str(),
         "assigns combat damage equal to its toughness rather than its power",
     ) {
         modifications.push(ContinuousModification::AssignDamageFromToughness);
@@ -6158,7 +6196,9 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
 
     // CR 613.4c: Scan for "get +X/+X" / "gets +X/+X" anywhere in the text
     // for dynamic P/T modification (e.g., Craterhoof Behemoth)
-    if let Some(dynamic_mods) = parse_dynamic_pt_in_text(lower, where_x_expression.as_deref()) {
+    if let Some(dynamic_mods) =
+        parse_dynamic_pt_in_text(&unquoted_lower, where_x_expression.as_deref())
+    {
         modifications.extend(dynamic_mods);
     }
 
@@ -6166,18 +6206,18 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     // at layer 7b. Checked before the fixed-literal parser so X-bearing patterns
     // are not mis-parsed as literal integers.
     if let Some((power, toughness)) =
-        parse_base_pt_dynamic(text_stripped, where_x_expression.as_deref())
+        parse_base_pt_dynamic(&unquoted_text, where_x_expression.as_deref())
     {
         modifications.push(ContinuousModification::SetPowerDynamic { value: power });
         modifications.push(ContinuousModification::SetToughnessDynamic { value: toughness });
-    } else if let Some((power, toughness)) = parse_base_pt_mod(text_stripped) {
+    } else if let Some((power, toughness)) = parse_base_pt_mod(&unquoted_text) {
         modifications.push(ContinuousModification::SetPower { value: power });
         modifications.push(ContinuousModification::SetToughness { value: toughness });
     }
-    if let Some(power) = parse_base_power_mod(text_stripped) {
+    if let Some(power) = parse_base_power_mod(&unquoted_text) {
         modifications.push(ContinuousModification::SetPower { value: power });
     }
-    if let Some(toughness) = parse_base_toughness_mod(text_stripped) {
+    if let Some(toughness) = parse_base_toughness_mod(&unquoted_text) {
         modifications.push(ContinuousModification::SetToughness { value: toughness });
     }
 
@@ -6185,17 +6225,18 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
         modifications.push(modification);
     }
 
-    if let Some(additive_modifications) = parse_additive_type_clause_modifications(text_stripped) {
+    if let Some(additive_modifications) = parse_additive_type_clause_modifications(&unquoted_text) {
         modifications.extend(additive_modifications);
     }
 
     // CR 702: Guard "can't have or gain [keyword]" from extract_keyword_clause —
     // "have" inside "can't have" must NOT produce AddKeyword.
-    if nom_primitives::scan_contains(lower, "can't have")
-        || nom_primitives::scan_contains(lower, "can't have or gain")
+    if nom_primitives::scan_contains(&unquoted_lower, "can't have")
+        || nom_primitives::scan_contains(&unquoted_lower, "can't have or gain")
     {
         // Parse the keyword from "can't have or gain [keyword]" / "can't have [keyword]"
-        let stripped_lower = lower.strip_suffix('.').unwrap_or(lower);
+        // allow-noncombinator: punctuation cleanup after parser dispatch, not dispatch itself.
+        let stripped_lower = unquoted_lower.strip_suffix('.').unwrap_or(&unquoted_lower);
         let cant_text = if let Ok((_, (_, after))) =
             nom_primitives::split_once_on(stripped_lower, "can't have or gain ")
         {
@@ -6216,7 +6257,7 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
                 // It will be handled at the static definition level.
             }
         }
-    } else if let Some(keyword_text) = extract_keyword_clause(text_stripped) {
+    } else if let Some(keyword_text) = extract_keyword_clause(&unquoted_text) {
         for part in split_keyword_list(keyword_text.trim().trim_end_matches('.')) {
             let part_trimmed = part.trim().trim_end_matches('.');
             let part_lower = part_trimmed.to_lowercase();
@@ -6251,7 +6292,7 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     }
 
     // CR 702: "lose [keyword]" / "loses [keyword]" — keyword removal.
-    if let Some(keyword_text) = extract_lose_keyword_clause(text_stripped) {
+    if let Some(keyword_text) = extract_lose_keyword_clause(&unquoted_text) {
         for part in split_keyword_list(keyword_text.trim().trim_end_matches('.')) {
             if let Some(kw) = map_keyword(part.trim().trim_end_matches('.')) {
                 modifications.push(ContinuousModification::RemoveKeyword { keyword: kw });
@@ -6264,9 +6305,41 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     // animation type-sequence combinator so one CR-205 type-line decomposes
     // into one AddType/AddSubtype modification per token (not a single
     // whole-phrase AddSubtype string).
-    modifications.extend(parse_becomes_type_addition_modifications(&tp));
+    modifications.extend(parse_becomes_type_addition_modifications(&unquoted_tp));
 
     modifications
+}
+
+fn strip_quoted_segments(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut in_quote = false;
+    for ch in text.chars() {
+        if ch == '"' {
+            if !in_quote {
+                remove_trailing_quote_connector(&mut output);
+            }
+            in_quote = !in_quote;
+            output.push(' ');
+        } else if in_quote {
+            output.push(' ');
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn remove_trailing_quote_connector(text: &mut String) {
+    let trimmed_len = text.trim_end().len();
+    text.truncate(trimmed_len);
+    for connector in [" and", " or"] {
+        if text.ends_with(connector) {
+            let new_len = text.len() - connector.len();
+            text.truncate(new_len);
+            break;
+        }
+    }
+    text.push(' ');
 }
 
 /// CR 613.4c: Scan text for "get(s) +X/+X" and resolve X via where_x_expression.
@@ -15621,6 +15694,117 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_commander_creatures_you_own_grant_attack_trigger() {
+        use crate::types::ability::{Effect, TriggerCondition};
+        use crate::types::triggers::{AttackTargetFilter, TriggerMode};
+
+        let def = parse_static_line(
+            "Commander creatures you own have \"Whenever this creature attacks a player, if no opponent has more life than that player, you create two Treasure tokens.\"",
+        )
+        .expect("Guild Artisan granted trigger should parse");
+
+        match &def.affected {
+            Some(TargetFilter::Typed(tf)) => {
+                assert!(tf.type_filters.contains(&TypeFilter::Creature));
+                assert!(tf.properties.contains(&FilterProp::IsCommander));
+                assert!(tf.properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::You,
+                }));
+                assert_eq!(tf.controller, None);
+            }
+            other => panic!("expected Typed filter, got {other:?}"),
+        }
+
+        match def.modifications.as_slice() {
+            [ContinuousModification::GrantTrigger { trigger }] => {
+                assert_eq!(trigger.mode, TriggerMode::Attacks);
+                assert_eq!(trigger.valid_card, Some(TargetFilter::SelfRef));
+                assert_eq!(
+                    trigger.attack_target_filter,
+                    Some(AttackTargetFilter::Player)
+                );
+                match trigger.condition.as_ref() {
+                    Some(TriggerCondition::QuantityComparison {
+                        comparator: Comparator::LE,
+                        rhs:
+                            QuantityExpr::Ref {
+                                qty:
+                                    QuantityRef::LifeTotal {
+                                        player: PlayerScope::DefendingPlayer,
+                                    },
+                            },
+                        ..
+                    }) => {}
+                    other => panic!("expected defending-player life condition, got {other:?}"),
+                }
+                let execute = trigger.execute.as_ref().expect("trigger must have effect");
+                match execute.effect.as_ref() {
+                    Effect::Token { name, count, .. } => {
+                        assert_eq!(name, "Treasure");
+                        assert_eq!(*count, QuantityExpr::Fixed { value: 2 });
+                    }
+                    other => panic!("expected Treasure token creation, got {other:?}"),
+                }
+            }
+            other => panic!("expected single GrantTrigger modification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_initiative_background_attack_trigger_cluster() {
+        use crate::types::ability::{Effect, TriggerCondition};
+
+        let cases = [
+            "Commander creatures you own have \"Whenever this creature attacks a player, if no opponent has more life than that player, put a +1/+1 counter on this creature. It gains deathtouch and indestructible until end of turn.\"",
+            "Commander creatures you own have \"Whenever this creature attacks a player, if no opponent has more life than that player, you create two Treasure tokens.\"",
+            "Commander creatures you own have \"Whenever this creature attacks a player, if no opponent has more life than that player, another target creature you control gets +X/+X until end of turn, where X is this creature's power.\"",
+            "Commander creatures you own have \"Whenever this creature attacks a player, if no opponent has more life than that player, this creature can't be blocked this turn.\"",
+            "Commander creatures you own have \"Whenever this creature attacks a player, if no opponent has more life than that player, for each opponent, create a 1/1 white Soldier creature token that's tapped and attacking that opponent.\"",
+        ];
+
+        for text in cases {
+            let def = parse_static_line(text).expect("initiative Background should parse");
+            match def.modifications.as_slice() {
+                [ContinuousModification::GrantTrigger { trigger }] => {
+                    assert!(matches!(
+                        trigger.condition,
+                        Some(TriggerCondition::QuantityComparison {
+                            comparator: Comparator::LE,
+                            ..
+                        })
+                    ));
+                    let execute = trigger.execute.as_ref().expect("trigger must have effect");
+                    assert!(
+                        !matches!(execute.effect.as_ref(), Effect::Unimplemented { .. }),
+                        "granted trigger effect must be implemented for {text}"
+                    );
+                }
+                other => panic!("expected single GrantTrigger modification, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_quoted_grant_preserves_outer_keyword_only() {
+        let def = parse_static_line(
+            "Commander creatures you own have menace and \"This creature gets +X/+0, where X is the number of creature cards in your graveyard.\"",
+        )
+        .expect("Criminal Past-style mixed keyword and quoted ability should parse");
+
+        assert_eq!(def.modifications.len(), 2);
+        assert!(def.modifications.iter().any(|modification| matches!(
+            modification,
+            ContinuousModification::AddKeyword {
+                keyword: Keyword::Menace
+            }
+        )));
+        assert!(def.modifications.iter().any(|modification| matches!(
+            modification,
+            ContinuousModification::GrantAbility { .. }
+        )));
+    }
+
     // CR 903.3d: parse_commander_subject_filter as a raw subject helper.
     // Unblocks subject-continuous-static dispatch (the secondary path).
     #[test]
@@ -15653,6 +15837,20 @@ mod tests {
             TargetFilter::Typed(tf) => {
                 assert_eq!(tf.controller, None);
                 assert!(tf.properties.contains(&FilterProp::IsCommander));
+            }
+            _ => panic!("expected Typed"),
+        }
+
+        let f = parse_commander_subject_filter("commander creatures you own")
+            .expect("commander creatures you own");
+        match f {
+            TargetFilter::Typed(tf) => {
+                assert_eq!(tf.controller, None);
+                assert!(tf.type_filters.contains(&TypeFilter::Creature));
+                assert!(tf.properties.contains(&FilterProp::IsCommander));
+                assert!(tf.properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::You,
+                }));
             }
             _ => panic!("expected Typed"),
         }

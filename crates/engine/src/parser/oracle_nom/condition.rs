@@ -60,6 +60,7 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
         parse_control_conditions,
         parse_opponent_poison_conditions,
         parse_defending_player_comparison_conditions,
+        parse_no_opponent_comparison_conditions,
         parse_opponent_comparison_conditions,
         parse_life_conditions,
         parse_zone_conditions,
@@ -2823,6 +2824,36 @@ fn parse_defending_player_comparison_conditions(input: &str) -> OracleResult<'_,
     ))
 }
 
+/// Parse "no opponent has more life than that/defending player".
+///
+/// This is the negated form of the cross-player life comparison used on attack
+/// triggers such as Guild Artisan. The referenced player is the defending
+/// player from the attack event, so the condition composes as:
+/// max(opponent life) <= defending-player life.
+fn parse_no_opponent_comparison_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("no opponent ").parse(input)?;
+    let (rest, _) = tag("has more life than ").parse(rest)?;
+    let (rest, _) = alt((tag("that player"), tag("defending player"))).parse(rest)?;
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::Opponent {
+                        aggregate: AggregateFunction::Max,
+                    },
+                },
+            },
+            comparator: Comparator::LE,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::DefendingPlayer,
+                },
+            },
+        },
+    ))
+}
+
 /// Parse "an opponent controls more [type] than you" → QuantityComparison.
 /// Also handles "an opponent has more life/cards in hand than you".
 ///
@@ -4539,6 +4570,38 @@ mod tests {
                     },
             } => {}
             other => panic!("expected OpponentLifeTotal GT LifeTotal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_no_opponent_has_more_life_than_that_player() {
+        let (rest, c) =
+            parse_inner_condition("no opponent has more life than that player").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::LifeTotal {
+                                player:
+                                    PlayerScope::Opponent {
+                                        aggregate: AggregateFunction::Max,
+                                    },
+                            },
+                    },
+                comparator: Comparator::LE,
+                rhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::LifeTotal {
+                                player: PlayerScope::DefendingPlayer,
+                            },
+                    },
+            } => {}
+            other => {
+                panic!("expected OpponentLifeTotal LE DefendingPlayerLifeTotal, got {other:?}")
+            }
         }
     }
 
