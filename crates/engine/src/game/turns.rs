@@ -1058,27 +1058,37 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                     continue;
                 }
                 // CR 503.1a: "At the beginning of [your] upkeep" triggers fire here.
-                if process_phase_triggers(state) {
-                    return WaitingFor::Priority {
-                        player: state.active_player,
-                    };
-                }
-                advance_phase(state, events);
+                process_phase_triggers(state);
+                // CR 503.2 + CR 117.1c: The active player ALWAYS receives priority
+                // during the upkeep step, regardless of whether triggers fired.
+                // Whether to auto-pass through this priority window (or honor the
+                // user's `phase_stops` / full-control preferences) is decided by
+                // `run_auto_pass_loop` and the frontend, not by skipping the step
+                // here. Mirrors the pattern in PreCombatMain and DeclareBlockers.
+                return WaitingFor::Priority {
+                    player: state.active_player,
+                };
             }
             Phase::Draw => {
-                let skip_draw = state.turn_number == 1 || should_skip_step_now(state, Phase::Draw);
-                if !skip_draw {
-                    if let Some(wf) = execute_draw(state, events) {
-                        return wf;
-                    }
+                // CR 103.7a: The first player skips their first-turn draw step
+                // entirely — no draw, no triggers, no priority.
+                // CR 614.10a + CR 614.1b: Other "skip your draw step" effects
+                // (replacements or static abilities) also remove the whole step.
+                if state.turn_number == 1 || should_skip_step_now(state, Phase::Draw) {
+                    advance_phase(state, events);
+                    continue;
+                }
+                if let Some(wf) = execute_draw(state, events) {
+                    return wf;
                 }
                 // CR 504.2: "At the beginning of [your] draw step" triggers fire here.
-                if process_phase_triggers(state) {
-                    return WaitingFor::Priority {
-                        player: state.active_player,
-                    };
-                }
-                advance_phase(state, events);
+                process_phase_triggers(state);
+                // CR 504.3 + CR 117.1c: The active player ALWAYS receives priority
+                // during the draw step (after the turn-based draw and any triggers).
+                // See the Upkeep arm above for the rationale — same pattern.
+                return WaitingFor::Priority {
+                    player: state.active_player,
+                };
             }
             Phase::PreCombatMain | Phase::PostCombatMain => {
                 // CR 714.3b: As the precombat main phase begins, add a lore counter
@@ -2581,13 +2591,20 @@ mod tests {
         assert_eq!(state.objects[&id].damage_marked, 0);
     }
 
+    /// CR 117.1c + CR 503.2: After Untap (no priority), the engine must hand
+    /// the active player priority during Upkeep — even when no triggers fired.
+    /// Previously `auto_advance` skipped past empty Upkeep/Draw windows, which
+    /// silently broke phase-stop and full-control honoring (the FE never got a
+    /// priority prompt to override). The skip happens at a higher layer now:
+    /// the FE auto-pass loop and `run_auto_pass_loop` decide whether to drain
+    /// the priority window based on `phase_stops` and `auto_pass_recommended`.
     #[test]
-    fn auto_advance_skips_to_precombat_main() {
+    fn auto_advance_pauses_at_upkeep_priority() {
         let mut state = setup();
         state.phase = Phase::Untap;
-        state.turn_number = 2; // Not first turn, so draw happens
+        state.turn_number = 2; // Not first turn, so the Draw step is not skipped.
 
-        // Add a card to library so draw works
+        // Add a card to library so draw works (when Draw priority is eventually drained).
         create_object(
             &mut state,
             CardId(1),
@@ -2599,7 +2616,8 @@ mod tests {
         let mut events = Vec::new();
         let waiting = auto_advance(&mut state, &mut events);
 
-        assert_eq!(state.phase, Phase::PreCombatMain);
+        // CR 117.1c: priority returned to active player during Upkeep.
+        assert_eq!(state.phase, Phase::Upkeep);
         assert!(matches!(
             waiting,
             WaitingFor::Priority {
@@ -2611,8 +2629,12 @@ mod tests {
     #[test]
     fn auto_advance_processes_precombat_main_triggers_before_priority() {
         let mut state = setup();
-        state.phase = Phase::Untap;
+        // Start mid-turn at the boundary entering PreCombatMain. `auto_advance`
+        // is now CR-117-strict (priority at every step), so testing the
+        // PreCombatMain-specific trigger path requires entering directly.
+        state.phase = Phase::Draw;
         state.turn_number = 2;
+        advance_phase(&mut state, &mut Vec::new()); // Draw → PreCombatMain
 
         create_object(
             &mut state,
