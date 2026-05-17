@@ -3010,6 +3010,32 @@ mod tests {
     }
 
     #[test]
+    fn strip_if_you_do_conditional_renegade_reaper_at_least_one_angel() {
+        // Issue #477 — Renegade Reaper: the swallowed-clause splitter must
+        // recognize the quantified "if at least one Angel card is milled this
+        // way" gate and emit `ZoneChangedThisWay { Angel }` on the GainLife
+        // sub-ability — not drop it.
+        let (condition, body) = strip_if_you_do_conditional(
+            "if at least one angel card is milled this way, you gain 4 life",
+        );
+        assert_eq!(body, "you gain 4 life");
+        let Some(AbilityCondition::ZoneChangedThisWay { filter }) = condition else {
+            panic!("expected ZoneChangedThisWay condition, got {condition:?}");
+        };
+        match filter {
+            TargetFilter::Typed(TypedFilter { type_filters, .. }) => {
+                assert!(
+                    type_filters.iter().any(
+                        |f| matches!(f, TypeFilter::Subtype(s) if s.eq_ignore_ascii_case("Angel"))
+                    ),
+                    "expected Subtype Angel, got {type_filters:?}"
+                );
+            }
+            other => panic!("expected Typed Angel filter, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn if_you_cant_parses_as_not_zone_changed_this_way() {
         // CR 608.2c: "if you can't, draw a card" — the gating condition on the
         // already-parsed `Draw` must be `Not { ZoneChangedThisWay { Any } }` so
