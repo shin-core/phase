@@ -1154,7 +1154,9 @@ pub enum Duration {
     /// next named phase/step. `Phase::Untap` covers exert / "doesn't untap"
     /// effects (CR 502.3). `Phase::End` covers "until your next end step"
     /// floating play-permission patterns such as Rocco, Street Chef (CR 513.1).
+    #[serde(alias = "UntilNextUntapStepOf")]
     UntilNextStepOf {
+        #[serde(default)]
         step: Phase,
         player: PlayerScope,
     },
@@ -10797,6 +10799,19 @@ mod tests {
         let json = serde_json::to_string(&durations).unwrap();
         let deserialized: Vec<Duration> = serde_json::from_str(&json).unwrap();
         assert_eq!(durations, deserialized);
+    }
+
+    #[test]
+    fn duration_deserializes_legacy_until_next_untap_step() {
+        let json = r#"[{"UntilNextUntapStepOf":{"player":{"type":"Controller"}}}]"#;
+        let deserialized: Vec<Duration> = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            deserialized,
+            vec![Duration::UntilNextStepOf {
+                step: Phase::Untap,
+                player: PlayerScope::Controller,
+            }]
+        );
     }
 
     #[test]
