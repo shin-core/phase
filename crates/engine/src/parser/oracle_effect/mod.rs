@@ -12975,6 +12975,17 @@ fn strip_each_player_subject(text: &str) -> (Option<PlayerFilter>, String) {
         );
     }
 
+    // CR 608.2c: A leading "also" after a resolved player-scope subject
+    // ("each opponent also discards a card") is a continuation adverb with no
+    // semantic weight — the same additive connector handled for self-ref
+    // subjects in `parse_effect_clause_inner`. Strip it via `tag()` so the
+    // residual ("discards a card") deconjugates and dispatches normally.
+    let rest = nom_on_lower(rest, &rest_condition_lower, |i| {
+        value((), tag("also ")).parse(i)
+    })
+    .map(|((), after)| after)
+    .unwrap_or(rest);
+
     // Deconjugate the verb: "discards" → "discard", "draws" → "draw"
     let deconjugated = subject::deconjugate_verb(rest);
     (Some(scope), deconjugated)
@@ -25541,6 +25552,24 @@ mod tests {
     }
 
     #[test]
+    fn strip_each_player_subject_strips_leading_also() {
+        // CR 608.2c: Leading "also" continuation adverb after a player scope is
+        // dropped before deconjugation — covers the whole class, not just
+        // Liliana's Triumph.
+        let (scope, result) = strip_each_player_subject("each opponent also discards a card");
+        assert_eq!(scope, Some(PlayerFilter::Opponent));
+        assert_eq!(result, "discard a card");
+
+        let (scope, result) = strip_each_player_subject("each player also draws a card");
+        assert_eq!(scope, Some(PlayerFilter::All));
+        assert_eq!(result, "draw a card");
+
+        let (scope, result) = strip_each_player_subject("each other player also loses 2 life");
+        assert_eq!(scope, Some(PlayerFilter::Opponent));
+        assert_eq!(result, "lose 2 life");
+    }
+
+    #[test]
     fn strip_player_scope_subject_linked_exile_owner() {
         let (scope, result) =
             strip_player_scope_subject("the exiled card's owner creates an X/X token");
@@ -26111,6 +26140,57 @@ mod tests {
             matches!(*third.effect, Effect::PhaseOut { .. }),
             "expected PhaseOut clause, got {:?}",
             third.effect
+        );
+    }
+
+    /// Issue #514 + CR 608.2c: Liliana's Triumph's secondary clause
+    /// ("each opponent also discards a card") must lower to a real
+    /// `Effect::Discard` with `player_scope: Opponent` — not `Unimplemented`.
+    /// The leading "also" continuation adverb is stripped after the player
+    /// scope is resolved.
+    #[test]
+    fn liliana_triumph_secondary_clause_discards() {
+        let result = crate::parser::parse_oracle_text(
+            "Each opponent sacrifices a creature of their choice. If you control a Liliana planeswalker, each opponent also discards a card.",
+            "Liliana's Triumph",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        );
+
+        let first = &result.abilities[0];
+        assert!(
+            matches!(*first.effect, Effect::Sacrifice { .. }),
+            "expected primary clause to be Sacrifice, got {:?}",
+            first.effect
+        );
+
+        let sub = first
+            .sub_ability
+            .as_ref()
+            .expect("Liliana's Triumph should chain a sub_ability for the secondary discard");
+        assert_eq!(
+            sub.player_scope,
+            Some(PlayerFilter::Opponent),
+            "secondary clause must be scoped to each opponent"
+        );
+        assert!(
+            matches!(sub.condition, Some(AbilityCondition::QuantityCheck { .. })),
+            "secondary clause must be gated on the Liliana planeswalker QuantityCheck, got {:?}",
+            sub.condition
+        );
+
+        // Discriminating assertion: the secondary clause is a real Discard
+        // effect, NOT Unimplemented (the bug being fixed).
+        assert!(
+            !matches!(*sub.effect, Effect::Unimplemented { .. }),
+            "secondary clause must not be Unimplemented, got {:?}",
+            sub.effect
+        );
+        assert!(
+            matches!(*sub.effect, Effect::Discard { .. }),
+            "secondary clause must lower to Effect::Discard, got {:?}",
+            sub.effect
         );
     }
 
