@@ -1874,7 +1874,7 @@ fn pay_additional_cost(
                 events,
             );
         }
-        AbilityCost::Sacrifice { ref target, .. } => {
+        AbilityCost::Sacrifice { ref target, count } => {
             if matches!(target, crate::types::ability::TargetFilter::SelfRef) {
                 if super::static_abilities::player_cant_sacrifice_as_cost(
                     state,
@@ -1896,14 +1896,16 @@ fn pay_additional_cost(
                     pending.object_id,
                     target,
                 );
-                if eligible.is_empty() {
+                // CR 118.3: cannot pay a multi-permanent sacrifice cost without
+                // `count` legal permanents to sacrifice.
+                if eligible.len() < count as usize {
                     return Err(EngineError::ActionNotAllowed(
-                        "No eligible permanents to sacrifice".into(),
+                        "Not enough eligible permanents to sacrifice".into(),
                     ));
                 }
                 return Ok(WaitingFor::SacrificeForCost {
                     player,
-                    count: 1,
+                    count: count as usize,
                     permanents: eligible,
                     pending_cast: Box::new(pending),
                 });

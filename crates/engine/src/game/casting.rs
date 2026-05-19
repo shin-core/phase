@@ -5539,13 +5539,15 @@ fn find_waterbend_cost(cost: &AbilityCost) -> Option<&ManaCost> {
     }
 }
 
-/// Walk a cost tree and return the first non-SelfRef sacrifice filter found, if any.
-fn find_non_self_sacrifice(cost: &AbilityCost) -> Option<&TargetFilter> {
+/// Walk a cost tree and return the first non-SelfRef sacrifice `(count, filter)`
+/// found, if any. The `count` is honored so multi-permanent sacrifice costs
+/// ("Sacrifice two creatures:") are modeled correctly.
+pub(super) fn find_non_self_sacrifice_cost(cost: &AbilityCost) -> Option<(u32, &TargetFilter)> {
     match cost {
-        AbilityCost::Sacrifice { target, .. } if !matches!(target, TargetFilter::SelfRef) => {
-            Some(target)
+        AbilityCost::Sacrifice { target, count } if !matches!(target, TargetFilter::SelfRef) => {
+            Some((*count, target))
         }
-        AbilityCost::Composite { costs } => costs.iter().find_map(find_non_self_sacrifice),
+        AbilityCost::Composite { costs } => costs.iter().find_map(find_non_self_sacrifice_cost),
         _ => None,
     }
 }
@@ -5863,8 +5865,13 @@ fn can_pay_ability_cost_now(
     // CR 118.3: Pre-check non-self sacrifice eligibility before simulation.
     // The simulation would give a false positive since pay_ability_cost's
     // non-self Sacrifice arm is a no-op (it's handled interactively).
-    if let Some(sac_filter) = find_non_self_sacrifice(cost) {
-        if find_eligible_sacrifice_targets(state, player, source_id, sac_filter).is_empty() {
+    if let Some((count, sac_filter)) = find_non_self_sacrifice_cost(cost) {
+        // CR 118.3: a multi-permanent sacrifice cost is unpayable without
+        // `count` legal permanents — keep AI legal actions in sync with
+        // `handle_activate_ability`.
+        if find_eligible_sacrifice_targets(state, player, source_id, sac_filter).len()
+            < count as usize
+        {
             return false;
         }
     }
@@ -6147,11 +6154,13 @@ pub fn handle_activate_ability(
     // CR 118.3: Pre-check for non-self sacrifice costs — must detour to WaitingFor
     // before any cost payment, regardless of whether targets were auto-selected.
     if let Some(ref cost) = ability_def.cost {
-        if let Some(sac_filter) = find_non_self_sacrifice(cost) {
+        if let Some((count, sac_filter)) = find_non_self_sacrifice_cost(cost) {
             let eligible = find_eligible_sacrifice_targets(state, player, source_id, sac_filter);
-            if eligible.is_empty() {
+            // CR 118.3: cannot pay a multi-permanent sacrifice cost without
+            // `count` legal permanents to sacrifice.
+            if eligible.len() < count as usize {
                 return Err(EngineError::ActionNotAllowed(
-                    "No eligible permanents to sacrifice".into(),
+                    "Not enough eligible permanents to sacrifice".into(),
                 ));
             }
             let mut pending_sac =
@@ -6160,7 +6169,7 @@ pub fn handle_activate_ability(
             pending_sac.activation_ability_index = Some(ability_index);
             return Ok(WaitingFor::SacrificeForCost {
                 player,
-                count: 1,
+                count: count as usize,
                 permanents: eligible,
                 pending_cast: Box::new(pending_sac),
             });

@@ -1896,16 +1896,6 @@ fn exile_from_battlefield_cost_choice(
     Some((count as usize, permanents))
 }
 
-fn find_non_self_sacrifice_cost(cost: &AbilityCost) -> Option<(u32, &TargetFilter)> {
-    match cost {
-        AbilityCost::Sacrifice { target, count } if !matches!(target, TargetFilter::SelfRef) => {
-            Some((*count, target))
-        }
-        AbilityCost::Composite { costs } => costs.iter().find_map(find_non_self_sacrifice_cost),
-        _ => None,
-    }
-}
-
 /// CR 117.1 + CR 118.3 + CR 605.3b: Surface eligible battlefield permanents
 /// for an `AbilityCost::Sacrifice { target: !SelfRef }` mana ability cost.
 /// Delegates eligibility to the casting cost helper so mana and non-mana
@@ -1916,7 +1906,7 @@ fn sacrifice_cost_choice(
     source_id: ObjectId,
     cost: &Option<AbilityCost>,
 ) -> Option<(usize, Vec<ObjectId>)> {
-    let (count, filter) = find_non_self_sacrifice_cost(cost.as_ref()?)?;
+    let (count, filter) = super::casting::find_non_self_sacrifice_cost(cost.as_ref()?)?;
     let permanents =
         super::casting::find_eligible_sacrifice_targets(state, player, source_id, filter);
     Some((count as usize, permanents))

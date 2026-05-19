@@ -15,8 +15,8 @@
 //!   → `GameAction::SelectCards` → engine snapshots the victim's power into
 //!   `cost_paid_object` BEFORE the zone change → resolve → draw N, discard 3.
 //!
-//! Cases 1-5 drive `apply()` end-to-end. Case 6 is a labelled shape test that
-//! documents the singular-slot `chosen.first()` behavior.
+//! All cases drive `apply()` end-to-end, including the multi-permanent
+//! (`count: 2`) sacrifice-cost tests at the end of the file.
 //!
 //! CR 400.7j + CR 608.2k: the sacrificed object's last-known information is
 //! captured before it changes zones, so cost-paid-object property references
@@ -373,30 +373,24 @@ fn cost_paid_object_does_not_leak_between_activations() {
     );
 }
 
-/// SHAPE TEST (not a pipeline test) — documents two co-located known
-/// limitations around multi-permanent sacrifice costs:
+/// CR 118.3 + CR 701.21a — multi-permanent sacrifice cost. PROVES the engine
+/// honors `AbilityCost::Sacrifice { count }` > 1: a synthetic `count: 2`
+/// sacrifice cost produces a `SacrificeForCost { count: 2 }` prompt whose
+/// eligible-permanents set is exactly the two victims.
 ///
-/// 1. **`cost_paid_object` is a singular slot.**
+/// One co-located known limitation remains, separately scoped (see #340/#334):
+/// **`cost_paid_object` is a singular slot.**
 ///    `casting_costs.rs::handle_sacrifice_for_cost` snapshots only
 ///    `chosen.first()` — for a `count > 1` sacrifice cost, only the first
 ///    sacrificed object's characteristics are stamped onto the resolving
-///    ability. Greater Good's cost is `count: 1`, so this slot is exact for
-///    it; the limitation only surfaces for hypothetical multi-sacrifice costs.
+///    ability. This is a `CostPaidObjectSnapshot` representation change tracked
+///    elsewhere; the multi-sacrifice *cost* class is fully fixed here.
 ///
-/// 2. **The engine does not honor `AbilityCost::Sacrifice { count }` > 1.**
-///    `casting_costs.rs:1906` builds `WaitingFor::SacrificeForCost` with a
-///    hardcoded `count: 1`, discarding the cost's `count` field. A synthetic
-///    `count: 2` sacrifice cost therefore still produces a `count: 1` prompt.
-///    No printed card currently has a fixed `count > 1` sacrifice *activation*
-///    cost feeding a `CostPaidObject` reference, so this is a documented
-///    limitation, not a regression introduced by #334's snapshot work.
-///
-/// This test asserts CURRENT behavior so a future fix to either limitation
-/// produces a visible, intentional diff. It is a shape test: it inspects the
-/// engine-produced `WaitingFor` rather than driving a multi-sacrifice to a
-/// drawn-card result (which is unreachable today).
+/// This is a reverted-fix-discriminating test: reverting the constructor's
+/// `count: count as usize` change flips the prompt count back to `1` and the
+/// `assert_eq!(*count, 2, ...)` assertion fires.
 #[test]
-fn multi_sacrifice_cost_count_is_not_honored_shape() {
+fn multi_sacrifice_cost_count_is_honored() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
 
@@ -423,13 +417,13 @@ fn multi_sacrifice_cost_count_is_not_honored_shape() {
         .with_ability_definition(synthetic)
         .as_enchantment()
         .id();
-    scenario.add_creature(P0, "First Victim", 5, 5);
-    scenario.add_creature(P0, "Second Victim", 2, 2);
+    let first_victim = scenario.add_creature(P0, "First Victim", 5, 5).id();
+    let second_victim = scenario.add_creature(P0, "Second Victim", 2, 2).id();
     scenario.with_library_top(P0, &["L1", "L2", "L3", "L4", "L5", "L6"]);
 
     let mut runner = scenario.build();
 
-    // SHAPE assertion 1: the synthetic ability carries the count: 2 cost.
+    // The synthetic ability carries the count: 2 cost.
     {
         let ability = &runner.state().objects[&host_id].abilities[0];
         assert!(
@@ -445,18 +439,139 @@ fn multi_sacrifice_cost_count_is_not_honored_shape() {
         })
         .expect("activating the count: 2 sacrifice ability must succeed");
 
-    // SHAPE assertion 2: the engine builds the sacrifice prompt with a
-    // hardcoded count: 1, NOT the cost's count: 2. This documents the
-    // `casting_costs.rs:1906` limitation — if a future fix honors the cost
-    // count, this assertion fails loudly and intentionally.
+    // The engine builds the sacrifice prompt honoring the cost's count: 2, and
+    // the eligible-permanents set is exactly the two victims — the host has its
+    // Creature core type stripped by `.as_enchantment()`, so it does not match
+    // the `TypeFilter::Creature` sacrifice filter.
     match &runner.state().waiting_for {
-        engine::types::WaitingFor::SacrificeForCost { count, .. } => {
+        engine::types::WaitingFor::SacrificeForCost {
+            count, permanents, ..
+        } => {
+            assert_eq!(*count, 2, "SacrificeForCost must honor the cost's count: 2",);
             assert_eq!(
-                *count, 1,
-                "documented limitation: SacrificeForCost is built with a \
-                 hardcoded count of 1 — the cost's count: 2 is not honored",
+                permanents.len(),
+                2,
+                "exactly the two creature victims are eligible (the enchantment host is not)",
+            );
+            let set: std::collections::HashSet<_> = permanents.iter().copied().collect();
+            assert_eq!(
+                set,
+                [first_victim, second_victim].into_iter().collect(),
+                "the eligible set must equal {{first_victim, second_victim}}",
             );
         }
         other => panic!("expected SacrificeForCost prompt, got {other:?}"),
+    }
+}
+
+/// CR 118.3 + CR 701.21a — drives a `count: 2` sacrifice cost end-to-end
+/// through the activation pipeline. PROVES both victims are sacrificed and the
+/// ability advances past the cost, and that a short selection is rejected.
+///
+/// Reverted-fix-discriminating: with the hardcoded `count: 1`, the prompt would
+/// carry `count: 1`, the handler's `chosen.len() != count` check would reject
+/// the two-card selection, and the single-card negative case would wrongly
+/// *succeed* — inverting both assertions.
+#[test]
+fn multi_sacrifice_cost_resolves_through_pipeline() {
+    let synthetic = || {
+        AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::CostPaidObject,
+                    },
+                },
+                target: TargetFilter::Controller,
+            },
+        )
+        .cost(AbilityCost::Sacrifice {
+            target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+            count: 2,
+        })
+    };
+
+    // Positive case: select exactly two victims → both sacrificed, cost cleared.
+    {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let host_id = scenario
+            .add_creature(P0, "Twin Sacrifice", 0, 0)
+            .with_ability_definition(synthetic())
+            .as_enchantment()
+            .id();
+        let first_victim = scenario.add_creature(P0, "First Victim", 5, 5).id();
+        let second_victim = scenario.add_creature(P0, "Second Victim", 2, 2).id();
+        scenario.with_library_top(P0, &["L1", "L2", "L3", "L4", "L5", "L6"]);
+
+        let mut runner = scenario.build();
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: host_id,
+                ability_index: 0,
+            })
+            .expect("activating the count: 2 sacrifice ability must succeed");
+        assert!(
+            matches!(
+                &runner.state().waiting_for,
+                engine::types::WaitingFor::SacrificeForCost { count: 2, .. }
+            ),
+            "the prompt must carry count: 2",
+        );
+
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![first_victim, second_victim],
+            })
+            .expect("selecting exactly two victims must succeed");
+
+        assert_eq!(
+            runner.state().objects[&first_victim].zone,
+            Zone::Graveyard,
+            "the first victim must be sacrificed to the graveyard",
+        );
+        assert_eq!(
+            runner.state().objects[&second_victim].zone,
+            Zone::Graveyard,
+            "the second victim must be sacrificed to the graveyard",
+        );
+        assert_ne!(
+            runner.waiting_for_kind(),
+            "SacrificeForCost",
+            "the ability must advance past the sacrifice cost",
+        );
+    }
+
+    // Negative case: select only one victim → handler rejects the short set.
+    {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let host_id = scenario
+            .add_creature(P0, "Twin Sacrifice", 0, 0)
+            .with_ability_definition(synthetic())
+            .as_enchantment()
+            .id();
+        let first_victim = scenario.add_creature(P0, "First Victim", 5, 5).id();
+        scenario.add_creature(P0, "Second Victim", 2, 2);
+        scenario.with_library_top(P0, &["L1", "L2", "L3"]);
+
+        let mut runner = scenario.build();
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: host_id,
+                ability_index: 0,
+            })
+            .expect("activating the count: 2 sacrifice ability must succeed");
+
+        let err = runner
+            .act(GameAction::SelectCards {
+                cards: vec![first_victim],
+            })
+            .expect_err("selecting only one victim for a count: 2 cost must fail");
+        assert!(
+            format!("{err:?}").contains("exactly 2"),
+            "the handler must reject a short selection citing the required count; got {err:?}",
+        );
     }
 }
