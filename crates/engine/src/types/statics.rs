@@ -484,6 +484,15 @@ pub enum StaticMode {
     },
     CantGainLife,
     CantLoseLife,
+    /// CR 702.16: The scoped player(s) have protection from a quality —
+    /// e.g. Serra's Emissary's "You ... have protection from the chosen card
+    /// type." Player scope rides on `StaticDefinition::affected` (identical to
+    /// `CantGainLife`); `ProtectionTarget` is the canonical protection-quality
+    /// axis. Data-carrying variant — not registry-registered (see
+    /// `coverage::is_data_carrying_static`); consumed by direct pattern-match
+    /// in `player_protection_from`. Only the `ChosenCardType` arm is
+    /// runtime-implemented; other arms are inert.
+    PlayerProtection(super::keywords::ProtectionTarget),
     MustAttack,
     MustBlock,
     CantDraw {
@@ -885,6 +894,9 @@ impl fmt::Display for StaticMode {
             StaticMode::CantPayCost { who, cost } => write!(f, "CantPayCost({who},{cost})"),
             StaticMode::CantGainLife => write!(f, "CantGainLife"),
             StaticMode::CantLoseLife => write!(f, "CantLoseLife"),
+            StaticMode::PlayerProtection(target) => {
+                write!(f, "PlayerProtection({target:?})")
+            }
             StaticMode::MustAttack => write!(f, "MustAttack"),
             StaticMode::MustBlock => write!(f, "MustBlock"),
             StaticMode::CantDraw { who } => write!(f, "CantDraw({who})"),

@@ -50,6 +50,9 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
             | StaticMode::TopOfLibraryCastPermission { .. }
             | StaticMode::CastFromHandFree { .. }
             | StaticMode::CastWithKeyword { .. }
+            // CR 702.16: PlayerProtection carries a `ProtectionTarget` (Strings) —
+            // open value space, consumed by direct match in `player_protection_from`.
+            | StaticMode::PlayerProtection { .. }
             | StaticMode::ActivateAsInstant { .. }
             | StaticMode::MaximumHandSize { .. }
             | StaticMode::StepEndUnspentMana { .. }

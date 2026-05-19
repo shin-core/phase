@@ -2384,6 +2384,10 @@ fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition> {
         return defs;
     }
 
+    if let Some(defs) = parse_compound_subject_keyword_static(&stripped, &lower) {
+        return defs;
+    }
+
     // Check compound must-attack/block first — may return multiple.
     if let Some(defs) = try_parse_scoped_must_attack_block(&lower, &stripped) {
         return defs;
@@ -2506,6 +2510,59 @@ fn parse_compound_subject_rule_static(text: &str, lower: &str) -> Option<Vec<Sta
             .map(|predicate| lower_rule_static(predicate, affected.clone(), text))
             .collect(),
     )
+}
+
+/// CR 702.16 + CR 609.6: Compound-subject keyword-grant statics of the form
+/// `"You and creatures you control have <keyword>"` — a single keyword grant
+/// bound to a player plus an object subset. A single `StaticDefinition` cannot
+/// carry both a player scope and an object scope, so decompose into two:
+///   - an object-half `Continuous` def whose `affected` is the object subset;
+///   - a player-half `PlayerProtection` def whose `affected` is the controller.
+///
+/// Restricted to `Protection(_)` grants — the only player-applicable keyword
+/// with a runtime-implemented `PlayerProtection` mode. Returns `None` for any
+/// other granted keyword (a player cannot meaningfully "have flying").
+fn parse_compound_subject_keyword_static(text: &str, lower: &str) -> Option<Vec<StaticDefinition>> {
+    type VE<'a> = OracleError<'a>;
+
+    // Subject: "you and <object subject phrase> ".
+    let (after_you, _) = tag::<_, _, VE<'_>>("you and ").parse(lower).ok()?;
+    let (predicate_lower, _) = alt((
+        tag::<_, _, VE<'_>>("creatures you control "),
+        tag("other creatures you control "),
+        tag("permanents you control "),
+    ))
+    .parse(after_you)
+    .ok()?;
+
+    // Map the matched lowercase spans back onto the original-case text so the
+    // object-subject filter and predicate retain their original casing.
+    let object_subject = text[text.len() - after_you.len()..text.len() - predicate_lower.len()]
+        .trim()
+        .trim_end_matches(' ');
+    let predicate = text[text.len() - predicate_lower.len()..].trim();
+
+    let affected = parse_rule_static_subject_filter(object_subject)?;
+
+    // Object-half: delegate the predicate to the shared keyword-grant builder.
+    let object_def = parse_continuous_gets_has(predicate, affected, text)?;
+
+    // Extract the granted protection target — only `Protection(_)` grants get a
+    // player-half. Any other keyword (or no keyword) → not this pattern.
+    let protection_target = object_def.modifications.iter().find_map(|m| match m {
+        ContinuousModification::AddKeyword {
+            keyword: crate::types::keywords::Keyword::Protection(pt),
+        } => Some(pt.clone()),
+        _ => None,
+    })?;
+
+    let player_def = StaticDefinition::new(StaticMode::PlayerProtection(protection_target))
+        .affected(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::You),
+        ))
+        .description(text.to_string());
+
+    Some(vec![object_def, player_def])
 }
 
 fn parse_rule_static_separator_nom(input: &str) -> OracleResult<'_, ()> {
@@ -9980,6 +10037,66 @@ mod tests {
         AggregateFunction, CardTypeSetSource, CountScope, Duration, Effect, PlayerScope,
         SharedQuality, SharedQualityRelation, TypeFilter, ZoneRef,
     };
+
+    /// CR 702.16 + CR 609.6: Serra's Emissary's compound-subject keyword grant
+    /// "You and creatures you control have protection from the chosen card
+    /// type." must decompose into exactly TWO `StaticDefinition`s:
+    ///   - object-half: `Continuous` / `AddKeyword(Protection(ChosenCardType))`
+    ///     with a controller-You creatures filter;
+    ///   - player-half: `PlayerProtection(ChosenCardType)` with controller-You.
+    #[test]
+    fn compound_subject_keyword_static_splits_serras_emissary() {
+        use crate::types::keywords::{Keyword, ProtectionTarget};
+
+        let defs = parse_static_line_multi(
+            "You and creatures you control have protection from the chosen card type.",
+        );
+        assert_eq!(
+            defs.len(),
+            2,
+            "expected exactly two StaticDefinitions, got {defs:?}"
+        );
+
+        // Object-half.
+        let object_def = &defs[0];
+        assert_eq!(object_def.mode, StaticMode::Continuous);
+        match &object_def.affected {
+            Some(TargetFilter::Typed(tf)) => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(
+                    tf.type_filters.contains(&TypeFilter::Creature),
+                    "object-half must affect creatures, got {:?}",
+                    tf.type_filters
+                );
+            }
+            other => {
+                panic!("object-half affected must be Typed(creatures you control), got {other:?}")
+            }
+        }
+        assert!(
+            object_def
+                .modifications
+                .contains(&ContinuousModification::AddKeyword {
+                    keyword: Keyword::Protection(ProtectionTarget::ChosenCardType),
+                }),
+            "object-half must grant Protection(ChosenCardType), got {:?}",
+            object_def.modifications
+        );
+
+        // Player-half.
+        let player_def = &defs[1];
+        assert_eq!(
+            player_def.mode,
+            StaticMode::PlayerProtection(ProtectionTarget::ChosenCardType)
+        );
+        assert_eq!(
+            player_def.affected,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::You)
+            )),
+            "player-half must affect the controller"
+        );
+    }
 
     /// CR 205.1a + CR 205.2 + CR 205.3 + CR 613.1c: "becomes a [subtype]*
     /// [core-type]+ in addition to its other types" must decompose into

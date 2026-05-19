@@ -180,6 +180,15 @@ pub fn source_matches_protection_target(
         ProtectionTarget::ChosenColor => protected
             .chosen_color()
             .is_some_and(|color| source.color.contains(&color)),
+        // CR 702.16 + CR 105.4 + CR 205.2: "Protection from the chosen card
+        // type" — resolved from the protected permanent's own chosen card type.
+        // This arm only fires for objects that themselves carry the choice
+        // (e.g. Serra's Emissary); creatures it grants protection to receive a
+        // concrete `Protection(CardType(..))` baked in by the layer applier.
+        ProtectionTarget::ChosenCardType => protected
+            .chosen_card_type()
+            .and_then(|ct| ct.protection_quality_str())
+            .is_some_and(|quality| source_matches_card_type(source, quality)),
         // CR 702.16j: "Protection from everything" — protection from each object
         // regardless of the source's characteristic values.
         ProtectionTarget::Everything => true,
@@ -540,6 +549,52 @@ mod tests {
         obj.keywords.push(Keyword::Flying);
         assert!(has_keyword(&obj, &Keyword::Flying));
         assert!(!has_keyword(&obj, &Keyword::Haste));
+    }
+
+    /// CR 702.16 + CR 105.4 + CR 205.2: `source_matches_protection_target`'s
+    /// `ChosenCardType` arm resolves against the *protected* object's own
+    /// chosen card type. A creature-typed source matches when the protected
+    /// object chose Creature; a non-creature source does not. An object with
+    /// no chosen card type is matched by nothing through this arm.
+    #[test]
+    fn source_matches_protection_target_chosen_card_type() {
+        use crate::types::ability::ChosenAttribute;
+        use crate::types::card_type::CoreType;
+
+        let mut protected = make_obj();
+        protected
+            .chosen_attributes
+            .push(ChosenAttribute::CardType(CoreType::Creature));
+
+        let mut creature_source = make_obj();
+        creature_source.card_types.core_types = vec![CoreType::Creature];
+        let mut instant_source = make_obj();
+        instant_source.card_types.core_types = vec![CoreType::Instant];
+
+        assert!(
+            source_matches_protection_target(
+                &ProtectionTarget::ChosenCardType,
+                &protected,
+                &creature_source,
+            ),
+            "creature source must match protection from chosen card type Creature"
+        );
+        assert!(
+            !source_matches_protection_target(
+                &ProtectionTarget::ChosenCardType,
+                &protected,
+                &instant_source,
+            ),
+            "instant source must NOT match protection from chosen card type Creature"
+        );
+
+        // No chosen card type -> the arm protects from nothing.
+        let no_choice = make_obj();
+        assert!(!source_matches_protection_target(
+            &ProtectionTarget::ChosenCardType,
+            &no_choice,
+            &creature_source,
+        ));
     }
 
     #[test]

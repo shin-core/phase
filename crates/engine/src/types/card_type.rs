@@ -133,6 +133,24 @@ impl CoreType {
         CoreType::Land,
         CoreType::Planeswalker,
     ];
+
+    /// CR 702.16a: The lowercase singular noun used to express "protection from
+    /// [card type]" — e.g. "protection from creatures". Returns `None` for the
+    /// supplemental types (Tribal/Kindred/Dungeon/Battle) which are never offered
+    /// as a chosen card type (`CARD_TYPES` in `choose.rs` offers only the seven
+    /// main types); callers `continue`/skip on `None`.
+    pub const fn protection_quality_str(self) -> Option<&'static str> {
+        match self {
+            CoreType::Artifact => Some("artifact"),
+            CoreType::Creature => Some("creature"),
+            CoreType::Enchantment => Some("enchantment"),
+            CoreType::Instant => Some("instant"),
+            CoreType::Sorcery => Some("sorcery"),
+            CoreType::Planeswalker => Some("planeswalker"),
+            CoreType::Land => Some("land"),
+            CoreType::Tribal | CoreType::Battle | CoreType::Kindred | CoreType::Dungeon => None,
+        }
+    }
 }
 
 /// CR 205.3: The classification of subtype sets. Each card type has its own
@@ -186,4 +204,42 @@ pub fn is_land_subtype(s: &str) -> bool {
             | "Town"
             | "Urza's"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CR 702.16a: `protection_quality_str` returns the lowercase singular
+    /// protection noun for each card type the engine can offer as a chosen
+    /// card type, and `None` for the four supplemental types that can never
+    /// be chosen (`CARD_TYPES` offers only the seven main types).
+    #[test]
+    fn protection_quality_str_covers_all_core_types() {
+        // 7 Some — the main card types.
+        assert_eq!(
+            CoreType::Artifact.protection_quality_str(),
+            Some("artifact")
+        );
+        assert_eq!(
+            CoreType::Creature.protection_quality_str(),
+            Some("creature")
+        );
+        assert_eq!(
+            CoreType::Enchantment.protection_quality_str(),
+            Some("enchantment")
+        );
+        assert_eq!(CoreType::Instant.protection_quality_str(), Some("instant"));
+        assert_eq!(CoreType::Sorcery.protection_quality_str(), Some("sorcery"));
+        assert_eq!(
+            CoreType::Planeswalker.protection_quality_str(),
+            Some("planeswalker")
+        );
+        assert_eq!(CoreType::Land.protection_quality_str(), Some("land"));
+        // 4 None — supplemental types never offered as a chosen card type.
+        assert_eq!(CoreType::Tribal.protection_quality_str(), None);
+        assert_eq!(CoreType::Battle.protection_quality_str(), None);
+        assert_eq!(CoreType::Kindred.protection_quality_str(), None);
+        assert_eq!(CoreType::Dungeon.protection_quality_str(), None);
+    }
 }

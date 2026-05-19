@@ -59,7 +59,7 @@ pub fn find_legal_targets(
 
     // Check if filter could match players
     if matches!(filter, TargetFilter::Any | TargetFilter::Player) {
-        add_players(state, &mut targets);
+        add_players(state, &mut targets, source_id);
     }
 
     // Typed filter with no type_filters targets players, not permanents.
@@ -76,10 +76,13 @@ pub fn find_legal_targets(
                 if player.is_eliminated {
                     continue;
                 }
-                // CR 702.16b + CR 702.16j: A player with protection from
-                // everything can't be targeted by spells or abilities.
-                if super::static_abilities::player_has_protection_from_everything(state, player.id)
-                {
+                // CR 702.16b + CR 702.16j: A player with protection from the
+                // spell/ability's source can't be targeted by it.
+                if super::static_abilities::player_protection_from(
+                    state,
+                    player.id,
+                    Some(source_id),
+                ) {
                     continue;
                 }
                 let is_opponent = player.id != source_controller;
@@ -986,7 +989,7 @@ fn filter_targets_stack_abilities(filter: &TargetFilter) -> bool {
     }
 }
 
-fn add_players(state: &GameState, targets: &mut Vec<TargetRef>) {
+fn add_players(state: &GameState, targets: &mut Vec<TargetRef>, source_id: ObjectId) {
     // Player-phasing exclusion: a phased-out player is treated as though they
     // don't exist for targeting purposes (mirrors CR 702.26b for permanents,
     // applied to players via card Oracle text like "you phase out").
@@ -1001,9 +1004,9 @@ fn add_players(state: &GameState, targets: &mut Vec<TargetRef>) {
         if player.is_eliminated {
             continue;
         }
-        // CR 702.16b + CR 702.16j: A player with protection from everything
-        // can't be targeted by spells or abilities — any source, any quality.
-        if super::static_abilities::player_has_protection_from_everything(state, player.id) {
+        // CR 702.16b: A player with protection from the spell/ability's source
+        // can't be targeted by it.
+        if super::static_abilities::player_protection_from(state, player.id, Some(source_id)) {
             continue;
         }
         targets.push(TargetRef::Player(player.id));

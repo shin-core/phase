@@ -308,6 +308,10 @@ pub enum ProtectionTarget {
     /// CR 702.16: Protection from the chosen color — resolved at runtime from the
     /// source permanent's `chosen_attributes`.
     ChosenColor,
+    /// CR 702.16 + CR 105.4 + CR 205.2: "Protection from the chosen card type" —
+    /// resolved at runtime from the source permanent's `chosen_attributes`
+    /// (the `CardType` chosen as the permanent entered). Parallels `ChosenColor`.
+    ChosenCardType,
     /// CR 702.16j: "Protection from everything" — protection from each object
     /// regardless of that object's characteristic values. Matches every source
     /// in `source_matches_protection_target`.
@@ -1657,10 +1661,15 @@ fn parse_protection_target(s: &str) -> ProtectionTarget {
         "multicolored" => ProtectionTarget::Multicolored,
         // CR 702.16: "the chosen color" resolves at runtime from chosen_attributes
         "the chosen color" | "chosen color" => ProtectionTarget::ChosenColor,
+        // CR 702.16 + CR 105.4 + CR 205.2: "the chosen card type" resolves at
+        // runtime from the source permanent's chosen `CardType` attribute.
+        "the chosen card type" | "chosen card type" => ProtectionTarget::ChosenCardType,
         // CR 702.16j: "protection from everything" — typed variant, not stringly-typed
         "everything" => ProtectionTarget::Everything,
-        _ if lower.starts_with("from ") => ProtectionTarget::Quality(s.to_string()),
-        _ => ProtectionTarget::CardType(s.to_string()),
+        // Lowercase the stored quality — `source_matches_card_type` only matches
+        // lowercase, so the canonical stored form must be lowercase.
+        _ if lower.starts_with("from ") => ProtectionTarget::Quality(lower),
+        _ => ProtectionTarget::CardType(lower),
     }
 }
 
@@ -2236,7 +2245,7 @@ mod tests {
         );
         assert_eq!(
             Keyword::from_str("Protection:Artifacts").unwrap(),
-            Keyword::Protection(ProtectionTarget::CardType("Artifacts".to_string()))
+            Keyword::Protection(ProtectionTarget::CardType("artifacts".to_string()))
         );
         assert_eq!(
             Keyword::from_str("Protection:multicolored").unwrap(),
@@ -2250,6 +2259,32 @@ mod tests {
         assert_eq!(
             Keyword::from_str("Protection:chosen color").unwrap(),
             Keyword::Protection(ProtectionTarget::ChosenColor)
+        );
+    }
+
+    /// CR 702.16 + CR 105.4 + CR 205.2: "the chosen card type" / "chosen card
+    /// type" parse to the runtime-resolved `ChosenCardType` variant. Plus the
+    /// Blocker-C regression: the `Quality`/`CardType` fallthrough arms must
+    /// lowercase their stored string — `source_matches_card_type` only matches
+    /// lowercase, so a capitalized stored quality would silently fail to match.
+    #[test]
+    fn parse_protection_target_chosen_card_type_and_lowercasing() {
+        assert_eq!(
+            parse_protection_target("the chosen card type"),
+            ProtectionTarget::ChosenCardType
+        );
+        assert_eq!(
+            parse_protection_target("chosen card type"),
+            ProtectionTarget::ChosenCardType
+        );
+        // Blocker-C: capitalized input must store lowercase.
+        assert_eq!(
+            Keyword::from_str("Protection:Artifacts").unwrap(),
+            Keyword::Protection(ProtectionTarget::CardType("artifacts".to_string()))
+        );
+        assert_eq!(
+            parse_protection_target("from artifacts"),
+            ProtectionTarget::Quality("from artifacts".to_string())
         );
     }
 

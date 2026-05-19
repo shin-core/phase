@@ -1820,6 +1820,29 @@ fn apply_continuous_effect(state: &mut GameState, effect: &ActiveContinuousEffec
         None
     };
 
+    // Pre-read chosen card type from source (avoids borrow conflict in the loop).
+    // CR 702.16 + CR 105.4 + CR 205.2: when the granted keyword is
+    // `Protection(ChosenCardType)`, the granting source's chosen card type must
+    // be baked into the granted modifier at apply-time — the modifier lives on
+    // the granted creature, which has no chosen-card-type attribute of its own.
+    let chosen_card_type = if matches!(
+        &effect.modification,
+        ContinuousModification::AddKeyword { keyword }
+            if matches!(
+                keyword,
+                crate::types::keywords::Keyword::Protection(
+                    crate::types::keywords::ProtectionTarget::ChosenCardType,
+                )
+            )
+    ) {
+        state
+            .objects
+            .get(&effect.source_id)
+            .and_then(|src| src.chosen_card_type())
+    } else {
+        None
+    };
+
     // CR 613.1b: For Layer 2 ChangeController, the new controller is the effect's
     // own `controller` field — set authoritatively by the effect that queued the
     // continuous modification (e.g. gain_control passes `ability.controller`,
@@ -1971,6 +1994,21 @@ fn apply_continuous_effect(state: &mut GameState, effect: &ActiveContinuousEffec
                             continue;
                         }
                     }
+                    // CR 702.16 + CR 105.4 + CR 205.2: "protection from the
+                    // chosen card type" — resolve to a concrete
+                    // `Protection(CardType("creature"))` from the granting
+                    // source's chosen card type, so the keyword is
+                    // self-contained on the recipient. `source_matches_card_type`
+                    // then enforces CR 702.16b/d/e/f. Skip the grant if the
+                    // chosen card type is unresolved or has no protection noun.
+                    crate::types::keywords::Keyword::Protection(
+                        crate::types::keywords::ProtectionTarget::ChosenCardType,
+                    ) => match chosen_card_type.and_then(|ct| ct.protection_quality_str()) {
+                        Some(quality) => crate::types::keywords::Keyword::Protection(
+                            crate::types::keywords::ProtectionTarget::CardType(quality.to_string()),
+                        ),
+                        None => continue,
+                    },
                     other => other.clone(),
                 };
                 if !obj.keywords.contains(&resolved_keyword) {

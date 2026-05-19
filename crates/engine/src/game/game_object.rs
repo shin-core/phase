@@ -953,6 +953,15 @@ impl GameObject {
         })
     }
 
+    /// CR 105.4 + CR 205.2: Look up a stored card-type choice (e.g. the card
+    /// type chosen as this permanent entered the battlefield).
+    pub fn chosen_card_type(&self) -> Option<CoreType> {
+        self.chosen_attributes.iter().find_map(|a| match a {
+            ChosenAttribute::CardType(t) => Some(*t),
+            _ => None,
+        })
+    }
+
     /// Look up a stored basic land type choice.
     pub fn chosen_basic_land_type(&self) -> Option<BasicLandType> {
         self.chosen_attributes.iter().find_map(|a| match a {

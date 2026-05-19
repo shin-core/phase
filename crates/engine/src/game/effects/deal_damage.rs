@@ -159,12 +159,16 @@ pub(crate) fn pre_replacement_damage_gate(
         }
     }
 
-    // CR 702.16j + CR 615.1: "All damage that would be dealt to [a player with
-    // protection from everything] is prevented." Mirror the object-protection
-    // gate above for player targets. Emits DamagePrevented so prevention-
-    // triggered abilities still observe the event.
+    // CR 702.16e + CR 615.1: "All damage that would be dealt to [a player with
+    // protection from the damage source] is prevented." Mirror the object-
+    // protection gate above for player targets. Emits DamagePrevented so
+    // prevention-triggered abilities still observe the event.
     if let TargetRef::Player(player_id) = target {
-        if crate::game::static_abilities::player_has_protection_from_everything(state, *player_id) {
+        if crate::game::static_abilities::player_protection_from(
+            state,
+            *player_id,
+            Some(ctx.source_id),
+        ) {
             events.push(GameEvent::DamagePrevented {
                 source_id: ctx.source_id,
                 target: target.clone(),

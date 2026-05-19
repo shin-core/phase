@@ -689,13 +689,12 @@ pub fn player_cant_sacrifice_as_cost(
 /// `AddKeyword { Protection(ProtectionTarget::Everything) }`. Respects the
 /// optional `condition` on each transient.
 ///
-/// This is the single authority for player-scoped protection-from-everything
-/// enforcement — consulted by targeting (CR 702.16b + 702.16j), damage
-/// (CR 702.16j + CR 615.1), and attack-target legality (CR 508.1b +
-/// CR 702.16j). Callers never inspect the transient_continuous_effects
-/// table directly.
+/// This is an internal sub-query of `player_protection_from` — the new single
+/// authority for player-scoped protection enforcement. This function scans only
+/// the `transient_continuous_effects` table for the `Everything` arm; the
+/// battlefield-static `PlayerProtection` arm is handled by `player_protection_from`.
 ///
-/// Note: player-scoped protection uses the transient-effect table rather than
+/// Note: protection-from-everything uses the transient-effect table rather than
 /// the battlefield-object `static_definitions` scan used by `CantGainLife`
 /// etc. because a protected player can have zero permanents on the
 /// battlefield (e.g., right after Teferi's Protection phases them all out).
@@ -729,6 +728,70 @@ pub fn player_has_protection_from_everything(state: &GameState, player_id: Playe
             )
         });
         if grants_everything {
+            return true;
+        }
+    }
+    false
+}
+
+/// CR 702.16: Single authority for player-scoped protection enforcement.
+///
+/// Returns `true` if `player_id` has protection from `source` (identified by
+/// `source` ObjectId). Consulted by targeting (CR 702.16b) and damage
+/// prevention (CR 702.16e + CR 615.1).
+///
+/// Short-circuits on `player_has_protection_from_everything` (the transient-
+/// effect `Everything` authority, CR 702.16j), then scans battlefield/command-
+/// zone `PlayerProtection` statics — e.g. Serra's Emissary's "You ... have
+/// protection from the chosen card type." `source` is `None` for queries with
+/// no concrete source object; only the `Everything` short-circuit can fire then.
+pub fn player_protection_from(
+    state: &GameState,
+    player_id: PlayerId,
+    source: Option<ObjectId>,
+) -> bool {
+    use crate::game::keywords::source_matches_card_type;
+    use crate::types::keywords::ProtectionTarget;
+
+    // CR 702.16j: protection from everything covers every source.
+    if player_has_protection_from_everything(state, player_id) {
+        return true;
+    }
+    let Some(source_id) = source else {
+        return false;
+    };
+    let context = StaticCheckContext {
+        player_id: Some(player_id),
+        ..Default::default()
+    };
+    // CR 114.4: Abilities of emblems function in the command zone.
+    for (src_obj, def) in game_functioning_statics(state) {
+        let StaticMode::PlayerProtection(ref target) = def.mode else {
+            continue;
+        };
+        if let Some(ref affected) = def.affected {
+            if !static_filter_matches(state, &context, affected, src_obj.id) {
+                continue;
+            }
+        }
+        if !static_condition_matches_context(state, src_obj.id, src_obj.controller, def, &context) {
+            continue;
+        }
+        let protects = match target {
+            // CR 702.16j: handled by the short-circuit above.
+            ProtectionTarget::Everything => false,
+            // CR 702.16 + CR 105.4 + CR 205.2: protection from the card type
+            // chosen as the granting permanent (e.g. Serra's Emissary) entered.
+            ProtectionTarget::ChosenCardType => state.objects.get(&source_id).is_some_and(|src| {
+                src_obj
+                    .chosen_card_type()
+                    .and_then(|ct| ct.protection_quality_str())
+                    .is_some_and(|quality| source_matches_card_type(src, quality))
+            }),
+            // Inert — the parser never emits other arms for `PlayerProtection`.
+            _ => false,
+        };
+        if protects {
             return true;
         }
     }
