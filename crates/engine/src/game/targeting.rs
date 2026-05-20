@@ -661,6 +661,18 @@ pub(crate) fn extract_player_from_event(
         // creature") would have no player anchor and the sacrifice filter
         // would match across all players.
         GameEvent::PhaseChanged { .. } => Some(state.active_player),
+        // CR 603.7c + CR 109.4: For zone-change triggers ("whenever a creature
+        // enters", "whenever an opponent's creature enters", "whenever a card
+        // is put into a graveyard from anywhere"), the `TriggeringPlayer` /
+        // "that player" anchor must resolve to the moving object's controller
+        // at the moment of the zone change — captured in the
+        // `ZoneChangeRecord` snapshot per CR 603.10a so that LKI-dependent
+        // triggers see the correct controller even after the object has
+        // transferred or left the battlefield. Without this arm, ETB and
+        // dies-trigger sub-effects with `target: TriggeringPlayer` fell back
+        // to the ability controller, hitting the wrong player (Suture Priest
+        // #560, Bloodchief Ascension #546).
+        GameEvent::ZoneChanged { record, .. } => Some(record.controller),
         _ => None,
     }
 }
@@ -2174,6 +2186,49 @@ mod tests {
         };
         let result = extract_player_from_event(&event, &state);
         assert_eq!(result, Some(PlayerId(1)));
+    }
+
+    /// CR 603.7c + CR 109.4 + CR 603.10a: For `ZoneChanged` events
+    /// (ETB, dies, discard, return-to-hand), `TriggeringPlayer` must
+    /// resolve to the moving object's controller as captured in the
+    /// `ZoneChangeRecord` snapshot — NOT the ability controller and
+    /// NOT `None`. Regression discriminator for #546 (Bloodchief
+    /// Ascension) and #560 (Suture Priest), where the wildcard arm's
+    /// `None` fallback caused `LoseLife { target: TriggeringPlayer }`
+    /// to revert to the Suture Priest / Bloodchief controller via
+    /// `resolve_player_for_context_ref`'s ability-controller fallback,
+    /// damaging the wrong player.
+    #[test]
+    fn extract_player_from_zone_change_returns_moving_objects_controller() {
+        use crate::types::events::GameEvent;
+        use crate::types::game_state::ZoneChangeRecord;
+        use crate::types::zones::Zone;
+
+        let state = GameState::new_two_player(42);
+        // Construct a ZoneChangeRecord for a card moving from
+        // P1's battlefield to P1's graveyard (a death event for a
+        // P1-controlled creature). Override the controller from the
+        // skeleton default of `PlayerId(0)` to `PlayerId(1)`.
+        let record = ZoneChangeRecord {
+            controller: PlayerId(1),
+            ..ZoneChangeRecord::test_minimal(ObjectId(7), Some(Zone::Battlefield), Zone::Graveyard)
+        };
+        let event = GameEvent::ZoneChanged {
+            object_id: ObjectId(7),
+            from: Some(Zone::Battlefield),
+            to: Zone::Graveyard,
+            record: Box::new(record),
+        };
+        let result = extract_player_from_event(&event, &state);
+        // Pre-fix, the `_ => None` wildcard returned None; the caller
+        // then fell back to the ability controller. Post-fix, the
+        // record's snapshot controller is returned directly.
+        assert_eq!(
+            result,
+            Some(PlayerId(1)),
+            "ZoneChanged must surface the moving object's controller, \
+             not fall through to None"
+        );
     }
 
     #[test]
