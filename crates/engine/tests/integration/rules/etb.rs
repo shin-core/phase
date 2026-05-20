@@ -80,7 +80,6 @@ fn etb_changes_zone_trigger_fires_on_zone_change() {
 /// Two permanents with ChangesZone triggers on the battlefield. When a third creature
 /// is cast (Hand->Stack zone change), both triggers fire.
 #[test]
-#[ignore = "TODO(#531 followup): identity-drain alone doesn't restore pre-#531 multi-trigger stack assembly; needs deeper test update"]
 fn multiple_changes_zone_triggers_fire() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);

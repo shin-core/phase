@@ -249,7 +249,6 @@ fn earthbender_ascension_grants_trample_at_four_quest_counters() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "TODO(#531 followup): resolve_all_triggers helper needs OrderTriggers drain"]
 fn harmonizer_and_ascension_combined_landfall() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
@@ -730,7 +729,6 @@ fn run_optional_landfall_scenario(ob_nixilis_first: bool, accept: bool) {
 }
 
 #[test]
-#[ignore = "TODO(#531 followup): batch-resolve helper needs OrderTriggers drain in its waiting-state loop"]
 fn optional_plus_targeted_landfall_trigger_batch_resolves_to_clean_priority() {
     // Ordering R1: Ob Nixilis added first. Both accept and decline branches.
     run_optional_landfall_scenario(true, true);

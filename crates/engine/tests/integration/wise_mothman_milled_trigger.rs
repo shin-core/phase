@@ -167,7 +167,6 @@ fn wise_mothman_passive_milled_trigger_fires() {
 /// milled nonland card, with an observable life-gain effect — so we can assert
 /// the exact firing count end-to-end.
 #[test]
-#[ignore = "TODO(#531 followup): OrderTriggers drain pattern needs update for run_until_optional_choice_or_settled helper"]
 fn glowing_one_active_milled_trigger_gains_life_per_card() {
     let Some(db) = load_db() else {
         return;
@@ -262,7 +261,6 @@ fn run_until_optional_choice_or_settled(runner: &mut engine::game::scenario::Gam
 /// — mill a nonland card, so the trigger fires (surfacing its optional
 /// return-to-hand choice).
 #[test]
-#[ignore = "TODO(#531 followup): OrderTriggers drain pattern needs update for run_until_optional_choice_or_settled helper"]
 fn infesting_radroach_opponent_milled_trigger_fires_on_opponent_mill() {
     let Some(db) = load_db() else {
         return;

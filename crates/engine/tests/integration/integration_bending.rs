@@ -973,7 +973,6 @@ fn test_search_changezone_shuffle_continuation_completes() {
 /// resolves (earthbend + search + put + shuffle), but the Landfall trigger
 /// fires from the searched land entering and appears stuck on the stack.
 #[test]
-#[ignore = "TODO(#531 followup): post-SelectCards continuation needs OrderTriggers drain at additional sites"]
 fn test_earthbender_ascension_etb_completes_with_landfall() {
     use engine::game::engine::apply_as_current;
     use engine::game::stack;
