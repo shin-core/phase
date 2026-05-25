@@ -71,7 +71,7 @@ export function SetSelector({ onStartDraft }: SetSelectorProps) {
         setSets(entries);
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load sets");
+          setError(err instanceof Error ? err.message : t("setSelector.loadFailed"));
         }
       } finally {
         if (!cancelled) setLoading(false);

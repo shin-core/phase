@@ -60,7 +60,8 @@
     "botDifficulty": "Dificultad de los bots",
     "chooseSet": "Elige una colección",
     "noPools": "No hay grupos de draft disponibles. Ejecuta primero la canalización de datos del draft.",
-    "setIconAlt": "Icono de la colección {{name}}"
+    "setIconAlt": "Icono de la colección {{name}}",
+    "loadFailed": "Error al cargar las colecciones"
   },
   "pack": {
     "confirmPick": "Confirmar elección",

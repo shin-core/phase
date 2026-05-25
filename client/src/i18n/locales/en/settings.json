@@ -32,6 +32,15 @@
       "random": "Random",
       "customUrl": "Custom URL",
       "none": "None"
+    },
+    "cardSizeOptions": {
+      "small": "Small",
+      "medium": "Medium",
+      "large": "Large"
+    },
+    "logDefaultOptions": {
+      "open": "Open",
+      "closed": "Closed"
     }
   },
   "visual": {
@@ -45,7 +54,12 @@
     "clearArtOverrides_one": "Clear All Art Overrides ({{count}})",
     "clearArtOverrides_other": "Clear All Art Overrides ({{count}})",
     "clearArtOverridesConfirm_one": "Clear all {{count}} art override?",
-    "clearArtOverridesConfirm_other": "Clear all {{count}} art overrides?"
+    "clearArtOverridesConfirm_other": "Clear all {{count}} art overrides?",
+    "vfxQualityOptions": {
+      "full": "Full",
+      "reduced": "Reduced",
+      "minimal": "Minimal"
+    }
   },
   "audio": {
     "title": "Audio",

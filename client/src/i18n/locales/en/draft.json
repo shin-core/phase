@@ -60,7 +60,8 @@
     "botDifficulty": "Bot Difficulty",
     "chooseSet": "Choose a Set",
     "noPools": "No draft pools available. Run the draft data pipeline first.",
-    "setIconAlt": "{{name}} set icon"
+    "setIconAlt": "{{name}} set icon",
+    "loadFailed": "Failed to load sets"
   },
   "pack": {
     "confirmPick": "Confirm Pick",

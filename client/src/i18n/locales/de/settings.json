@@ -32,6 +32,15 @@
       "random": "Zufällig",
       "customUrl": "Eigene URL",
       "none": "Keiner"
+    },
+    "cardSizeOptions": {
+      "small": "Klein",
+      "medium": "Mittel",
+      "large": "Groß"
+    },
+    "logDefaultOptions": {
+      "open": "Offen",
+      "closed": "Geschlossen"
     }
   },
   "visual": {
@@ -45,7 +54,12 @@
     "clearArtOverrides_one": "Alle Artwork-Überschreibungen aufheben ({{count}})",
     "clearArtOverrides_other": "Alle Artwork-Überschreibungen aufheben ({{count}})",
     "clearArtOverridesConfirm_one": "Alle {{count}} Artwork-Überschreibung aufheben?",
-    "clearArtOverridesConfirm_other": "Alle {{count}} Artwork-Überschreibungen aufheben?"
+    "clearArtOverridesConfirm_other": "Alle {{count}} Artwork-Überschreibungen aufheben?",
+    "vfxQualityOptions": {
+      "full": "Voll",
+      "reduced": "Reduziert",
+      "minimal": "Minimal"
+    }
   },
   "audio": {
     "title": "Audio",

@@ -60,7 +60,8 @@
     "botDifficulty": "Difficoltà bot",
     "chooseSet": "Scegli un set",
     "noPools": "Nessun pool di draft disponibile. Esegui prima la pipeline dei dati di draft.",
-    "setIconAlt": "Icona set {{name}}"
+    "setIconAlt": "Icona set {{name}}",
+    "loadFailed": "Impossibile caricare i set"
   },
   "pack": {
     "confirmPick": "Conferma scelta",

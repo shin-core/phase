@@ -60,7 +60,8 @@
     "botDifficulty": "Bot-Schwierigkeit",
     "chooseSet": "Wähle ein Set",
     "noPools": "Keine Draft-Pools verfügbar. Führe zuerst die Draft-Datenpipeline aus.",
-    "setIconAlt": "{{name}} Set-Symbol"
+    "setIconAlt": "{{name}} Set-Symbol",
+    "loadFailed": "Sets konnten nicht geladen werden"
   },
   "pack": {
     "confirmPick": "Pick bestätigen",

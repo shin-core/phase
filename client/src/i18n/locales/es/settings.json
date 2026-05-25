@@ -32,6 +32,15 @@
       "random": "Aleatorio",
       "customUrl": "URL personalizada",
       "none": "Ninguno"
+    },
+    "cardSizeOptions": {
+      "small": "Pequeño",
+      "medium": "Mediano",
+      "large": "Grande"
+    },
+    "logDefaultOptions": {
+      "open": "Abierto",
+      "closed": "Cerrado"
     }
   },
   "visual": {
@@ -45,7 +54,12 @@
     "clearArtOverrides_one": "Borrar todas las anulaciones de ilustración ({{count}})",
     "clearArtOverrides_other": "Borrar todas las anulaciones de ilustración ({{count}})",
     "clearArtOverridesConfirm_one": "¿Borrar la anulación de ilustración? ({{count}})",
-    "clearArtOverridesConfirm_other": "¿Borrar las {{count}} anulaciones de ilustración?"
+    "clearArtOverridesConfirm_other": "¿Borrar las {{count}} anulaciones de ilustración?",
+    "vfxQualityOptions": {
+      "full": "Completa",
+      "reduced": "Reducida",
+      "minimal": "Mínima"
+    }
   },
   "audio": {
     "title": "Audio",

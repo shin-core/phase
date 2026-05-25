@@ -32,6 +32,15 @@
       "random": "Aléatoire",
       "customUrl": "URL personnalisée",
       "none": "Aucun"
+    },
+    "cardSizeOptions": {
+      "small": "Petit",
+      "medium": "Moyen",
+      "large": "Grand"
+    },
+    "logDefaultOptions": {
+      "open": "Ouvert",
+      "closed": "Fermé"
     }
   },
   "visual": {
@@ -45,7 +54,12 @@
     "clearArtOverrides_one": "Effacer tous les remplacements d'illustration ({{count}})",
     "clearArtOverrides_other": "Effacer tous les remplacements d'illustration ({{count}})",
     "clearArtOverridesConfirm_one": "Effacer les {{count}} remplacement d'illustration ?",
-    "clearArtOverridesConfirm_other": "Effacer les {{count}} remplacements d'illustration ?"
+    "clearArtOverridesConfirm_other": "Effacer les {{count}} remplacements d'illustration ?",
+    "vfxQualityOptions": {
+      "full": "Complète",
+      "reduced": "Réduite",
+      "minimal": "Minimale"
+    }
   },
   "audio": {
     "title": "Audio",
