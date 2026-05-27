@@ -117,6 +117,28 @@ If the contributor lacks `gh`, fall back to a plain `git clone` and tell them (i
 
 ---
 
+## 2.5. Bootstrap the repo (Developer track only)
+
+Run **once per fresh clone** before invoking `$engine-implementer`. This downloads MTGJSON, generates `client/public/card-data.json`, fetches the local copy of the Comprehensive Rules, installs frontend deps, and configures git hooks:
+
+```bash
+./scripts/setup.sh --agent
+```
+
+The `--agent` flag skips the three Scryfall image sidecars (`scryfall-data.json`, `scryfall-token-images.json`, `scryfall-printings.json`). They are runtime-only image data for the React frontend in a browser — no Rust integration test, parser tool, `cargo coverage`, `cargo semantic-audit`, or vitest test depends on them. Skipping saves a ~500 MB Scryfall bulk download with zero impact on the signal §6 verification consumes.
+
+What `--agent` mode produces, in agent-relevant order:
+- `client/public/card-data.json` — without this, integration tests in `crates/engine/tests/integration/*.rs` self-skip with `"skipping: client/public/card-data.json not generated"` and `cargo coverage` / `cargo semantic-audit` / `cargo parser-gaps` cannot read parsed AST shape for any card. Agents without this file have no signal beyond unit tests.
+- `client/public/card-names.json`, `coverage-data.json`, `coverage-summary.json`, `card-data-meta.json`, `set-list.json`, `decks.json` — sidecars consumed by `cargo coverage` and the parser audit binaries.
+- `client/src/wasm/*` — WASM artifacts; required by `pnpm run type-check` because TypeScript files import their generated `.d.ts`.
+- `docs/MagicCompRules.txt` — gitignored. Required for the CR-annotation rule (`grep -n "^701.21" docs/MagicCompRules.txt`); without it you cannot verify CR numbers and §0.1 honesty applies.
+- `client/node_modules/` — required by `pnpm run type-check` / `pnpm lint` / `pnpm test`.
+- `.git/config` git-hooks include — applies the repo's pre-commit hooks.
+
+Skip this section entirely on the Non-developer track — CI runs everything `--agent` mode produces.
+
+---
+
 ## 3. Pick a card
 
 **If the human named a card**, use that name verbatim. Normalize casing as needed for `client/public/card-data.json` lookups (typically lowercase).
@@ -178,6 +200,8 @@ Apply **all three** checks:
 ## 6. Verify (track-specific)
 
 **Developer track** — run in this order. On any failure, fix in-loop (max 2 retries) before proceeding. If still failing after retries, record the failure in the PR body under "CI Failures" and continue to Step 7 — do not abort.
+
+Step 2.5 (`./scripts/setup.sh --agent`) is a prerequisite for this section — `cargo coverage` and `cargo semantic-audit` both read `client/public/card-data.json`, and the integration suite self-skips without it.
 
 If Tilt is running locally (`tilt get uiresource clippy >/dev/null 2>&1` succeeds), prefer `tilt-wait.sh` for clippy/tests/card-data — it reuses Tilt's already-warm rebuild loop instead of fighting it for the cargo target lock. See CLAUDE.md § "Canonical verification pattern".
 
