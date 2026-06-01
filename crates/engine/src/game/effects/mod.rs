@@ -1092,6 +1092,7 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
         | Some(
             AbilityCondition::AdditionalCostPaid { .. }
             | AbilityCondition::AdditionalCostPaidInstead
+            | AbilityCondition::AlternativeManaCostPaid
             | AbilityCondition::EventOutcomeWon
             | AbilityCondition::WhenYouDo
             | AbilityCondition::CastFromZone { .. }
@@ -4399,6 +4400,7 @@ pub(crate) fn evaluate_condition(
             kicker_cost.as_ref(),
             *min_count,
         ),
+        AbilityCondition::AlternativeManaCostPaid => ability.context.alternative_mana_cost_paid,
         AbilityCondition::EffectOutcome {
             signal: EffectOutcomeSignal::OptionalEffectPerformed,
         } => ability.context.optional_effect_performed && !state.cost_payment_failed_flag,
