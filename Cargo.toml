@@ -37,6 +37,26 @@ split-debuginfo = "unpacked"
 inherits = "dev"
 codegen-units = 256
 
+# The engine is compute-heavy: full-game integration tests drive thousands of
+# `apply()` steps through layer evaluation and SBA sweeps. At opt-level 0 each
+# game-driving test is ~10s of unoptimized engine, and the suite (150+ integration
+# files) thrashes all cores. Optimizing ONLY the engine package keeps the test
+# harness and other crates fast to compile while cutting per-test runtime sharply.
+# `debug_assert!`s are retained (opt-level does not disable them).
+#   - `dev` override: governs the engine lib when linked as a dependency of an
+#     integration test (cargo builds test-target deps with the dev profile).
+#   - `test` override: governs engine's inline `#[cfg(test)]` unit tests.
+# opt-level 1 (not 2) is deliberate: opt-2 cold-compiles the engine for ~10+ min
+# in CI, overrunning the `Rust tests` job's 15-min timeout (the opt-0 baseline is
+# ~5.5 min). opt-1 skips the expensive LLVM passes (vectorization, aggressive
+# inlining) so the cold compile fits the budget while still giving a large
+# per-test runtime win over the opt-0 debug build.
+[profile.dev.package.engine]
+opt-level = 1
+
+[profile.test.package.engine]
+opt-level = 1
+
 [profile.wasm-dev]
 inherits = "dev"
 opt-level = 2
