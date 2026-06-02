@@ -945,6 +945,7 @@ pub(super) fn build_spell_meta(
         keyword_kinds: effective_spell_keyword_kinds(state, caster, object_id),
         cast_from_zone: Some(pending_cast_origin_zone_for(state, object_id).unwrap_or(obj.zone)),
         mana_value: Some(obj.mana_cost.mana_value()),
+        color_count: Some(obj.color.len() as u32),
     })
 }
 
