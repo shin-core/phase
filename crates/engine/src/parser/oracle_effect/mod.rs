@@ -20335,6 +20335,50 @@ mod tests {
         );
     }
 
+    /// CR 118.12a + CR 701.9: Wrench Mind — "unless they discard an artifact
+    /// card" must hoist to `unless_pay`, not fire the two-card discard
+    /// unconditionally (issue #2361).
+    #[test]
+    fn effect_wrench_mind_unless_discard_artifact_card() {
+        let def = parse_effect_chain(
+            "Target player discards two cards unless they discard an artifact card",
+            AbilityKind::Spell,
+        );
+        let unless_pay = def.unless_pay.expect("should attach unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::Player);
+        match &unless_pay.cost {
+            AbilityCost::Discard { count, filter, .. } => {
+                assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+                assert!(filter.is_some(), "artifact filter required");
+            }
+            other => panic!("expected Discard unless cost, got {other:?}"),
+        }
+        match &*def.effect {
+            Effect::Discard { count, .. } => {
+                assert_eq!(*count, QuantityExpr::Fixed { value: 2 });
+            }
+            other => panic!("expected Discard primary effect, got {other:?}"),
+        }
+    }
+
+    /// Tyrannize — "unless they pay 7 life" must attach `unless_pay` with a
+    /// life cost (issue #2361).
+    #[test]
+    fn effect_tyrannize_unless_pay_seven_life() {
+        let def = parse_effect_chain(
+            "Target player discards their hand unless they pay 7 life",
+            AbilityKind::Spell,
+        );
+        let unless_pay = def.unless_pay.expect("should attach unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::Player);
+        assert!(matches!(
+            unless_pay.cost,
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 7 }
+            }
+        ));
+    }
+
     /// CR 118.12a: "unless they pay {N}" — `they` anaphors to the targeted
     /// player when the effect targets a player (Flay).
     #[test]
