@@ -1259,7 +1259,13 @@ fn crackback_damage(
     opp_attackers.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let mut unblocked_damage = 0i32;
-    let mut blocker_idx = 0;
+    // CR 509.1: greedy 1:1 blocker assignment. Track which blockers have been
+    // committed rather than a single advancing cursor: a blocker that can't
+    // legally block the CURRENT attacker (e.g. a ground creature vs a flyer)
+    // must remain available for later attackers it CAN block. A shared cursor
+    // permanently discarded such a blocker, over-estimating crackback and making
+    // the AI hold back profitable attacks.
+    let mut used = vec![false; our_blockers.len()];
     for &(opp_id, opp_power) in &opp_attackers {
         // Keyword lookup mirrors the power lookup: prefer the projected view
         // (e.g., Battle Cry / Mentor pumps, newly-granted Trample).
@@ -1270,24 +1276,27 @@ fn crackback_damage(
             Some(o) => o,
             None => continue,
         };
-        let blocked = loop {
-            if blocker_idx >= our_blockers.len() {
-                break false;
+        // First not-yet-committed blocker that can legally block this attacker.
+        let mut blocked = false;
+        for (i, &bid) in our_blockers.iter().enumerate() {
+            if used[i] {
+                continue;
             }
-            let bid = our_blockers[blocker_idx];
-            if let Some(blocker) = state.objects.get(&bid) {
-                if can_block_pair(state, bid, opp_id) {
-                    blocker_idx += 1;
-                    if opp_obj.has_keyword(&Keyword::Trample) {
-                        let blocker_toughness = blocker.toughness.unwrap_or(0);
-                        let trample_through = (opp_power - blocker_toughness).max(0);
-                        unblocked_damage += trample_through;
-                    }
-                    break true;
-                }
+            if !can_block_pair(attacker_source, bid, opp_id) {
+                continue; // skip — still available for other attackers
             }
-            blocker_idx += 1;
-        };
+            used[i] = true;
+            blocked = true;
+            if opp_obj.has_keyword(&Keyword::Trample) {
+                let blocker_toughness = attacker_source
+                    .objects
+                    .get(&bid)
+                    .and_then(|b| b.toughness)
+                    .unwrap_or(0);
+                unblocked_damage += (opp_power - blocker_toughness).max(0);
+            }
+            break;
+        }
         if !blocked {
             unblocked_damage += opp_power;
         }
@@ -1683,6 +1692,104 @@ mod tests {
         obj.keywords = keywords;
         obj.entered_battlefield_turn = Some(1);
         id
+    }
+
+    // --- Issue #2514: crackback_damage blocker reuse (CR 509.1) ---
+
+    #[test]
+    fn crackback_blocker_not_consumed_by_unblockable_attacker() {
+        // A ground wall that can't block a flyer must remain available to block a
+        // ground attacker. The old shared cursor discarded the wall after it
+        // failed to block the (higher-power) flyer, over-counting crackback.
+        let mut state = setup();
+        // AI (P0) has only a 0/5 ground wall.
+        add_creature(&mut state, PlayerId(0), "Wall", 0, 5, vec![]);
+        // Opponent (P1): a 5/5 flyer (sorted first by power) and a 4/4 ground.
+        add_creature(
+            &mut state,
+            PlayerId(1),
+            "Flyer",
+            5,
+            5,
+            vec![Keyword::Flying],
+        );
+        add_creature(&mut state, PlayerId(1), "Ground", 4, 4, vec![]);
+
+        let cb = crackback_damage(&state, PlayerId(0), &[PlayerId(1)], &[], None);
+        // The wall blocks the 4/4; only the 5/5 flyer is unblocked.
+        assert_eq!(
+            cb, 5,
+            "wall must block the ground 4/4, leaving only the flyer's 5"
+        );
+    }
+
+    #[test]
+    fn crackback_uses_all_legal_pairings() {
+        // Two ground walls + (flyer, two ground attackers): both walls block the
+        // ground attackers; only the flyer is unblocked.
+        let mut state = setup();
+        add_creature(&mut state, PlayerId(0), "Wall A", 0, 5, vec![]);
+        add_creature(&mut state, PlayerId(0), "Wall B", 0, 4, vec![]);
+        add_creature(
+            &mut state,
+            PlayerId(1),
+            "Flyer",
+            5,
+            5,
+            vec![Keyword::Flying],
+        );
+        add_creature(&mut state, PlayerId(1), "Ground A", 3, 3, vec![]);
+        add_creature(&mut state, PlayerId(1), "Ground B", 2, 2, vec![]);
+
+        let cb = crackback_damage(&state, PlayerId(0), &[PlayerId(1)], &[], None);
+        assert_eq!(
+            cb, 5,
+            "both walls block the ground attackers; flyer unblocked"
+        );
+    }
+
+    #[test]
+    fn crackback_trample_counts_only_excess() {
+        // A trampler blocked by a smaller creature contributes only the excess.
+        let mut state = setup();
+        add_creature(&mut state, PlayerId(0), "Blocker", 2, 2, vec![]);
+        add_creature(
+            &mut state,
+            PlayerId(1),
+            "Trampler",
+            5,
+            5,
+            vec![Keyword::Trample],
+        );
+
+        let cb = crackback_damage(&state, PlayerId(0), &[PlayerId(1)], &[], None);
+        // 5 power - 2 toughness blocker = 3 trample-through.
+        assert_eq!(cb, 3, "only the trample excess (5-2) is counted");
+    }
+
+    #[test]
+    fn crackback_projection_drives_block_legality() {
+        let mut state = setup();
+        add_creature(&mut state, PlayerId(0), "Wall", 0, 5, vec![]);
+        let attacker = add_creature(&mut state, PlayerId(1), "Projected Flyer", 4, 4, vec![]);
+
+        let mut projected = state.clone();
+        projected
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .keywords
+            .push(Keyword::Flying);
+        let projection = Projection {
+            horizon_reached: ProjectionHorizon::OpponentAttackersDeclared,
+            state: projected,
+            snapshots: Vec::new(),
+            confidence: crate::projection::Confidence::Exact,
+            target_opponent: PlayerId(1),
+        };
+
+        let cb = crackback_damage(&state, PlayerId(0), &[PlayerId(1)], &[], Some(&projection));
+        assert_eq!(cb, 4, "projected flying must make the attacker unblocked");
     }
 
     /// Battlefield planeswalker for `owner` with the given starting loyalty.
