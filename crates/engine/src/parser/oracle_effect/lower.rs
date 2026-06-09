@@ -4418,16 +4418,14 @@ pub(super) fn compute_sentence_where_x(chunks: &[ClauseChunk]) -> Vec<Option<Str
 pub(crate) fn strip_trailing_where_x<'a>(tp: TextPair<'a>) -> (TextPair<'a>, Option<String>) {
     for needle in [", where x is ", " where x is "] {
         if let Some((before, after)) = tp.split_around(needle) {
-            // CR 608.2c: A where-X binding can precede further instructions in the
-            // same resolution ("..., where X is N. Put that card ..."). Truncate on
-            // the TextPair before materializing a String. Examples: Eldritch Evolution
-            // ("... where X is 2 plus the sacrificed creature's mana value. Put ...")
-            // and Halana and Alena, Partners ("... where X is ~'s power. That creature
-            // gains haste ...").
+            // CR 608.2c: A where-X binding can precede further instructions in
+            // the same resolution. Bound the expression structurally, not by
+            // enumerating the verbs that may start the next instruction.
             let mut after_clause = after;
             if let Some((clause, _)) = after.split_around(". ") {
                 after_clause = clause;
             }
+            after_clause = structurally_bound_where_x_clause(after_clause);
             let expression = after_clause
                 .original
                 .trim()
@@ -4441,6 +4439,37 @@ pub(crate) fn strip_trailing_where_x<'a>(tp: TextPair<'a>) -> (TextPair<'a>, Opt
         }
     }
     (tp, None)
+}
+
+fn structurally_bound_where_x_clause<'a>(clause: TextPair<'a>) -> TextPair<'a> {
+    let clause = clause.trim_start().trim_end_matches('.').trim_end();
+    let mut has_comma = false;
+    let mut best_end = None;
+
+    for (idx, _) in clause.lower.match_indices(',') {
+        has_comma = true;
+        let candidate = clause.slice(0, idx).trim_end();
+        if !candidate.is_empty() && parse_where_x_quantity_expression(candidate.original).is_some()
+        {
+            best_end = Some(candidate.len());
+        }
+    }
+
+    if let Some(expr) = parse_where_x_quantity_expression(clause.original) {
+        let is_constraint = matches!(
+            expr,
+            QuantityExpr::Ref {
+                qty: QuantityRef::Variable { ref name },
+            } if name == "X"
+        );
+        if !is_constraint || best_end.is_none() || !has_comma {
+            best_end = Some(clause.len());
+        }
+    }
+
+    best_end
+        .map(|end| clause.slice(0, end).trim_end())
+        .unwrap_or(clause)
 }
 
 pub(super) fn strip_leading_sequence_connector(text: &str) -> &str {
@@ -5276,6 +5305,16 @@ mod tests {
             .1
             .expect("where-x");
         assert_eq!(expr, "halana and alena's power");
+    }
+
+    #[test]
+    fn strip_trailing_where_x_stops_at_non_enumerated_comma_continuation() {
+        let text = "draw x cards, where x is the number of creatures you control, draw a card.";
+        let lower = text.to_ascii_lowercase();
+        let (without_where_x, expr) = strip_trailing_where_x(TextPair::new(text, &lower));
+
+        assert_eq!(without_where_x.original, "draw x cards");
+        assert_eq!(expr.as_deref(), Some("the number of creatures you control"));
     }
 
     #[test]
