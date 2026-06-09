@@ -607,7 +607,7 @@ pub fn synthesize_reconfigure(face: &mut CardFace) {
         let static_condition = StaticCondition::SourceAttachedToCreature;
         let already_has_static = face.static_abilities.iter().any(|static_def| {
             static_def.affected == Some(TargetFilter::SelfRef)
-                && static_def.condition == Some(static_condition.clone())
+                && static_def.condition.as_ref() == Some(&static_condition)
                 && static_def
                     .modifications
                     .contains(&ContinuousModification::RemoveType {
