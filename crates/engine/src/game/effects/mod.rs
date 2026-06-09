@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use crate::game::conditions::{
+    eval_has_city_blessing, eval_is_monarch, eval_source_entered_this_turn, eval_source_is_tapped,
+};
 use crate::game::filter;
 use crate::game::speed::has_max_speed;
 use crate::types::ability::{
@@ -5149,13 +5152,11 @@ pub(crate) fn evaluate_condition(
             };
             type_matches && subtype_matches && filter_matches
         }
-        // CR 400.7 + CR 608.2c: source permanent entered the battlefield this turn.
+        // CR 400.7: source permanent entered the battlefield this turn.
         // For the "unless ~ entered this turn" sense, wrap with `Not`.
-        AbilityCondition::SourceEnteredThisTurn => state
-            .objects
-            .get(&ability.source_id)
-            .map(|obj| obj.entered_battlefield_turn == Some(state.turn_number))
-            .unwrap_or(false),
+        AbilityCondition::SourceEnteredThisTurn => {
+            eval_source_entered_this_turn(state, ability.source_id)
+        }
         // CR 702.49 + CR 702.190a + CR 603.4: "if its sneak/ninjutsu cost was paid"
         AbilityCondition::CastVariantPaid { variant } => state
             .objects
@@ -5224,10 +5225,10 @@ pub(crate) fn evaluate_condition(
         AbilityCondition::SpellCastWithVariantThisTurn { variant } => {
             crate::game::restrictions::spell_cast_with_variant_this_turn(state, variant)
         }
-        AbilityCondition::IsMonarch => state.monarch == Some(ability.controller),
+        AbilityCondition::IsMonarch => eval_is_monarch(state, ability.controller),
         // CR 702.131c: The city's blessing is a player designation that effects
         // can identify.
-        AbilityCondition::HasCityBlessing => state.city_blessing.contains(&ability.controller),
+        AbilityCondition::HasCityBlessing => eval_has_city_blessing(state, ability.controller),
         // "Instead" override conditions — return pure boolean value.
         // Terminal control flow (early return from resolve_ability_chain) is the caller's
         // responsibility in the sub-ability context.
@@ -5398,11 +5399,9 @@ pub(crate) fn evaluate_condition(
             }
         }
         // CR 611.2b: "if this creature/permanent is tapped" — check source object.
-        // For the untapped sense, wrap with `Not`.
-        AbilityCondition::SourceIsTapped => state
-            .objects
-            .get(&ability.source_id)
-            .is_some_and(|obj| obj.tapped),
+        // For the untapped sense, wrap with `Not`. No battlefield zone guard
+        // (ability conditions; zone constrained by functioning-abilities path).
+        AbilityCondition::SourceIsTapped => eval_source_is_tapped(state, ability.source_id),
         // CR 608.2c: General "instead" — delegate to the wrapped inner condition.
         // The "instead" semantics are handled by the swap/guard in resolve_ability_chain.
         AbilityCondition::ConditionInstead { inner } => evaluate_condition(inner, state, ability),
