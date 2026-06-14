@@ -7562,6 +7562,39 @@ fn is_player_filter(filter: &TargetFilter) -> bool {
         )
 }
 
+/// CR 109.5: True when a `TargetFilter` denotes players (a controller-/player-
+/// scoped filter) rather than objects. Builds on `is_player_filter` (which covers
+/// `Player` and the controller-only `Typed` "each of your opponents" shape) and
+/// adds the player-denoting variants producible by `parse_subject_application`
+/// from a leading subject noun phrase, so the carry-forward guard protects that
+/// whole class, not just one phrasing. It is intentionally NOT the universe of
+/// player-denoting `TargetFilter` variants — context refs that only arise mid-
+/// chain (e.g. `TriggeringPlayer`, `DefendingPlayer`, `Owner`,
+/// `ParentTargetController`) are never emitted as a *subject* head and so are not
+/// listed here. `AllPlayers` is likewise excluded: per its own doc it is valid
+/// only as an `UnlessPayModifier.payer`, never as a subject/affected filter.
+fn is_player_scoped_filter(filter: &TargetFilter) -> bool {
+    is_player_filter(filter)
+        || matches!(
+            filter,
+            TargetFilter::Controller
+                | TargetFilter::OriginalController
+                | TargetFilter::SourceChosenPlayer
+                | TargetFilter::ScopedPlayer
+                | TargetFilter::SpecificPlayer { .. }
+                | TargetFilter::Neighbor { .. }
+        )
+}
+
+/// CR 109.5 / CR 119: True when a conjunct's subject denotes players (a
+/// controller-/player-scoped filter), not objects. Used to stop the mass-object
+/// verb carry-forward from re-heading a player subject-predicate clause
+/// ("each of your opponents loses life …") with an object action verb.
+fn subject_application_is_player_scoped(sub_text: &str, ctx: &mut ParseContext) -> bool {
+    parse_subject_application(sub_text, ctx)
+        .is_some_and(|app| is_player_scoped_filter(&app.affected))
+}
+
 fn thread_for_each_subject(effect: Effect, original: &str, ctx: &mut ParseContext) -> Effect {
     let application = match for_each_subject_application(original, ctx) {
         Some(application) => application,
@@ -8646,6 +8679,37 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // Parse the sub-effect
     let mut sub_clause = parse_imperative_effect(sub_text, &mut continuation_ctx);
 
+    // CR 109.5 + CR 608.2c: A compound conjunct whose subject is a *player*
+    // ("...and each of your opponents loses life equal to ...", Genesis of the
+    // Daleks chapter IV) must lower through the subject-predicate path so the
+    // player scope reaches `inject_subject_target` and is stamped onto the
+    // effect's player field (`LoseLife.target`, `Draw.target`, `Mill.target`,
+    // `GainLife.player`, ...). `parse_imperative_effect` deconjugates the verb
+    // ("loses" → "lose") but DROPS the subject, leaving `target: None` —
+    // which `resolve_life_loss_target` would otherwise default to the source's
+    // controller, the exact inverse of "each of your opponents loses life".
+    // Only re-route when the conjunct is genuinely player-scoped; object
+    // continuations ("all Samurai you control") still take the verb
+    // carry-forward path below.
+    //
+    // CR 119.3: When the rerouted subject is an iterating player CLASS ("each
+    // of your opponents"), lift it to `sub_ability.player_scope` (the canonical
+    // Bloodletting / Exsanguinate idiom) instead of leaving a non-resolvable
+    // controller-only filter on the effect's own target field. The resolver's
+    // `player_scope` iteration rebinds the acting controller per player, so the
+    // inner `LoseLife { target: None }` (etc.) drains each scoped player rather
+    // than the source's controller.
+    let mut sub_player_scope: Option<PlayerFilter> = None;
+    if subject_application_is_player_scoped(sub_text, &mut continuation_ctx) {
+        if let Some(ast) = try_parse_subject_predicate_ast(sub_text, &mut continuation_ctx) {
+            let mut rerouted = lower_clause_ast(ast, &mut continuation_ctx);
+            if !matches!(rerouted.effect, Effect::Unimplemented { .. }) {
+                sub_player_scope = lift_effect_player_class_to_scope(&mut rerouted.effect);
+                sub_clause = rerouted;
+            }
+        }
+    }
+
     // CR 608.2c: Verb carry-forward for bare "target X" clauses in compound actions.
     // When the sub-text starts with "target" and parsed as Unimplemented or
     // the structural TargetOnly wrapper, prepend the verb from the primary
@@ -8756,6 +8820,14 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // "untap it and all Samurai you control" splits into sub-text
     // "all Samurai you control"; prepend the primary verb so the existing
     // mass parser sees "untap all Samurai you control".
+    //
+    // CR 109.5: but "each of your opponents loses life …" is a player
+    // subject-predicate clause, not a verbless object continuation — never
+    // re-head it with the primary action verb. `subject_application_is_player_scoped`
+    // fires only when the conjunct's subject resolves to a player-scoped filter
+    // (the "each of your opponents" controller-only shape); object continuations
+    // like "all Samurai you control" resolve to an object filter and still carry
+    // forward.
     if matches!(sub_clause.effect, Effect::Unimplemented { .. })
         && alt((
             tag::<_, _, OracleError<'_>>("all "),
@@ -8763,6 +8835,7 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         ))
         .parse(sub_lower.as_str())
         .is_ok()
+        && !subject_application_is_player_scoped(sub_text, &mut continuation_ctx)
     {
         if let Some(verb) = extract_effect_verb(&primary_effect) {
             let reparsed_text = format!("{verb} {sub_text}");
@@ -8865,6 +8938,11 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // CR 115.6: Propagate "up to N" cardinality so the sub-clause target
     // remains optional (e.g. "up to one other target artifact or enchantment").
     sub_ability.multi_target = sub_clause.multi_target;
+    // CR 119.3 + CR 109.5: Install the iterating player scope lifted from an
+    // "each of your opponents" subject conjunct so the resolver iterates each
+    // opponent and the inner effect drains the scoped player (not the source's
+    // controller). See `lift_effect_player_class_to_scope`.
+    sub_ability.player_scope = sub_player_scope;
 
     // CR 115.1d: Recover the PRIMARY clause's "up to N" cardinality, which
     // `try_parse_verb_and_target` discards when it lowers a PutCounter to a
@@ -11135,6 +11213,69 @@ fn target_filter_controller_ref(filter: &TargetFilter) -> Option<ControllerRef> 
     }
 }
 
+/// CR 119.3 + CR 109.5: Convert a player-CLASS subject filter (a controller-only
+/// typed filter denoting "each of your opponents", produced by
+/// `parse_subject_application`) into the `PlayerFilter` iteration scope the
+/// resolver drives via `AbilityDefinition.player_scope`.
+///
+/// This is the canonical Bloodletting / Exsanguinate idiom: the engine iterates
+/// the player set with `resolve_ability_chain` rebinding the acting `controller`
+/// per player, while the inner effect (e.g. `LoseLife { target: None }`) reads
+/// that iterated player. A controller-only filter such as
+/// `Typed(controller=Opponent)` is NOT a context ref (`is_context_ref()` is
+/// false), so leaving it on `LoseLife.target` would fall through to the source
+/// controller fallback in `resolve_life_loss_target` and drain the wrong player.
+///
+/// Only the controller-only player CLASS shape (matched by `is_player_filter`)
+/// is lifted; filters that name a single, resolution-chosen, or object-bound
+/// player belong on the effect's own target field and return `None`.
+fn player_class_filter_as_scope(filter: &TargetFilter) -> Option<PlayerFilter> {
+    match filter {
+        TargetFilter::Typed(tf) if tf.type_filters.is_empty() && tf.properties.is_empty() => {
+            match tf.controller {
+                // "each of your opponents" — iterate every opponent of the controller.
+                Some(ControllerRef::Opponent) => Some(PlayerFilter::Opponent),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// CR 119.3 + CR 109.5: If `effect` carries an iterating player-CLASS filter on
+/// its player field (stamped by `inject_subject_target` for an "each of your
+/// opponents" subject), strip it back to the undirected form and return the
+/// corresponding `player_scope`. The caller installs that scope on the
+/// surrounding `AbilityDefinition`, so resolution iterates the player set and
+/// the inner effect drains/acts on each scoped player (Bloodletting idiom)
+/// rather than falling through to the source controller fallback.
+///
+/// Returns `None` (leaving the effect untouched) for any non-class player
+/// reference.
+fn lift_effect_player_class_to_scope(effect: &mut Effect) -> Option<PlayerFilter> {
+    fn lift_required_target(target: &mut TargetFilter) -> Option<PlayerFilter> {
+        let scope = player_class_filter_as_scope(target)?;
+        *target = TargetFilter::Controller;
+        Some(scope)
+    }
+
+    match effect {
+        Effect::LoseLife { target, .. } => {
+            let scope = target.as_ref().and_then(player_class_filter_as_scope)?;
+            *target = None;
+            Some(scope)
+        }
+        Effect::GainLife { player, .. } => lift_required_target(player),
+        Effect::Draw { target, .. }
+        | Effect::Discard { target, .. }
+        | Effect::Mill { target, .. }
+        | Effect::Scry { target, .. }
+        | Effect::Surveil { target, .. }
+        | Effect::Connive { target, .. } => lift_required_target(target),
+        _ => None,
+    }
+}
+
 /// CR 701.16a + CR 115.1: Unconditionally set the controller constraint on a
 /// typed object filter, overwriting any existing value. Used when a targeted
 /// subject ("target opponent sacrifices...") must override a pre-parsed "they
@@ -11638,13 +11779,15 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
                 force_controller(target, effective_ctrl);
             }
         }
-        // CR 115.1c / CR 602.2b + CR 601.2c / CR 119.3: "Target player gains
-        // N life" / "target opponent gains N life" announces a player target;
-        // the chosen player, not the source controller, gains the life.
+        // CR 115.1c / CR 602.2b + CR 601.2c / CR 119.3: "<player> gains
+        // N life" binds the subject player, not the source controller. Targeted
+        // subjects announce a player target; non-targeted player classes
+        // ("each of your opponents") are lifted to `player_scope` by
+        // `lift_effect_player_class_to_scope`.
         Effect::GainLife {
             player: player @ TargetFilter::Controller,
             ..
-        } if subject.target.is_some() && target_filter_can_target_player(&subject_filter) => {
+        } if target_filter_can_target_player(&subject_filter) => {
             *player = subject_filter;
         }
         // CR 119.3 + CR 115.1d: "they lose N life" — inject subject's player reference.
@@ -19048,8 +19191,8 @@ mod tests {
         CastVariantPaid, ChoiceType, ChosenSubtypeKind, CombatRelation, CombatRelationSubject,
         Comparator, ContinuousModification, ControllerRef, CopyRetargetPermission, CountScope,
         DoublePTMode, Duration, FilterProp, LibraryPosition, LinkedExileScope, ManaContribution,
-        ManaProduction, ObjectProperty, ObjectScope, PermissionGrantee, PlayerRelation,
-        PreventionScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
+        ManaProduction, ObjectProperty, ObjectScope, PermissionGrantee, PlayerFilter,
+        PlayerRelation, PreventionScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
         SearchSelectionConstraint, SharedQuality, TargetChoiceTiming, TypeFilter, TypedFilter,
         ZoneRef,
     };
@@ -19058,6 +19201,140 @@ mod tests {
     use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaExpiry};
     use crate::types::player::PlayerCounterKind;
+
+    /// CR 701.55 + CR 608.2d + CR 400.7: the villainous-choice chapter-IV branch
+    /// "Destroy all Dalek creatures and each of your opponents loses life equal
+    /// to the total power of Daleks that died this turn" must split into
+    /// `DestroyAll{Dalek}` + a `LoseLife` sub_ability whose amount is the
+    /// `ZoneChangeAggregateThisTurn` death-power aggregate — NOT collapse to an
+    /// empty-filter mass DestroyAll, and NOT drop the `, or …` alternative. The
+    /// `LoseLife.target` must carry the "each of your opponents" player scope
+    /// (CR 119.3); dropping it would redirect the loss to Genesis's controller.
+    #[test]
+    fn genesis_villainous_branch_splits_destroy_and_lose_life() {
+        let mut ctx = ParseContext::default();
+        let full = "Target opponent faces a villainous choice — Destroy all Dalek creatures and each of your opponents loses life equal to the total power of Daleks that died this turn, or destroy all non-Dalek creatures";
+        let clause = parse_effect_clause(full, &mut ctx);
+        let Effect::ChooseOneOf { branches, .. } = &clause.effect else {
+            panic!("expected ChooseOneOf, got {:?}", clause.effect);
+        };
+        assert_eq!(branches.len(), 2, "must keep both choice branches");
+
+        // Branch 1: DestroyAll{Dalek} with a LoseLife sub_ability.
+        let Effect::DestroyAll { target, .. } = &*branches[0].effect else {
+            panic!("expected DestroyAll branch 1, got {:?}", branches[0].effect);
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("expected typed DestroyAll filter");
+        };
+        assert!(
+            !tf.type_filters.is_empty(),
+            "branch 1 must NOT be an empty-filter mass destroy: {tf:?}"
+        );
+        let sub = branches[0]
+            .sub_ability
+            .as_ref()
+            .expect("branch 1 must carry the LoseLife sub_ability");
+        let Effect::LoseLife { amount, target } = &*sub.effect else {
+            panic!("expected LoseLife sub_ability, got {:?}", sub.effect);
+        };
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::ZoneChangeAggregateThisTurn {
+                    function, property, ..
+                },
+        } = amount
+        else {
+            panic!("expected ZoneChangeAggregateThisTurn amount, got {amount:?}");
+        };
+        assert_eq!(*function, AggregateFunction::Sum);
+        assert_eq!(*property, ObjectProperty::Power);
+        // CR 119.3 + CR 109.5: the "each of your opponents" subject is lifted to
+        // the sub_ability's `player_scope` (the canonical Bloodletting idiom),
+        // leaving `LoseLife.target: None`. A controller-only `Typed(Opponent)`
+        // target is NOT a context ref, so it would resolve to Genesis's
+        // controller (the inverse of the Oracle text); the iterating scope makes
+        // each opponent the life loser instead. End-to-end resolution is asserted
+        // in `genesis_each_opponent_loses_life_drains_opponent` (effects/life.rs).
+        assert_eq!(
+            *target, None,
+            "LoseLife.target must be lifted to player_scope, got {target:?}"
+        );
+        assert_eq!(
+            sub.player_scope,
+            Some(PlayerFilter::Opponent),
+            "sub_ability must carry the each-opponent player_scope, got {:?}",
+            sub.player_scope
+        );
+
+        // Branch 2: DestroyAll{non-Dalek} unchanged.
+        assert!(matches!(&*branches[1].effect, Effect::DestroyAll { .. }));
+    }
+
+    /// CR 109.5 + CR 119.3 + CR 121.1: the compound player-subject reroute is a
+    /// player-effect class helper, not a Genesis-only `LoseLife` special case.
+    /// Controller-only player-class targets such as "each of your opponents" must
+    /// lift to `player_scope: Opponent` and restore the inner effect's target to
+    /// `Controller`, the shape the resolution driver already fans out correctly.
+    #[test]
+    fn compound_player_subject_lifts_draw_and_gain_life_scope() {
+        let mut ctx = ParseContext::default();
+        let draw_clause = try_split_targeted_compound(
+            "destroy target creature and each of your opponents draws a card",
+            &mut ctx,
+        )
+        .expect("compound must split");
+        let draw = draw_clause
+            .sub_ability
+            .as_ref()
+            .expect("draw sub-ability must be present");
+        let Effect::Draw { target, .. } = &*draw.effect else {
+            panic!("expected Draw sub-ability, got {:?}", draw.effect);
+        };
+        assert_eq!(*target, TargetFilter::Controller);
+        assert_eq!(draw.player_scope, Some(PlayerFilter::Opponent));
+
+        let mut ctx = ParseContext::default();
+        let gain_clause = try_split_targeted_compound(
+            "destroy target creature and each of your opponents gains 2 life",
+            &mut ctx,
+        )
+        .expect("compound must split");
+        let gain = gain_clause
+            .sub_ability
+            .as_ref()
+            .expect("gain-life sub-ability must be present");
+        let Effect::GainLife { player, .. } = &*gain.effect else {
+            panic!("expected GainLife sub-ability, got {:?}", gain.effect);
+        };
+        assert_eq!(*player, TargetFilter::Controller);
+        assert_eq!(gain.player_scope, Some(PlayerFilter::Opponent));
+    }
+
+    /// CR 608.2c regression guard: the legitimate mass-object verb carry-forward
+    /// ("untap it and all Samurai you control") must STILL fire — the Step 5
+    /// player-scope guard only blocks player subject-predicate continuations, not
+    /// object continuations whose filter has a non-empty type set.
+    #[test]
+    fn untap_and_all_samurai_carry_forward_still_fires() {
+        let mut ctx = ParseContext::default();
+        let clause = try_split_targeted_compound(
+            "untap target creature and all Samurai you control",
+            &mut ctx,
+        )
+        .expect("compound must split");
+        let sub = clause
+            .sub_ability
+            .as_ref()
+            .expect("carry-forward must produce a sub_ability");
+        // The continuation parsed to a non-Unimplemented effect (the verb carried
+        // forward onto the Samurai object filter).
+        assert!(
+            !matches!(&*sub.effect, Effect::Unimplemented { .. }),
+            "Samurai object continuation must carry the untap verb, got {:?}",
+            sub.effect
+        );
+    }
 
     #[test]
     fn infer_origin_zone_handles_top_of_your_library() {
