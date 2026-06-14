@@ -92,6 +92,7 @@ mod integration_adventure;
 mod integration_bending;
 mod integration_landfall;
 mod invoke_calamity_free_cast;
+mod issue_1202_prepared_spell_cast_timing;
 mod issue_1297_venture_initiative_triggers;
 mod issue_1302_final_parting;
 mod issue_1305_thalisse_tokens_created_this_turn;
