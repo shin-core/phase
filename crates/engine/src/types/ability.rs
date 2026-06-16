@@ -13839,6 +13839,8 @@ pub enum DamageModification {
 pub enum QuantityModification {
     /// count * 2 — Primal Vigor, Doubling Season, Parallel Lives, Anointed Procession
     Double,
+    /// count / 2 rounded down — Halving Season
+    Half,
     /// count + value — Hardened Scales (+1)
     Plus { value: u32 },
     /// count.saturating_sub(value) — Vizier of Remedies (-1)
