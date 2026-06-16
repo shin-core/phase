@@ -3808,8 +3808,44 @@ pub fn find_applicable_replacements(
                             if !player_ok {
                                 continue;
                             }
-                        } else if repl_def.valid_player.is_some() {
-                            continue;
+                        } else if let Some(valid_player) = &repl_def.valid_player {
+                            // Quantity-modifying counter replacements (Halving Season
+                            // class) may scope by permanent controller; player-counter
+                            // prohibitions with valid_player stay player-only.
+                            if !matches!(
+                                repl_def.quantity_modification,
+                                Some(
+                                    QuantityModification::Double
+                                        | QuantityModification::Half
+                                        | QuantityModification::Plus { .. }
+                                        | QuantityModification::Minus { .. }
+                                )
+                            ) {
+                                continue;
+                            }
+                            // CR 614.1a: Opponent-scoped counter replacements
+                            // (Halving Season) apply to counters on permanents
+                            // controlled by an opponent, not only player counters.
+                            let Some(object_id) = placement.object_id() else {
+                                continue;
+                            };
+                            let Some(affected_controller) =
+                                state.objects.get(&object_id).map(|o| o.controller)
+                            else {
+                                continue;
+                            };
+                            let player_ok = match valid_player {
+                                crate::types::ability::ReplacementPlayerScope::Opponent => {
+                                    affected_controller != obj.controller
+                                }
+                                crate::types::ability::ReplacementPlayerScope::You => {
+                                    affected_controller == obj.controller
+                                }
+                                crate::types::ability::ReplacementPlayerScope::AnyPlayer => true,
+                            };
+                            if !player_ok {
+                                continue;
+                            }
                         }
                     } else if repl_def.event == ReplacementEvent::AddCounter
                         && repl_def.valid_player.is_some()
@@ -10522,6 +10558,124 @@ mod tests {
             panic!("expected CreateToken");
         };
         assert_eq!(count, 2, "five tokens halved (rounded down) → two");
+    }
+
+    /// CR 614.1a: Halving Season halves opponent counter batches on permanents.
+    #[test]
+    fn halving_season_halves_opponent_counter_placement_on_permanents() {
+        use crate::types::ability::QuantityModification;
+        use crate::types::counter::CounterType;
+        use crate::types::proposed_event::CounterPlacement;
+
+        let halving_season = ObjectId(10);
+        let opponent_creature = ObjectId(20);
+        let halver_repl = {
+            let mut repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .quantity_modification(QuantityModification::Half);
+            repl.valid_player = Some(ReplacementPlayerScope::Opponent);
+            repl
+        };
+
+        let mut state = GameState::new_two_player(42);
+        let mut hs = GameObject::new(
+            halving_season,
+            CardId(1),
+            PlayerId(0),
+            "Halving Season".to_string(),
+            Zone::Battlefield,
+        );
+        hs.replacement_definitions = vec![halver_repl].into();
+        state.objects.insert(halving_season, hs);
+        state.battlefield.push_back(halving_season);
+
+        let creature = GameObject::new(
+            opponent_creature,
+            CardId(2),
+            PlayerId(1),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.insert(opponent_creature, creature);
+        state.battlefield.push_back(opponent_creature);
+
+        let proposed = ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(1),
+                object_id: opponent_creature,
+                counter_type: CounterType::Plus1Plus1,
+            },
+            count: 5,
+            applied: HashSet::new(),
+        };
+
+        let mut events = Vec::new();
+        let result = replace_event(&mut state, proposed, &mut events);
+        let ReplacementResult::Execute(primary) = result else {
+            panic!("expected Execute, got {:?}", result);
+        };
+        let ProposedEvent::AddCounter { count, .. } = primary else {
+            panic!("expected AddCounter");
+        };
+        assert_eq!(count, 2, "five counters halved (rounded down) → two");
+    }
+
+    /// CR 614.1a: Halving Season must not halve counters on permanents you control.
+    #[test]
+    fn halving_season_skips_controller_owned_permanent_counters() {
+        use crate::types::ability::QuantityModification;
+        use crate::types::counter::CounterType;
+        use crate::types::proposed_event::CounterPlacement;
+
+        let halving_season = ObjectId(10);
+        let own_creature = ObjectId(20);
+        let halver_repl = {
+            let mut repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .quantity_modification(QuantityModification::Half);
+            repl.valid_player = Some(ReplacementPlayerScope::Opponent);
+            repl
+        };
+
+        let mut state = GameState::new_two_player(42);
+        let mut hs = GameObject::new(
+            halving_season,
+            CardId(1),
+            PlayerId(0),
+            "Halving Season".to_string(),
+            Zone::Battlefield,
+        );
+        hs.replacement_definitions = vec![halver_repl].into();
+        state.objects.insert(halving_season, hs);
+        state.battlefield.push_back(halving_season);
+
+        let creature = GameObject::new(
+            own_creature,
+            CardId(2),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.insert(own_creature, creature);
+        state.battlefield.push_back(own_creature);
+
+        let proposed = ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: own_creature,
+                counter_type: CounterType::Plus1Plus1,
+            },
+            count: 5,
+            applied: HashSet::new(),
+        };
+
+        let mut events = Vec::new();
+        let result = replace_event(&mut state, proposed, &mut events);
+        let ReplacementResult::Execute(ProposedEvent::AddCounter { count, .. }) = result else {
+            panic!("expected Execute, got {:?}", result);
+        };
+        assert_eq!(
+            count, 5,
+            "controller-owned counters must pass through unchanged"
+        );
     }
 
     /// CR 614.1a: Bloodletter of Aclazotz doubles opponent life loss on the
