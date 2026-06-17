@@ -4998,6 +4998,94 @@ mod tests {
     use crate::parser::oracle_effect::parse_effect_chain;
     use crate::types::ability::CountScope;
 
+    /// Issue #69 (Banewhip Punisher): "Destroy target creature that has a -1/-1
+    /// counter on it" — the relative-clause counter restriction was dropped, so
+    /// the activated ability destroyed ANY creature. The target filter must now
+    /// carry `FilterProp::Counters{OfType(Minus1Minus1), GE, 1}`. CR 122.1 /
+    /// CR 122.1a.
+    #[test]
+    fn banewhip_punisher_destroy_creature_with_minus_counter() {
+        use crate::types::counter::{CounterMatch, CounterType};
+        let r = parse(
+            "{B}, Sacrifice this creature: Destroy target creature that has a -1/-1 counter on it.",
+            "Banewhip Punisher",
+            &[],
+            &["Creature"],
+            &[],
+        );
+        assert_eq!(r.abilities.len(), 1, "{r:#?}");
+        let Effect::Destroy { target, .. } = &*r.abilities[0].effect else {
+            panic!("expected Destroy effect, got {:?}", r.abilities[0].effect);
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("expected typed target, got {target:?}");
+        };
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(
+            tf.properties.contains(&FilterProp::Counters {
+                counters: CounterMatch::OfType(CounterType::Minus1Minus1),
+                comparator: Comparator::GE,
+                count: QuantityExpr::Fixed { value: 1 },
+            }),
+            "counter restriction must survive, got {:?}",
+            tf.properties
+        );
+    }
+
+    /// Issue #69 (Triad of Fates): "Exile target creature that has a fate counter
+    /// on it, then return it to the battlefield…" — the exile target ChangeZone
+    /// filter must carry the fate-counter restriction, and the "then return it"
+    /// tail must still fully parse (the ability stays supported, not
+    /// Unimplemented). CR 122.1.
+    #[test]
+    fn triad_of_fates_exile_creature_with_fate_counter() {
+        use crate::types::counter::{CounterMatch, CounterType};
+        let r = parse(
+            "{W}, {T}: Exile target creature that has a fate counter on it, then return it to the battlefield under its owner's control.",
+            "Triad of Fates",
+            &[],
+            &["Creature"],
+            &[],
+        );
+        assert_eq!(r.abilities.len(), 1, "{r:#?}");
+        let ability = &r.abilities[0];
+        let Effect::ChangeZone {
+            destination,
+            target,
+            ..
+        } = &*ability.effect
+        else {
+            panic!(
+                "expected ChangeZone (exile) effect, got {:?}",
+                ability.effect
+            );
+        };
+        assert_eq!(*destination, Zone::Exile);
+        let TargetFilter::Typed(tf) = target else {
+            panic!("expected typed exile target, got {target:?}");
+        };
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(
+            tf.properties.contains(&FilterProp::Counters {
+                counters: CounterMatch::OfType(CounterType::Generic("fate".to_string())),
+                comparator: Comparator::GE,
+                count: QuantityExpr::Fixed { value: 1 },
+            }),
+            "fate-counter restriction must survive, got {:?}",
+            tf.properties
+        );
+        // The "then return it…" tail must parse as the return sub-ability, so the
+        // card stays supported (no Unimplemented effect anywhere).
+        assert!(
+            ability.sub_ability.is_some(),
+            "the return-to-battlefield tail must parse as a sub-ability"
+        );
+        assert!(
+            !matches!(&*ability.effect, Effect::Unimplemented { .. }),
+            "ability must not be Unimplemented"
+        );
+    }
+
     /// Test helper: pull the graveyard-exile sub-cost count out of a compound
     /// `Keyword::Escape(EscapeCost::NonMana(Composite[Mana, Exile{count,...}]))`.
     /// Asserts exactly one `Exile` sub-cost is present and returns its count.
