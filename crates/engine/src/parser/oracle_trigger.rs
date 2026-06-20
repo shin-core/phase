@@ -4736,9 +4736,17 @@ fn split_cross_subject_event_compound(cond_lower: &str, condition: &str) -> Opti
 
     // Check if what follows " or " starts with a valid subject phrase
     // (a/an/the + type word, or "a player", "an opponent", etc.)
-    if parse_cross_subject_phrase_start(after_lower.trim_start()).is_err() {
+    let after_trimmed = after_lower.trim_start();
+    if parse_cross_subject_phrase_start(after_trimmed).is_err() {
         return None;
     }
+
+    // CR 508.3a: The second half must contain an event verb to be a genuine
+    // cross-subject compound trigger. Without this guard, attack-target scope
+    // extensions ("attacks you or a planeswalker you control") are mis-split
+    // because "a planeswalker you control" starts with an article but has no
+    // event verb — it extends the attack target, not the trigger event.
+    scan_preceded(after_trimmed, |i| parse_event_verb_start(i))?;
 
     let (_, keyword) = parse_trigger_keyword_prefix(cond_lower).ok()?;
 
@@ -14857,6 +14865,28 @@ mod tests {
             attack_trigger.valid_card,
             Some(TargetFilter::Typed(_))
         ));
+    }
+
+    /// CR 508.3a: "attacks you or a planeswalker you control" is a single
+    /// attack-target scope (PlayerOrPlaneswalker), NOT a cross-subject compound.
+    /// The production path (`parse_trigger_lines`) must produce exactly one
+    /// trigger — not mis-split at " or ".
+    #[test]
+    fn trigger_attacks_you_or_planeswalker_not_split() {
+        let triggers = parse_trigger_lines(
+            "Whenever a creature attacks you or a planeswalker you control, that creature's controller loses 1 life.",
+            "Revenge of Ravens",
+        );
+        assert_eq!(
+            triggers.len(),
+            1,
+            "attack-target scope extension must not be split into two triggers"
+        );
+        assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+        assert_eq!(
+            triggers[0].attack_target_filter,
+            Some(AttackTargetFilter::PlayerOrPlaneswalker)
+        );
     }
 
     #[test]
