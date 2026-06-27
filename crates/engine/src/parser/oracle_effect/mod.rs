@@ -22474,7 +22474,7 @@ pub(crate) fn parse_unless_for_each_payment(
 }
 
 /// Parse "where X is this creature's power" and similar dynamic quantity clauses.
-fn parse_where_x_is(text: &str) -> Option<QuantityExpr> {
+pub(super) fn parse_where_x_is(text: &str) -> Option<QuantityExpr> {
     let trimmed = text.trim().trim_start_matches(',').trim();
     let (rest, _) = tag::<_, _, OracleError<'_>>("where x is ")
         .parse(trimmed)

@@ -4066,6 +4066,11 @@ mod tests {
                 "Counter-Discard",
                 &["Instant"][..],
             ),
+            (
+                "At the beginning of your upkeep, for each player, this enchantment deals 1 damage to that player unless they pay {B} or {3}.",
+                "Lim-Dul's Hex",
+                &["Enchantment"][..],
+            ),
         ] {
             let parsed = parse_named(oracle, name, types);
             assert!(
