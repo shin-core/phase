@@ -377,6 +377,7 @@ mod issue_4269_nested_shambler_death_tokens;
 mod issue_4271_birthing_ritual_cmc_filter;
 mod issue_4272_birthing_ritual_etb_triggers;
 mod issue_4420_lava_blister_unless_deal_damage;
+mod issue_4459_decoy_gambit_unless_have_you_draw;
 mod issue_536_six_grants_retrace;
 mod issue_541_endurance_graveyard_to_bottom;
 mod issue_544_krark_clan_ironworks_auto_pass;
