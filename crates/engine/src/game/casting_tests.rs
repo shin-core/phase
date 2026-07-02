@@ -2821,6 +2821,138 @@ fn composite_mana_tap_activation_excludes_source_from_auto_tap() {
 }
 
 #[test]
+fn handle_activate_rejects_tapped_one_of_tap_branches() {
+    use crate::parser::oracle_cost::parse_oracle_cost;
+    use crate::types::mana::{ManaType, ManaUnit};
+
+    let mut state = setup_game_at_main_phase();
+    let cost = parse_oracle_cost("{3}, {T} or {R}, {T}");
+    let source = create_colorless_tap_activated_source(
+        &mut state,
+        PlayerId(0),
+        cost,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    );
+    state.players[0]
+        .mana_pool
+        .add(ManaUnit::new(ManaType::Colorless, source, false, vec![]));
+    state.players[0]
+        .mana_pool
+        .add(ManaUnit::new(ManaType::Colorless, source, false, vec![]));
+    state.players[0]
+        .mana_pool
+        .add(ManaUnit::new(ManaType::Colorless, source, false, vec![]));
+    state.players[0]
+        .mana_pool
+        .add(ManaUnit::new(ManaType::Red, source, false, vec![]));
+    state.objects.get_mut(&source).unwrap().tapped = true;
+
+    assert!(!can_activate_ability_now(&state, PlayerId(0), source, 1));
+
+    let mut events = Vec::new();
+    let result = handle_activate_ability(&mut state, PlayerId(0), source, 1, &mut events);
+
+    assert!(
+        result.is_err(),
+        "direct ActivateAbility must reject tapped OneOf {{T}} branches"
+    );
+    assert!(events.is_empty());
+}
+
+#[test]
+fn legacy_equip_effect_cost_one_of_is_legal_without_mana_when_discard_available() {
+    use crate::ai_support::legal_actions;
+    use crate::types::ability::{AbilityTag, CardSelectionMode, PlayerFilter};
+
+    let mut state = setup_game_at_main_phase();
+    let creature = create_object(
+        &mut state,
+        CardId(98),
+        PlayerId(0),
+        "Grizzly Bears".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let obj = state.objects.get_mut(&creature).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.power = Some(2);
+        obj.toughness = Some(2);
+    }
+    let equip_cost = AbilityCost::EffectCost {
+        effect: Box::new(Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![
+                AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PayCost {
+                        cost: AbilityCost::Mana {
+                            cost: ManaCost::Cost {
+                                generic: 3,
+                                shards: vec![],
+                            },
+                        },
+                        scale: None,
+                        payer: TargetFilter::Controller,
+                    },
+                ),
+                AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Discard {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                        selection: CardSelectionMode::Chosen,
+                        unless_filter: None,
+                        filter: None,
+                    },
+                ),
+            ],
+        }),
+    };
+    let source = create_colorless_tap_activated_source(
+        &mut state,
+        PlayerId(0),
+        equip_cost,
+        Effect::Attach {
+            attachment: TargetFilter::SelfRef,
+            target: TargetFilter::Typed(TypedFilter::creature()),
+        },
+    );
+    {
+        let obj = state.objects.get_mut(&source).unwrap();
+        obj.card_types
+            .core_types
+            .push(crate::types::card_type::CoreType::Artifact);
+        obj.card_types.subtypes.push("Equipment".to_string());
+        Arc::make_mut(&mut obj.abilities)[1].ability_tag = Some(AbilityTag::Equip);
+    }
+    let _hand_card = create_object(
+        &mut state,
+        CardId(99),
+        PlayerId(0),
+        "Hand Card".to_string(),
+        Zone::Hand,
+    );
+
+    assert!(
+        can_activate_ability_now(&state, PlayerId(0), source, 1),
+        "legacy EffectCost equip disjunction must be legal when discard is affordable"
+    );
+    assert!(
+        legal_actions(&state).iter().any(|action| matches!(
+            action,
+            GameAction::ActivateAbility {
+                source_id,
+                ability_index: 1,
+            } if *source_id == source
+        )),
+        "legal actions must offer legacy EffectCost equip when discard is affordable"
+    );
+}
+
+#[test]
 fn composite_mana_tap_sacrifice_activation_uses_alternate_mana_source() {
     let mut state = setup_game_at_main_phase();
     let source_cost = AbilityCost::Composite {
