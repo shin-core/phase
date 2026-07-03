@@ -72,7 +72,7 @@ fn parse_digit_number(input: &str) -> OracleResult<'_, u32> {
 fn parse_english_number(input: &str) -> OracleResult<'_, u32> {
     // Longest-match-first ordering within shared prefixes (e.g. "fourteen" before "four").
     // Split into multiple alt groups to stay within nom's 21-element tuple limit.
-    alt((
+    let (rest, matched) = alt((
         value(100u32, tag("one hundred")),
         parse_hyphenated_english_number,
         parse_english_tens,
@@ -101,7 +101,22 @@ fn parse_english_number(input: &str) -> OracleResult<'_, u32> {
         value(1, tag("one")),
         parse_article_number,
     )))
-    .parse(input)
+    .parse(input)?;
+
+    // Require a word boundary after the number word so a cardinal isn't matched
+    // inside a longer word ("sixth" → "six", "tenfold" → "ten", "nineteenth" →
+    // "nineteen"). This mirrors the boundary guard `parse_article_number` already
+    // applies to "a"/"an"; the multi-character number words previously lacked it
+    // because the `oracle_util::parse_number` wrapper only guards matches of ≤2
+    // characters. A following ASCII alphanumeric means the token continues, so
+    // the match was a spurious substring.
+    match rest.chars().next() {
+        Some(c) if c.is_ascii_alphanumeric() => Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        ))),
+        _ => Ok((rest, matched)),
+    }
 }
 
 fn parse_english_tens(input: &str) -> OracleResult<'_, u32> {
@@ -1176,6 +1191,43 @@ mod tests {
         assert_eq!(parse_number("ninety-nine").unwrap().1, 99);
         assert_eq!(parse_number("ninety").unwrap().1, 90);
         assert_eq!(parse_number("one hundred").unwrap().1, 100);
+    }
+
+    /// A cardinal number word must not be matched inside a longer word (e.g.
+    /// the ordinal "sixth" or "tenfold"). The multi-character words previously
+    /// lacked the word-boundary guard that `parse_article_number` applies to
+    /// "a"/"an", and the `oracle_util::parse_number` wrapper only guarded
+    /// matches of ≤2 characters — so "sixth" parsed as 6, "tenth" as 10, etc.
+    #[test]
+    fn test_parse_english_number_requires_word_boundary() {
+        // Longer words that merely start with a cardinal must NOT parse.
+        for embedded in [
+            "sixth",
+            "tenth",
+            "tenfold",
+            "threefold",
+            "nineteenth",
+            "fourteener",
+        ] {
+            assert!(
+                parse_number(embedded).is_err(),
+                "{embedded:?} must not parse as an embedded cardinal"
+            );
+        }
+        // Genuine cardinals with a trailing boundary still parse, remainder intact.
+        assert_eq!(parse_number("six cards").unwrap(), (" cards", 6));
+        assert_eq!(parse_number("ten").unwrap(), ("", 10));
+        assert_eq!(
+            parse_number("nineteen creatures").unwrap(),
+            (" creatures", 19)
+        );
+        assert_eq!(
+            parse_number("three, then draw").unwrap(),
+            (", then draw", 3)
+        );
+        // Distinct number words that merely share a prefix are unaffected.
+        assert_eq!(parse_number("sixteen").unwrap(), ("", 16));
+        assert_eq!(parse_number("sixty").unwrap(), ("", 60));
     }
 
     /// `parse_strict_counter_type` accepts recognized counter tokens (keyword
