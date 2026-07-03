@@ -6269,13 +6269,30 @@ fn apply_pending_spell_cost_reductions(
     }
 }
 
-/// CR 601.2f: Consume (remove) a one-shot pending cost reduction after a spell is cast.
-pub(super) fn consume_pending_spell_cost_reduction(state: &mut GameState, caster: PlayerId) {
-    if let Some(idx) = state
-        .pending_spell_cost_reductions
-        .iter()
-        .position(|r| r.player == caster && r.spell_filter.is_none())
-    {
+/// CR 601.2f: Consume (remove) the one-shot pending cost reduction a cast spell
+/// used. Removes the first entry for this caster that the cast spell matches —
+/// whether unfiltered OR filter-matched (e.g. "the next face-down creature spell
+/// you cast this turn costs {3} less", Kadena) — mirroring the single entry that
+/// [`apply_pending_spell_cost_reductions`] applied (it also stops at the first
+/// match). The previous predicate removed only *unfiltered* entries, so a
+/// filtered reduction was never consumed and kept discounting every matching
+/// spell for the rest of the turn instead of just the next one. Mirrors
+/// [`consume_pending_next_spell_modifiers`].
+pub(super) fn consume_pending_spell_cost_reduction(
+    state: &mut GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+) {
+    let matched = state.pending_spell_cost_reductions.iter().position(|r| {
+        r.player == caster
+            && match &r.spell_filter {
+                None => true,
+                Some(filter) => {
+                    spell_matches_cost_filter(state, caster, spell_id, filter, spell_id)
+                }
+            }
+    });
+    if let Some(idx) = matched {
         state.pending_spell_cost_reductions.remove(idx);
     }
 }
