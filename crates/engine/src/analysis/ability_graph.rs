@@ -2118,6 +2118,7 @@ mod tests {
             amount,
             target: default_target_filter_any(),
             damage_source: None,
+            excess: None,
         }
     }
     fn set_tap(state: TapStateChange) -> Effect {

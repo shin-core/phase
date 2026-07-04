@@ -3406,6 +3406,7 @@ fn parse_unless_player_have_deal_damage_cost(after_unless: &str) -> Option<Abili
             amount,
             target: TargetFilter::Player,
             damage_source: None,
+            excess: None,
         }),
     })
 }
@@ -4557,6 +4558,7 @@ fn try_parse_have_causative(
                             amount,
                             target,
                             damage_source: None,
+                            excess: None,
                         }));
                     }
                 }
@@ -4565,6 +4567,7 @@ fn try_parse_have_causative(
                         amount,
                         target: TargetFilter::Player,
                         damage_source: None,
+                        excess: None,
                     }));
                 }
                 // CR 608.2d: "have this artifact deal 1 damage to it" (Requiem
@@ -4575,6 +4578,7 @@ fn try_parse_have_causative(
                         amount,
                         target: TargetFilter::ParentTarget,
                         damage_source: None,
+                        excess: None,
                     }));
                 }
             }
@@ -10414,10 +10418,15 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
                 amount,
                 target,
                 damage_source,
+                excess,
             } => Effect::DealDamage {
                 amount: replace_fixed_quantity(amount, quantity.clone()),
                 target,
                 damage_source,
+                // CR 120.4a: preserve the excess-redirect rider when the fixed
+                // amount is replaced by a for-each quantity (e.g. Gandalf's
+                // Sanction's X). Dropping it here would silently lose the redirect.
+                excess,
             },
             Effect::DamageEachPlayer {
                 amount,
@@ -13238,6 +13247,7 @@ fn parse_bare_damage_continuation<'a>(
                 amount,
                 target: TargetFilter::ParentTarget,
                 damage_source: None,
+                excess: None,
             },
             "",
         ));
@@ -13250,6 +13260,7 @@ fn parse_bare_damage_continuation<'a>(
             amount,
             target,
             damage_source: None,
+            excess: None,
         },
         rem,
     ))
@@ -24538,6 +24549,7 @@ fn parse_unless_have_deal_damage_cost(after_unless: &str) -> Option<AbilityCost>
             amount,
             target: TargetFilter::Player,
             damage_source: None,
+            excess: None,
         }),
     })
 }

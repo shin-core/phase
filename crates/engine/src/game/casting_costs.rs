@@ -9125,6 +9125,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 3 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
             vec![TargetRef::Object(target)],
             spell,
@@ -9405,6 +9406,7 @@ mod tests {
                 },
                 target: TargetFilter::Typed(TypedFilter::creature()),
                 damage_source: None,
+                excess: None,
             },
             Vec::new(),
             source,
@@ -9763,6 +9765,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 2 },
                 target: TargetFilter::Typed(TypedFilter::default().with_type(TypeFilter::Creature)),
                 damage_source: None,
+                excess: None,
             },
             Vec::new(),
             spell,
@@ -15940,6 +15943,7 @@ its replicate cost was paid.)\nDraw a card.";
             amount: QuantityExpr::Fixed { value: 1 },
             target: TargetFilter::Any,
             damage_source: None,
+            excess: None,
         });
         let spell_id = builder.id();
         let card_id = scenario.state.objects[&spell_id].card_id;
