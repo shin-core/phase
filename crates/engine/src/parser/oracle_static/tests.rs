@@ -3123,6 +3123,84 @@ fn static_controlled_compound_subject_shares_continuous_predicate() {
         }));
 }
 
+// CR 611.3a: Verdeloth the Ancient — bare (no-controller) tribal compound anthem
+// "Saproling creatures and other Treefolk creatures get +1/+1." Must OR two
+// battlefield-wide subtype filters (controller: None), with the per-branch
+// "other" applying the Another source exclusion only to the Treefolk branch.
+#[test]
+fn static_bare_compound_tribal_subject_verdeloth() {
+    let def =
+        parse_static_line("Saproling creatures and other Treefolk creatures get +1/+1.").unwrap();
+    assert_eq!(def.mode, StaticMode::Continuous);
+    assert!(matches!(
+        def.affected,
+        Some(TargetFilter::Or { ref filters })
+            if filters.iter().any(|filter| matches!(
+                filter,
+                TargetFilter::Typed(typed)
+                    if typed.controller.is_none()
+                        && typed.type_filters.iter().any(|tf| matches!(
+                            tf, TypeFilter::Subtype(s) if s == "Saproling"
+                        ))
+                        && !typed.properties.contains(&FilterProp::Another)
+            ))
+                && filters.iter().any(|filter| matches!(
+                    filter,
+                    TargetFilter::Typed(typed)
+                        if typed.controller.is_none()
+                            && typed.type_filters.iter().any(|tf| matches!(
+                                tf, TypeFilter::Subtype(s) if s == "Treefolk"
+                            ))
+                            && typed.properties.contains(&FilterProp::Another)
+                ))
+    ));
+    assert!(def
+        .modifications
+        .contains(&ContinuousModification::AddPower { value: 1 }));
+    assert!(def
+        .modifications
+        .contains(&ContinuousModification::AddToughness { value: 1 }));
+}
+
+// #5147 regression on Life and Limb's ACTUAL static text. Its subject "All
+// Forests and all Saprolings" has "Forests" as a LAND subtype; the ungated bare
+// tribal-compound helper reinterpreted it as `Or{creature Forest, creature
+// Saproling}`, silently adding wrong out-of-scope support. With the
+// creature-term gate the helper declines this non-creature subject, so the
+// unsupported compound type-change strict-fails (no static) — the same shape as
+// baseline main — rather than over-claiming. Assert BOTH: Forest is never
+// reinterpreted as a creature-anthem branch, AND the line strict-fails.
+#[test]
+fn life_and_limb_real_text_not_over_claimed_as_creature_forest() {
+    let line = "All Forests and all Saprolings are 1/1 green Saproling creatures \
+                and Forest lands in addition to their other types.";
+    // No produced static may treat the land subtype Forest as a creature subject.
+    for def in parse_static_line_multi(line) {
+        if let Some(TargetFilter::Or { ref filters }) = def.affected {
+            assert!(
+                !filters.iter().any(|f| matches!(
+                    f,
+                    TargetFilter::Typed(tf)
+                        if tf.type_filters.iter().any(|t| matches!(
+                            t, TypeFilter::Subtype(s) if s == "Forest"
+                        ))
+                )),
+                "Life and Limb must not reinterpret land subtype Forest as a \
+                 creature-anthem branch: {def:?}"
+            );
+        }
+    }
+    // The bare-compound creature helper must decline this non-creature subject,
+    // so the unsupported compound type-change produces no bogus static (strict
+    // failure) — matching baseline main. This is the discriminating check: the
+    // ungated helper produced a spurious `creature Forest` static here.
+    assert!(
+        parse_static_line_multi(line).is_empty(),
+        "unsupported compound type-change must strict-fail, not over-claim: {:?}",
+        parse_static_line_multi(line)
+    );
+}
+
 #[test]
 fn static_opponent_controlled_compound_subject_shares_continuous_predicate() {
     let def = parse_static_line(
