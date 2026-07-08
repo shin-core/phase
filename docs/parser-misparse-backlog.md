@@ -5144,7 +5144,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Hecatomb
 - High Marshal Arguel
 - Liu Bei, Lord of Shu
-- Sift Through Sands
 - Thran Golem
 - Thrasta, Tempest's Roar
 - Wrathful Raptors
