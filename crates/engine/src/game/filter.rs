@@ -220,6 +220,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::FaceDown
+        | FilterProp::Transformed
         | FilterProp::HasXInManaCost
         | FilterProp::WasKicked
         | FilterProp::HasXInActivationCost
@@ -444,6 +445,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::FaceDown
+        | FilterProp::Transformed
         | FilterProp::HasXInManaCost
         | FilterProp::WasKicked
         | FilterProp::HasXInActivationCost
@@ -3138,6 +3140,9 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         // permanent — fail closed against the spell-cast snapshot.
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::FaceDown
+        // CR 712.2: a spell on the stack is not a transformed permanent — fail
+        // closed against the spell-cast snapshot.
+        | FilterProp::Transformed
         | FilterProp::TargetsOnly { .. }
         | FilterProp::Targets { .. }
         // CR 201.2: Source-/target-relative name predicates require
@@ -4165,6 +4170,9 @@ fn matches_filter_prop(
         // stack entry's actual targets.
         // CR 707.2: Match face-down permanents on the battlefield.
         FilterProp::FaceDown => obj.face_down,
+        // CR 712.2 + CR 701.27a: Match transformed permanents (nonmodal
+        // double-faced permanents with their back face up).
+        FilterProp::Transformed => obj.transformed,
         // CR 115.9c: If the object is a stack entry, ALL of its targets must match
         // the inner filter. Falls back permissive for non-stack objects so trigger
         // matchers remain the primary authority (they validate separately).
@@ -4586,6 +4594,10 @@ fn zone_change_record_matches_property(
         | FilterProp::AttachedToSource
         | FilterProp::AttachedToRecipient
         | FilterProp::FaceDown
+        // CR 712.2: the transformed status is a live-battlefield property; a
+        // zone-change (LKI) snapshot does not capture it. Fail closed, mirroring
+        // `FaceDown`.
+        | FilterProp::Transformed
         | FilterProp::Foretold
         // CR 201.2: Name-matches-any-permanent is a live-battlefield predicate
         // — a zone-change snapshot cannot represent it. Fail closed.

@@ -159,6 +159,8 @@ pub fn parse_property_filter(input: &str) -> OracleResult<'_, FilterProp> {
         value(FilterProp::Token, tag("token")),
         value(FilterProp::NonToken, tag("nontoken")),
         value(FilterProp::FaceDown, tag("face down")),
+        // CR 712.2 + CR 701.27a: "transformed <type>" selector (Mutagen Connoisseur).
+        value(FilterProp::Transformed, tag("transformed")),
         value(FilterProp::Unblocked, tag("unblocked")),
         value(FilterProp::Suspected, tag("suspected")),
         value(FilterProp::Renowned, tag("renowned")),
@@ -529,6 +531,15 @@ mod tests {
         let (rest, p) = parse_property_filter("face down").unwrap();
         assert_eq!(p, FilterProp::FaceDown);
         assert_eq!(rest, "");
+    }
+
+    // CR 712.2 + CR 701.27a: "transformed <type>" selector → FilterProp::Transformed
+    // (Mutagen Connoisseur: "for each transformed permanent you control").
+    #[test]
+    fn test_parse_property_filter_transformed() {
+        let (rest, p) = parse_property_filter("transformed permanent you control").unwrap();
+        assert_eq!(p, FilterProp::Transformed);
+        assert_eq!(rest, " permanent you control");
     }
 
     #[test]

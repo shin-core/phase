@@ -731,6 +731,9 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::Historic
         | FilterProp::NotHistoric
         | FilterProp::FaceDown
+        // CR 712.2: `obj.transformed` is a candidate fingerprint field — safe to
+        // memoize, mirroring `FaceDown` (`obj.face_down`).
+        | FilterProp::Transformed
         | FilterProp::HasXInManaCost
         | FilterProp::HasManaAbility
         | FilterProp::HasNoAbilities

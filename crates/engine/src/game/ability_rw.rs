@@ -2338,6 +2338,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::FaceDown
+        | FilterProp::Transformed
         | FilterProp::HasXInManaCost
         | FilterProp::HasXInActivationCost
         | FilterProp::WasKicked
@@ -2583,6 +2584,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::FaceDown
+        | FilterProp::Transformed
         | FilterProp::HasXInManaCost
         | FilterProp::HasXInActivationCost
         | FilterProp::WasKicked

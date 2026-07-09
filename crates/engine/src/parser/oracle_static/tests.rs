@@ -13173,6 +13173,45 @@ fn static_self_gets_dynamic_pt_for_each_unspent_green_mana() {
 }
 
 #[test]
+fn static_self_gets_dynamic_power_for_each_transformed_permanent() {
+    // Issue #5439 — Mutagen Connoisseur: "This creature gets +1/+0 for each
+    // transformed permanent you control." Before FilterProp::Transformed existed,
+    // the "transformed" quality was dropped and the static collapsed to a flat
+    // +1/+0. It must now scale via QuantityRef::ObjectCount over a Transformed
+    // filter (CR 712.2 + CR 701.27a).
+    use crate::types::ability::{FilterProp, QuantityRef, TargetFilter};
+    let def = parse_static_line("~ gets +1/+0 for each transformed permanent you control.")
+        .expect("Mutagen Connoisseur dynamic P/T static must parse");
+    assert_eq!(def.mode, StaticMode::Continuous);
+
+    // Power scales; toughness is +0 so it stays a flat (or absent) modifier.
+    let dynamic_power = def
+        .modifications
+        .iter()
+        .find_map(|m| match m {
+            ContinuousModification::AddDynamicPower { value } => Some(value),
+            _ => None,
+        })
+        .expect("expected AddDynamicPower (not a flat +1)");
+    match dynamic_power {
+        QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(typed),
+                },
+        } => assert!(
+            typed
+                .properties
+                .iter()
+                .any(|p| matches!(p, FilterProp::Transformed)),
+            "power must count transformed permanents, got {:?}",
+            typed.properties
+        ),
+        other => panic!("expected ObjectCount over a Transformed filter, got {other:?}"),
+    }
+}
+
+#[test]
 fn equipped_creature_gets_dynamic_pt_for_each_color_among_permanents() {
     let def = parse_static_line(
         "Equipped creature gets +1/+1 for each color among permanents you control.",

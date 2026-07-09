@@ -4169,6 +4169,10 @@ pub(crate) fn parse_combat_status_prefix(text: &str) -> Option<(FilterProp, usiz
                 | FilterProp::IsSaddled
                 | FilterProp::ProtectorMatches { .. }
                 | FilterProp::FaceDown
+                // CR 712.2 + CR 701.27a: "transformed" appears as an adjective
+                // prefix in type phrases and count selectors ("transformed
+                // permanent", "transformed creature" — Mutagen Connoisseur).
+                | FilterProp::Transformed
                 // CR 701.60b: "suspected" is a battlefield designation that appears
                 // as an adjective prefix in type phrases ("suspected creatures").
                 | FilterProp::Suspected

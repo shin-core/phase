@@ -5778,6 +5778,32 @@ mod tests {
         }
     }
 
+    /// CR 712.2 + CR 701.27a: "for each transformed permanent you control"
+    /// (Mutagen Connoisseur) counts transformed permanents via
+    /// `FilterProp::Transformed`, the symmetric sibling of `FilterProp::FaceDown`.
+    /// Regression guard for issue #5439 — the "transformed" quality was silently
+    /// dropped, collapsing the count to a flat modifier.
+    #[test]
+    fn for_each_transformed_permanent_you_control() {
+        let qty = parse_for_each_clause("transformed permanent you control").unwrap();
+        match qty {
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(typed),
+            } => {
+                assert_eq!(typed.controller, Some(ControllerRef::You));
+                assert!(
+                    typed
+                        .properties
+                        .iter()
+                        .any(|property| matches!(property, FilterProp::Transformed)),
+                    "expected Transformed property, got {:?}",
+                    typed.properties
+                );
+            }
+            other => panic!("Expected ObjectCount over Typed filter, got {other:?}"),
+        }
+    }
+
     /// CR 608.2c + CR 109.5: Tempt with Discovery's
     /// bonus-tutor-per-accepting-opponent step parses as a player-action count.
     /// Verb tense (searches/searched) and article (a/their) variants produce
