@@ -3757,6 +3757,12 @@ pub enum FilterProp {
     /// CR 707.2: Matches face-down objects on the battlefield.
     /// Used for "face-down creature" trigger subjects.
     FaceDown,
+    /// CR 701.27g: Matches transformed permanents — a transforming double-faced
+    /// permanent on the battlefield with its back face up. Used for "transformed
+    /// permanent"/"transformed creature" selectors (Mutagen Connoisseur's "+1/+0
+    /// for each transformed permanent you control"). Mirrors `FaceDown`/`Tapped`:
+    /// a per-object battlefield state read from `GameObject::transformed`.
+    Transformed,
     /// CR 115.9c: Matches stack entries whose targets ALL satisfy the given filter.
     /// Used for "that targets only ~", "that targets only a single creature you control", etc.
     /// Permissive at the per-object filter level; validated against the stack entry's actual

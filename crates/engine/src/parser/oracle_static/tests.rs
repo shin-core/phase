@@ -26381,6 +26381,46 @@ fn static_self_dynamic_pump_for_each_other_creature_on_battlefield_with_keyword(
     );
 }
 
+/// CR 701.27g + CR 613.4c: Mutagen Connoisseur's "for each transformed
+/// permanent you control" must lower through the production static parser to a
+/// dynamic object count over `FilterProp::Transformed`, not a flat +1/+0 pump.
+#[test]
+fn static_self_gets_dynamic_power_for_each_transformed_permanent() {
+    let def = parse_static_line("~ gets +1/+0 for each transformed permanent you control.")
+        .expect("Mutagen Connoisseur dynamic P/T static must parse");
+    assert_eq!(def.mode, StaticMode::Continuous);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+
+    let dynamic_power = def
+        .modifications
+        .iter()
+        .find_map(|m| match m {
+            ContinuousModification::AddDynamicPower { value } => Some(value),
+            _ => None,
+        })
+        .expect("expected AddDynamicPower, not a flat +1 modifier");
+
+    match dynamic_power {
+        QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(typed),
+                },
+        } => {
+            assert_eq!(typed.controller, Some(ControllerRef::You));
+            assert!(
+                typed
+                    .properties
+                    .iter()
+                    .any(|p| matches!(p, FilterProp::Transformed)),
+                "power must count transformed permanents, got {:?}",
+                typed.properties
+            );
+        }
+        other => panic!("expected ObjectCount over a Transformed filter, got {other:?}"),
+    }
+}
+
 /// CR 205.4a + CR 205.4g + CR 613.1d (Layer 4): Glittering Frost's "Enchanted
 /// land is snow." is an Aura that grants the Snow supertype (not a card type)
 /// to the enchanted land. It must lower to a `Continuous` static carrying
