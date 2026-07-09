@@ -4940,9 +4940,16 @@ fn parse_graveyard_exile_replacement(
 
     // Scope of the subject's destination graveyard. Valid-card filter is keyed
     // off this: "opponent's graveyard" ⇒ `Owned { controller: Opponent }`.
+    // Scope of the subject's destination graveyard, keying the valid-card owner
+    // filter. "your graveyard" ⇒ `Owned { You }` (Forbidden Crypt — the redirect
+    // must NOT exile opponents' cards); "opponent's graveyard" ⇒ `Owned { Opponent }`
+    // (Leyline of the Void); any other graveyard phrase ⇒ no owner constraint.
+    // CR 400.3 + CR 108.3: cards go to their owner's graveyard, so ownership is
+    // the stable discriminant for whose-graveyard scoping.
     #[derive(Clone)]
     enum Scope {
         Any,
+        You,
         Opponent,
     }
 
@@ -5018,6 +5025,11 @@ fn parse_graveyard_exile_replacement(
                 value(Scope::Opponent, tag("an opponent's graveyard")),
                 value(Scope::Opponent, tag("an opponents graveyard")),
                 value(Scope::Opponent, tag("opponent's graveyard")),
+                // CR 400.3: "your graveyard" (Forbidden Crypt) scopes to You-owned
+                // cards — the redirect must not exile opponents' cards. Tried
+                // before the generic ` graveyard` fallthrough so the possessive
+                // owner is captured rather than swallowed as unscoped.
+                value(Scope::You, tag("your graveyard")),
                 value(
                     Scope::Any,
                     preceded(take_until(" graveyard"), tag(" graveyard")),
@@ -5073,10 +5085,15 @@ fn parse_graveyard_exile_replacement(
     // opponent's token reach the graveyard so dies-triggers fire — Blood Artist
     // class). Both axes are leaf `FilterProp`s on one `TypedFilter`.
     let mut props = Vec::new();
-    if let Scope::Opponent = scope {
-        props.push(FilterProp::Owned {
+    match scope {
+        // CR 400.3: "your graveyard" ⇒ You-owned cards only (Forbidden Crypt).
+        Scope::You => props.push(FilterProp::Owned {
+            controller: ControllerRef::You,
+        }),
+        Scope::Opponent => props.push(FilterProp::Owned {
             controller: ControllerRef::Opponent,
-        });
+        }),
+        Scope::Any => {}
     }
     if let TokenScope::NonToken = token_scope {
         props.push(FilterProp::NonToken);
@@ -13221,6 +13238,39 @@ mod tests {
                 assert_eq!(qty, &QuantityExpr::Fixed { value: 1 });
             }
             other => panic!("Expected ChangeZone→Exile with counters, got {other:?}"),
+        }
+    }
+
+    /// CR 400.3: Forbidden Crypt — "If a card would be put into your graveyard
+    /// from anywhere, exile that card instead." The "your graveyard" scope must
+    /// bind the redirect to YOU-owned cards; without it the anaphor recognizer
+    /// (which now makes this card parse) would exile opponents' cards too. Review
+    /// finding on #5443 (matthewevans).
+    #[test]
+    fn forbidden_crypt_your_graveyard_scopes_to_you() {
+        let def = parse_replacement_line(
+            "If a card would be put into your graveyard from anywhere, exile that card instead.",
+            "Forbidden Crypt",
+        )
+        .expect("Forbidden Crypt graveyard-exile replacement must parse");
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.destination_zone, Some(Zone::Graveyard));
+        match &def.valid_card {
+            Some(TargetFilter::Typed(TypedFilter { properties, .. })) => {
+                assert!(
+                    properties.contains(&FilterProp::Owned {
+                        controller: ControllerRef::You,
+                    }),
+                    "'your graveyard' must scope to You-owned cards, got {properties:?}"
+                );
+                // Must NOT be scoped to an opponent.
+                assert!(!properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::Opponent,
+                }));
+                // "a card" is still token-excluding (CR 730.3e).
+                assert!(properties.contains(&FilterProp::NonToken));
+            }
+            other => panic!("Expected Typed(Owned You + NonToken), got {other:?}"),
         }
     }
 
