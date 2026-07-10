@@ -8713,10 +8713,12 @@ fn try_parse_event(
                 value(AttackTargetFilter::Player, tag(" one of your opponents")),
                 value(AttackTargetFilter::Player, tag(" a player")),
                 value(AttackTargetFilter::Player, tag(" you")),
-                // CR 303.4a + CR 508.1a: "attacks enchanted player" — a Curse Aura
-                // trigger scoped to the player this permanent is attached to. The
-                // type axis is Player; the player-identity scope is set below via
-                // `valid_target = AttachedTo` (Curse of Predation, Curse of Bloodletting).
+                // CR 303.4e: "attacks enchanted player" — a Curse Aura trigger
+                // scoped to the player this permanent is attached to (whose
+                // controller is separate from the Aura's controller). The type axis
+                // is Player; the player-identity scope is set below via
+                // `valid_target = AttachedTo` (Curse of Predation, Curse of Chaos,
+                // Curse of Inertia).
                 value(AttackTargetFilter::Player, tag(" enchanted player")),
                 value(AttackTargetFilter::Battle, tag(" a battle")),
             ))
@@ -8767,12 +8769,14 @@ fn try_parse_event(
             .parse(after)
             .is_ok()
         {
-            // CR 303.4a + CR 109.4: "attacks enchanted player" scopes the trigger
-            // to the player this Curse Aura is attached to. `AttachedTo` resolves
-            // to `source.attached_to.as_player()` in `player_matches_filter`, so
-            // the trigger fires only when the enchanted player is the defender
-            // (Curse of Predation, Curse of Bloodletting). Without this the trigger
-            // has no defender scope and fires on every attack, anywhere.
+            // CR 303.4e: "attacks enchanted player" scopes the trigger to the
+            // player this Curse Aura is attached to (whose controller is distinct
+            // from the Aura's controller). `AttachedTo` resolves to
+            // `source.attached_to.as_player()` in `player_matches_filter`
+            // (`game/trigger_matchers.rs`), so the trigger fires only when the
+            // enchanted player is the defender (Curse of Predation, Curse of Chaos,
+            // Curse of Inertia). Without this the trigger has no defender scope and
+            // fires on every attack, anywhere.
             def.valid_target = Some(TargetFilter::AttachedTo);
         } else if matches!(
             def.attack_target_filter,

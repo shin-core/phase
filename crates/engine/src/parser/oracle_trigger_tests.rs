@@ -2804,7 +2804,8 @@ fn trigger_attacks_you_or_planeswalker_you_control() {
 /// player, put a +1/+1 counter on it." The "enchanted player" defender scope
 /// must bind to the Aura's attached player (`valid_target = AttachedTo`), not be
 /// dropped — otherwise the trigger fires whenever any creature attacks anyone
-/// (CR 303.4a + CR 508.1a).
+/// (CR 303.4e). Runtime firing is covered by the discriminating integration
+/// test `curse_of_predation_scopes_counter_to_enchanted_player`.
 #[test]
 fn trigger_attacks_enchanted_player_scopes_to_attached_player() {
     let def = parse_trigger_line(
