@@ -4116,31 +4116,31 @@ fn matches_filter_prop(
         // reference resolution below). Used by Radiance's "each OTHER creature
         // that shares a color with it" — excludes the already-damaged target.
         FilterProp::DistinctFrom { reference } => {
-            let reference_ids: Vec<ObjectId> = if matches!(**reference, TargetFilter::ParentTarget)
-            {
-                source
-                    .ability
-                    .map(|ability| {
-                        ability
-                            .targets
-                            .iter()
-                            .filter_map(|t| match t {
-                                TargetRef::Object(id) => Some(*id),
-                                TargetRef::Player(_) => None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
+            // `matches_filter_prop` runs once per candidate object, so short-circuit
+            // via `.any()` rather than collecting the reference ids into a `Vec`.
+            //
+            // NOTE (fail-open asymmetry): the `ParentTarget` arm reads ONLY
+            // `ability.targets` — it lacks the LKI / `recipient_id` /
+            // effect-context fallback ladder that `SharesQuality`'s `ParentTarget`
+            // path carries (see `parent_target_shared_quality_values` below). When
+            // `ability` is `None` or its targets are empty this excludes nothing
+            // (fails open). That is safe for the current Radiance class — the
+            // resolving `DamageAll` sub-ability always carries the chosen target —
+            // but a future reuse in a layer-eval or recipient context would need
+            // the same fallback ladder to avoid a silent double-hit.
+            let is_referenced = if matches!(**reference, TargetFilter::ParentTarget) {
+                source.ability.is_some_and(|ability| {
+                    ability
+                        .targets
+                        .iter()
+                        .any(|t| matches!(t, TargetRef::Object(id) if *id == object_id))
+                })
             } else {
                 crate::game::targeting::resolve_event_context_targets(state, reference, source.id)
                     .into_iter()
-                    .filter_map(|t| match t {
-                        TargetRef::Object(id) => Some(id),
-                        TargetRef::Player(_) => None,
-                    })
-                    .collect()
+                    .any(|t| matches!(t, TargetRef::Object(id) if id == object_id))
             };
-            !reference_ids.contains(&object_id)
+            !is_referenced
         }
         // CR 604.3: Match objects in any of the listed zones (OR semantics).
         FilterProp::InAnyZone { zones } => zones.contains(&obj.zone),

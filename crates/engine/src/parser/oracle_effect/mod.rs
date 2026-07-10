@@ -14743,6 +14743,17 @@ fn try_parse_radiance_color_fanout_damage(
         return None;
     };
 
+    // Scope: only fixed-amount Radiance damage (Cleansing Beam = 2, Wojek
+    // Embermage = 1). Brightflame deals *X* and carries a following "You gain
+    // life equal to the damage dealt this way" rider whose amount would need to
+    // bind to the fan-out's `DamageAll` total, not a preceding `DealDamage` —
+    // real engine work deferred to its own PR. Declining an X-amount fan-out
+    // keeps Brightflame honestly unsupported (its lifegain sentence is not
+    // silently dropped) rather than lowering it wrong. CR 120.3.
+    if !matches!(amount, QuantityExpr::Fixed { .. }) {
+        return None;
+    }
+
     // The remainder must be exactly the color fan-out suffix.
     let rem_lower = remainder.trim().trim_end_matches('.').trim().to_lowercase();
     let matched = nom_on_lower(remainder.trim(), &rem_lower, |i| {

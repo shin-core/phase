@@ -4257,6 +4257,30 @@ fn plain_damage_no_radiance_suffix_stays_single_deal_damage() {
     );
 }
 
+/// Issue #5244 (review) — the Radiance fan-out recognizer must DECLINE
+/// Brightflame ("deals X damage to target creature and each other creature that
+/// shares a color with it. You gain life equal to the damage dealt this way.").
+/// Its X amount and "damage dealt this way" lifegain rider need the rider bound
+/// to the fan-out's DamageAll total — deferred engine work. Declining keeps the
+/// lifegain sentence intact instead of silently lowering the card wrong, so the
+/// recognizer only fires for FIXED-amount Radiance damage.
+#[test]
+fn radiance_fanout_declines_variable_x_amount() {
+    let clause = parse_effect_clause(
+        "Brightflame deals X damage to target creature and each other creature that shares a color with it.",
+        &mut ParseContext::default(),
+    );
+    // The X-amount fan-out must NOT produce a DamageAll sub-ability here.
+    assert!(
+        !matches!(
+            clause.sub_ability.as_ref().map(|s| s.effect.as_ref()),
+            Some(Effect::DamageAll { .. })
+        ),
+        "X-amount Radiance damage must not lower to the color fan-out (deferred), got {:?}",
+        clause.sub_ability
+    );
+}
+
 /// Issue #495 — Rite of Consumption. The explicit participle-possessive
 /// "the sacrificed creature's power" must resolve to the cost-paid object
 /// (CR 608.2k), NOT the source. The subject-injection rewrite for a `~`
