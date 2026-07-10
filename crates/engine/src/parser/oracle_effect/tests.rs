@@ -4169,6 +4169,94 @@ fn target_subject_damage_compound_each_creature_and_each_opponent() {
     );
 }
 
+/// Issue #5244 — Radiance color fan-out (Cleansing Beam): "deals 2 damage to
+/// target creature and each other creature that shares a color with it." Must
+/// lower to a `DealDamage` to the chosen target (providing the target slot +
+/// the target's own damage) with a `DamageAll` sub-ability that fans the damage
+/// to color-sharers (`SharesQuality{Color, ParentTarget}`) EXCLUDING the target
+/// (`DistinctFrom{ParentTarget}`), so the target is not double-damaged.
+#[test]
+fn radiance_color_fanout_lowers_to_damage_all_sub_ability() {
+    let clause = parse_effect_clause(
+        "Cleansing Beam deals 2 damage to target creature and each other creature that shares a color with it.",
+        &mut ParseContext::default(),
+    );
+    // Primary: DealDamage to a single target creature.
+    let Effect::DealDamage {
+        amount,
+        target: TargetFilter::Typed(primary_tf),
+        ..
+    } = &clause.effect
+    else {
+        panic!("expected DealDamage primary, got {:?}", clause.effect);
+    };
+    assert_eq!(*amount, QuantityExpr::Fixed { value: 2 });
+    assert!(primary_tf
+        .type_filters
+        .iter()
+        .any(|t| matches!(t, TypeFilter::Creature)));
+
+    // Sub-ability: DamageAll over color-sharers excluding the target.
+    let sub = clause
+        .sub_ability
+        .as_ref()
+        .expect("Radiance fan-out must attach a DamageAll sub-ability");
+    let Effect::DamageAll {
+        amount: fan_amount,
+        target: TargetFilter::Typed(fan_tf),
+        player_filter: None,
+        damage_source: None,
+    } = sub.effect.as_ref()
+    else {
+        panic!(
+            "expected DamageAll fan-out sub-effect, got {:?}",
+            sub.effect
+        );
+    };
+    assert_eq!(*fan_amount, QuantityExpr::Fixed { value: 2 });
+    assert!(
+        fan_tf.properties.iter().any(|p| matches!(
+            p,
+            FilterProp::SharesQuality {
+                quality: SharedQuality::Color,
+                reference: Some(r),
+                relation: SharedQualityRelation::Shares,
+            } if matches!(**r, TargetFilter::ParentTarget)
+        )),
+        "fan-out must share a Color with ParentTarget, got {:?}",
+        fan_tf.properties
+    );
+    assert!(fan_tf.properties.iter().any(|p| matches!(
+        p,
+        FilterProp::DistinctFrom { reference } if matches!(**reference, TargetFilter::ParentTarget)
+    )), "fan-out must exclude the ParentTarget, got {:?}", fan_tf.properties);
+}
+
+/// Negative reach-guard for the Radiance recognizer: a plain single-target
+/// damage line ("deals 2 damage to target creature", no fan-out suffix) must
+/// still lower to a bare `DealDamage` with NO DamageAll sub-ability — proving
+/// the fan-out recognizer doesn't over-fire.
+#[test]
+fn plain_damage_no_radiance_suffix_stays_single_deal_damage() {
+    let clause = parse_effect_clause(
+        "Shock deals 2 damage to target creature.",
+        &mut ParseContext::default(),
+    );
+    assert!(
+        matches!(clause.effect, Effect::DealDamage { .. }),
+        "plain damage must be DealDamage, got {:?}",
+        clause.effect
+    );
+    assert!(
+        clause.sub_ability.is_none()
+            || !matches!(
+                clause.sub_ability.as_ref().map(|s| s.effect.as_ref()),
+                Some(Effect::DamageAll { .. })
+            ),
+        "plain damage must NOT gain a DamageAll fan-out sub-ability"
+    );
+}
+
 /// Issue #495 — Rite of Consumption. The explicit participle-possessive
 /// "the sacrificed creature's power" must resolve to the cost-paid object
 /// (CR 608.2k), NOT the source. The subject-injection rewrite for a `~`
