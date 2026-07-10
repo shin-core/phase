@@ -1811,19 +1811,27 @@ fn filter_inner_for_object(
         }
         // CR 603.7: Match objects in a tracked set from the originating effect.
         // CR 608.2c: `TrackedSetId(0)` is the parser's "most recent set" sentinel.
-        // Resolve it chain-first, then latest non-empty set — the same order as
-        // `targeting::resolve_tracked_set_sentinel` and the `TrackedSetFiltered`
-        // sibling arm below — so effect resolvers that match objects directly
-        // against the filter (`DestroyAll { TrackedSet }` — "destroy each
-        // permanent chosen this way", Druid of Purification #4780) read the
-        // just-published set instead of looking up the literal sentinel id and
-        // matching nothing. With no set published, a sentinel still matches
-        // nothing (the correct fail-closed fallback).
+        // Resolve it via `targeting::resolve_tracked_set_id` — the single
+        // id-resolution authority (chain-first, then latest non-empty set) — so
+        // effect resolvers that match objects directly against the filter
+        // (`DestroyAll { TrackedSet }` — "destroy each permanent chosen this
+        // way", Druid of Purification #4780) read the just-published set instead
+        // of looking up the literal sentinel id and matching nothing. With no
+        // set published, a sentinel still matches nothing (fail-closed).
+        //
+        // Ladder inventory (deliberate, per review on #5505): the FILTER-level
+        // `targeting::resolve_tracked_set_sentinel` inserts one extra rung
+        // between chain and latest — `current_combat_damage_source_filter`
+        // (CR 510.2), which yields a `TargetFilter` rather than an id and so
+        // cannot fold into the shared id helper. The `TrackedSetFiltered`
+        // sibling arm below still carries its own pre-existing ladder (no chain
+        // rung; `max_by_key` over ALL sets including empty ones) — unifying it
+        // onto `resolve_tracked_set_id` would change empty-set shadowing for
+        // the Zimone's Experiment / Living Death class and is left to a
+        // follow-up rather than smuggled into this fix.
         TargetFilter::TrackedSet { id } => {
             let set_id = if id.0 == 0 {
-                state
-                    .chain_tracked_set_id
-                    .or_else(|| crate::game::targeting::latest_tracked_set_id(state))
+                crate::game::targeting::resolve_tracked_set_id(state)
             } else {
                 Some(*id)
             };

@@ -3245,6 +3245,11 @@ pub fn resolve_effect(
                 })
                 .collect();
             if ability.scoped_player.is_some() && !chosen.is_empty() {
+                // Load-bearing: `publish_tracked_set` EXTENDS the active chain
+                // set rather than minting a new id, which is what accumulates
+                // successive per-player picks into one union for the tail to
+                // read. (A declining player has no object targets — `chosen` is
+                // empty — so "may choose" declines are a no-op here.)
                 publish_tracked_set(state, chosen);
             }
             Ok(())
