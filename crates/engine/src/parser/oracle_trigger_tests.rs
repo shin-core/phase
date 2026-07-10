@@ -3,16 +3,18 @@ use crate::game::scenario::{GameScenario, P0, P1};
 use crate::parser::oracle::parse_oracle_text;
 use crate::parser::oracle_ir::context::ParseContext;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
+use crate::parser::oracle_ir::doc::PrintedTriggerIndex;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction, AttackScope,
     AttackSubject, BounceSelection, CardSelectionMode, CastingPermission, ChosenAttribute,
-    Comparator, ContinuousModification, ControllerRef, CountScope, DamageChannel,
-    DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration, Effect,
-    EffectScope, FilterProp, ManaContribution, ManaProduction, ManaSpendPermission, ObjectScope,
-    PerpetualModification, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr,
-    QuantityRef, SharedQuality, TapStateChange, TargetFilter, TriggerCondition, TypeFilter,
-    TypedFilter, ZoneRef,
+    Comparator, ContinuousModification, ControllerRef, CopyRetargetPermission, CountScope,
+    DamageChannel, DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope,
+    Duration, Effect, EffectScope, FilterProp, ManaContribution, ManaProduction,
+    ManaSpendPermission, ObjectScope, PerpetualModification, PlayerFilter, PlayerScope, PtStat,
+    PtValue, PtValueScope, QuantityExpr, QuantityRef, SharedQuality, TapStateChange, TargetFilter,
+    TriggerCondition, TypeFilter, TypedFilter, ZoneRef,
 };
+use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::game_state::WaitingFor;
 use crate::types::keywords::Keyword;
@@ -2798,6 +2800,27 @@ fn trigger_attacks_you_or_planeswalker_you_control() {
         Some(AttackTargetFilter::PlayerOrPlaneswalker)
     );
     assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+}
+
+/// Issue #4744 — Curse of Predation: "Whenever a creature attacks enchanted
+/// player, put a +1/+1 counter on it." The "enchanted player" defender scope
+/// must bind to the Aura's attached player (`valid_target = AttachedTo`), not be
+/// dropped — otherwise the trigger fires whenever any creature attacks anyone
+/// (CR 303.4e). Runtime firing is covered by the discriminating integration
+/// test `curse_of_predation_scopes_counter_to_enchanted_player`.
+#[test]
+fn trigger_attacks_enchanted_player_scopes_to_attached_player() {
+    let def = parse_trigger_line(
+        "Whenever a creature attacks enchanted player, put a +1/+1 counter on it.",
+        "Curse of Predation",
+    );
+    assert_eq!(def.mode, TriggerMode::Attacks);
+    assert_eq!(def.attack_target_filter, Some(AttackTargetFilter::Player));
+    assert_eq!(
+        def.valid_target,
+        Some(TargetFilter::AttachedTo),
+        "'attacks enchanted player' must scope the defender to the attached player"
+    );
 }
 
 #[test]
@@ -10411,6 +10434,41 @@ fn trigger_you_investigate_bare() {
 }
 
 #[test]
+fn trigger_curator_discover_again_for_the_same_value() {
+    // Curator of Sun's Creation (#5270): "Whenever you discover, discover again
+    // for the same value. This ability triggers only once each turn." The bare
+    // discover subject maps to the dedicated TriggerMode::Discover (matched on
+    // EffectResolved{Discover}); "the same value" re-discovers with N equal to
+    // the triggering discover's mana-value limit (TriggeringDiscoverValue).
+    let def = parse_trigger_line(
+        "Whenever you discover, discover again for the same value. This ability triggers only once each turn.",
+        "Curator of Sun's Creation",
+    );
+    assert_eq!(def.mode, TriggerMode::Discover);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    assert_eq!(
+        def.constraint,
+        Some(crate::types::ability::TriggerConstraint::OncePerTurn),
+    );
+    let execute = def
+        .execute
+        .as_ref()
+        .expect("trigger should have execute step");
+    match execute.effect.as_ref() {
+        Effect::Discover {
+            mana_value_limit, ..
+        } => assert_eq!(
+            mana_value_limit,
+            &crate::types::ability::QuantityExpr::Ref {
+                qty: crate::types::ability::QuantityRef::TriggeringDiscoverValue,
+            },
+            "\"discover again for the same value\" must reuse the triggering discover's value",
+        ),
+        other => panic!("expected Effect::Discover, got {other:?}"),
+    }
+}
+
+#[test]
 fn trigger_you_collect_evidence() {
     // Surveillance Monitor (MKM): "Whenever you collect evidence, create a 1/1 colorless
     // Thopter artifact creature token with flying."
@@ -15579,6 +15637,48 @@ fn trigger_zada_targets_only_self() {
 }
 
 #[test]
+fn trigger_zada_full_oracle_copies_for_each_legal_creature_target() {
+    let def = parse_trigger_line(
+        "Whenever you cast an instant or sorcery spell that targets only Zada, copy that spell for each other creature you control that the spell could target. Each copy targets a different one of those creatures.",
+        "Zada, Hedron Grinder",
+    );
+    let execute = def.execute.expect("execute");
+    assert!(
+        execute.sub_ability.is_none(),
+        "for-each copy must not spill into a sub_ability, got {:?}",
+        execute.sub_ability
+    );
+    assert!(matches!(
+        *execute.effect,
+        Effect::CopySpell {
+            target: TargetFilter::TriggeringSource,
+            retarget: CopyRetargetPermission::RetargetEachCopyToIterationMember,
+            ..
+        }
+    ));
+    assert!(matches!(
+        execute.repeat_for,
+        Some(QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { .. }
+        })
+    ));
+    if let Some(QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount { filter },
+    }) = execute.repeat_for
+    {
+        if let TargetFilter::Typed(tf) = filter {
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+            assert!(tf.properties.contains(&FilterProp::Another));
+            assert!(tf
+                .properties
+                .contains(&FilterProp::CouldBeTargetedByTriggeringSpell));
+        } else {
+            panic!("expected Typed ObjectCount filter, got {filter:?}");
+        }
+    }
+}
+
+#[test]
 fn trigger_leyline_of_resonance_targets_only_single_creature_you_control() {
     let def = parse_trigger_line(
             "Whenever you cast an instant or sorcery spell that targets only a single creature you control, copy that spell.",
@@ -18117,6 +18217,113 @@ fn trigger_intervening_if_source_is_exiled_sets_trigger_zone() {
         def.condition,
         Some(TriggerCondition::SourceInZone { zone: Zone::Exile }),
     );
+}
+
+/// CR 508.4 + CR 608.2c: Senu, Keen-Eyed Protector — exile-zone attack trigger
+/// returns the source attacking, not the legendary attacker that satisfied
+/// `valid_card`.
+#[test]
+fn senu_keen_eyed_protector_exile_attack_trigger_lowers_correctly() {
+    let def = parse_trigger_line(
+        "When a legendary creature you control attacks and isn't blocked, if this card is exiled, put it onto the battlefield attacking.",
+        "Senu, Keen-Eyed Protector",
+    );
+
+    assert_eq!(def.mode, TriggerMode::YouAttackUnblocked);
+    assert_eq!(def.trigger_zones, vec![Zone::Exile]);
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::SourceInZone { zone: Zone::Exile }),
+    );
+    match def.valid_card.as_ref() {
+        Some(TargetFilter::Typed(tf)) => {
+            assert!(tf.type_filters.contains(&TypeFilter::Creature));
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+            assert!(
+                tf.properties.iter().any(|p| matches!(
+                    p,
+                    FilterProp::HasSupertype {
+                        value: Supertype::Legendary
+                    }
+                )),
+                "valid_card must require legendary creatures you control"
+            );
+        }
+        other => panic!("expected Typed legendary creature filter, got {other:?}"),
+    }
+
+    let execute = def.execute.as_ref().expect("trigger must execute");
+    match &*execute.effect {
+        Effect::ChangeZone {
+            destination,
+            target,
+            enters_attacking,
+            ..
+        } => {
+            assert_eq!(*destination, Zone::Battlefield);
+            assert_eq!(*target, TargetFilter::SelfRef);
+            assert!(
+                *enters_attacking,
+                "must enter the battlefield attacking (CR 508.4)"
+            );
+        }
+        other => panic!("expected ChangeZone to battlefield attacking, got {other:?}"),
+    }
+}
+
+/// CR 608.2c: Managorger Phoenix — off-battlefield return + perpetual pump both
+/// bind bare "it" anaphors to the source, not the cast spell event object.
+#[test]
+fn managorger_phoenix_graveyard_return_rewrites_self_anaphors() {
+    let def = parse_trigger_line(
+        "Whenever you cast a spell, if Managorger Phoenix is in your graveyard, put a flame counter on Managorger Phoenix for each {R} in that spell's mana cost. If Managorger Phoenix has five or more flame counters on it, return it to the battlefield and it perpetually gets +1/+1.",
+        "Managorger Phoenix",
+    );
+
+    assert_eq!(def.mode, TriggerMode::SpellCast);
+    assert_eq!(def.trigger_zones, vec![Zone::Graveyard]);
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::SourceInZone {
+            zone: Zone::Graveyard,
+        }),
+    );
+
+    let execute = def.execute.as_ref().expect("trigger must execute");
+    // Root: flame counter clause. Conditional sibling: return + perpetual pump.
+    let return_branch = execute
+        .sub_ability
+        .as_ref()
+        .expect("counter clause must chain to return branch");
+    match &*return_branch.effect {
+        Effect::ChangeZone {
+            destination,
+            target,
+            ..
+        } => {
+            assert_eq!(*destination, Zone::Battlefield);
+            assert_eq!(
+                *target,
+                TargetFilter::SelfRef,
+                "return it must target the Phoenix in graveyard"
+            );
+        }
+        other => panic!("expected ChangeZone return, got {other:?}"),
+    }
+    let pump = return_branch
+        .sub_ability
+        .as_ref()
+        .expect("return must chain to perpetual pump");
+    match &*pump.effect {
+        Effect::Pump { target, .. } | Effect::ApplyPerpetual { target, .. } => {
+            assert_eq!(
+                *target,
+                TargetFilter::SelfRef,
+                "it perpetually gets +1/+1 must target the Phoenix, not the cast spell"
+            );
+        }
+        other => panic!("expected Pump/ApplyPerpetual perpetual clause, got {other:?}"),
+    }
 }
 
 #[test]
@@ -21267,7 +21474,7 @@ fn trigger_become_copy_with_set_name_and_retain_this_ability() {
     let def = parse_trigger_line_with_index(
             "At the beginning of combat on your turn, ~ becomes a copy of up to one other target creature you control, except her name is ~ and she has this ability. Then put a +1/+1 counter on her.",
             "Irma, Part-Time Mutant",
-            Some(0),
+            Some(PrintedTriggerIndex::from_slot_for_test(0)),
             &mut ParseContext::default(),
         );
     // Phase + constraint: BoC on your turn.
@@ -21354,7 +21561,7 @@ fn trigger_become_copy_he_has_this_ability() {
     let def = parse_trigger_line_with_index(
             "At the beginning of your upkeep, ~ becomes a copy of target creature you control, except his name is ~ and he has this ability.",
             "Test Mutant",
-            Some(0),
+            Some(PrintedTriggerIndex::from_slot_for_test(0)),
             &mut ParseContext::default(),
         );
     let execute = def.execute.as_deref().unwrap();
@@ -21390,7 +21597,7 @@ fn trigger_become_copy_it_has_this_ability_neuter() {
     let def = parse_trigger_line_with_index(
             "At the beginning of your upkeep, ~ becomes a copy of another target creature, except it has this ability.",
             "Test Cloner",
-            Some(0),
+            Some(PrintedTriggerIndex::from_slot_for_test(0)),
             &mut ParseContext::default(),
         );
     let execute = def.execute.as_deref().unwrap();
@@ -21435,7 +21642,7 @@ fn trigger_gogo_distributes_pump_haste_must_attack_to_both() {
     let def = parse_trigger_line_with_index(
             "At the beginning of combat on your turn, you may have ~ become a copy of another target creature you control until end of turn, except its name is ~. If you do, ~ and that creature each get +2/+0 and gain haste until end of turn and attack this turn if able.",
             "Gogo, Mysterious Mime",
-            Some(0),
+            Some(PrintedTriggerIndex::from_slot_for_test(0)),
             &mut ParseContext::default(),
         );
     assert_eq!(def.mode, TriggerMode::Phase);

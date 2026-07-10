@@ -795,6 +795,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::SameNameAsParentTarget
         | FilterProp::NameMatchesAnyPermanent { .. }
         | FilterProp::DifferentNameFrom { .. }
+        | FilterProp::DistinctFrom { .. }
         | FilterProp::SharesQuality { .. }
         | FilterProp::CanEnchant { .. }
         | FilterProp::IsChosenCreatureType
@@ -809,6 +810,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         // (`tracked_object_sets` / `chain_tracked_set_id`), not the candidate's
         // own fingerprint — POISON for memoization.
         | FilterProp::InTrackedSet { .. }
+        | FilterProp::CouldBeTargetedByTriggeringSpell
         | FilterProp::Other { .. } => false,
     }
 }

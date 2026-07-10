@@ -1581,6 +1581,9 @@ fn scan_quantity_ref(x: &QuantityRef) -> Axes {
             projected: true,
         },
         QuantityRef::StartingLifeTotal => Axes::NONE,
+        // CR 701.57a: reads a transient game-state scalar (the last discover's
+        // mana-value limit); no growing resource, sibling, or projected axis.
+        QuantityRef::TriggeringDiscoverValue => Axes::NONE,
         QuantityRef::ObjectCount { filter } => {
             let mut acc = Axes {
                 event: false,
@@ -2511,11 +2514,17 @@ fn scan_target_filter(x: &TargetFilter) -> Axes {
         },
         TargetFilter::DefendingPlayer => Axes::NONE,
         TargetFilter::HasChosenName => Axes::NONE,
-        TargetFilter::ChosenDamageSource => Axes {
-            event: true,
-            sibling: false,
-            projected: false,
-        },
+        TargetFilter::ChosenDamageSource { filter } => {
+            let mut acc = Axes {
+                event: true,
+                sibling: false,
+                projected: false,
+            };
+            if let Some(f) = filter {
+                acc = acc.or(scan_target_filter(f));
+            }
+            acc
+        }
         TargetFilter::Named { name: _ } => Axes::NONE,
         TargetFilter::Owner => Axes::NONE,
         TargetFilter::AllPlayers => Axes::NONE,

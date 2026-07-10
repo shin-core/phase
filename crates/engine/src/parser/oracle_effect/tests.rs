@@ -1228,6 +1228,23 @@ fn infer_origin_zone_handles_top_of_your_library() {
 }
 
 #[test]
+fn infer_origin_zone_handles_command_zone() {
+    // CR 408.1 + CR 903.6: "put your commander into your hand from the command
+    // zone" (Command Beacon, Road of Return, Netherborn Altar) and "put a
+    // commander you own from the command zone onto the battlefield" (Hellkite
+    // Courser, #5256). Before this the origin was inferred as None, so the
+    // resolver searched the wrong zone for the commander.
+    assert_eq!(
+        infer_origin_zone("put your commander into your hand from the command zone"),
+        Some(Zone::Command)
+    );
+    assert_eq!(
+        infer_origin_zone("put a commander you own from the command zone onto the battlefield"),
+        Some(Zone::Command)
+    );
+}
+
+#[test]
 fn inferred_top_of_your_library_origin_adds_owner_constraint() {
     let filter = add_inferred_origin_constraints_to_target(
         TargetFilter::Typed(TypedFilter::card()),
@@ -4220,6 +4237,118 @@ fn target_subject_damage_compound_each_creature_and_each_opponent() {
         *player_filter,
         Some(PlayerFilter::Opponent),
         "compound 'and each opponent' must lift into player_filter",
+    );
+}
+
+/// Issue #5244 — Radiance color fan-out (Cleansing Beam): "deals 2 damage to
+/// target creature and each other creature that shares a color with it." Must
+/// lower to a `DealDamage` to the chosen target (providing the target slot +
+/// the target's own damage) with a `DamageAll` sub-ability that fans the damage
+/// to color-sharers (`SharesQuality{Color, ParentTarget}`) EXCLUDING the target
+/// (`DistinctFrom{ParentTarget}`), so the target is not double-damaged.
+#[test]
+fn radiance_color_fanout_lowers_to_damage_all_sub_ability() {
+    let clause = parse_effect_clause(
+        "Cleansing Beam deals 2 damage to target creature and each other creature that shares a color with it.",
+        &mut ParseContext::default(),
+    );
+    // Primary: DealDamage to a single target creature.
+    let Effect::DealDamage {
+        amount,
+        target: TargetFilter::Typed(primary_tf),
+        ..
+    } = &clause.effect
+    else {
+        panic!("expected DealDamage primary, got {:?}", clause.effect);
+    };
+    assert_eq!(*amount, QuantityExpr::Fixed { value: 2 });
+    assert!(primary_tf
+        .type_filters
+        .iter()
+        .any(|t| matches!(t, TypeFilter::Creature)));
+
+    // Sub-ability: DamageAll over color-sharers excluding the target.
+    let sub = clause
+        .sub_ability
+        .as_ref()
+        .expect("Radiance fan-out must attach a DamageAll sub-ability");
+    let Effect::DamageAll {
+        amount: fan_amount,
+        target: TargetFilter::Typed(fan_tf),
+        player_filter: None,
+        damage_source: None,
+    } = sub.effect.as_ref()
+    else {
+        panic!(
+            "expected DamageAll fan-out sub-effect, got {:?}",
+            sub.effect
+        );
+    };
+    assert_eq!(*fan_amount, QuantityExpr::Fixed { value: 2 });
+    assert!(
+        fan_tf.properties.iter().any(|p| matches!(
+            p,
+            FilterProp::SharesQuality {
+                quality: SharedQuality::Color,
+                reference: Some(r),
+                relation: SharedQualityRelation::Shares,
+            } if matches!(**r, TargetFilter::ParentTarget)
+        )),
+        "fan-out must share a Color with ParentTarget, got {:?}",
+        fan_tf.properties
+    );
+    assert!(fan_tf.properties.iter().any(|p| matches!(
+        p,
+        FilterProp::DistinctFrom { reference } if matches!(**reference, TargetFilter::ParentTarget)
+    )), "fan-out must exclude the ParentTarget, got {:?}", fan_tf.properties);
+}
+
+/// Negative reach-guard for the Radiance recognizer: a plain single-target
+/// damage line ("deals 2 damage to target creature", no fan-out suffix) must
+/// still lower to a bare `DealDamage` with NO DamageAll sub-ability — proving
+/// the fan-out recognizer doesn't over-fire.
+#[test]
+fn plain_damage_no_radiance_suffix_stays_single_deal_damage() {
+    let clause = parse_effect_clause(
+        "Shock deals 2 damage to target creature.",
+        &mut ParseContext::default(),
+    );
+    assert!(
+        matches!(clause.effect, Effect::DealDamage { .. }),
+        "plain damage must be DealDamage, got {:?}",
+        clause.effect
+    );
+    assert!(
+        clause.sub_ability.is_none()
+            || !matches!(
+                clause.sub_ability.as_ref().map(|s| s.effect.as_ref()),
+                Some(Effect::DamageAll { .. })
+            ),
+        "plain damage must NOT gain a DamageAll fan-out sub-ability"
+    );
+}
+
+/// Issue #5244 (review) — the Radiance fan-out recognizer must DECLINE
+/// Brightflame ("deals X damage to target creature and each other creature that
+/// shares a color with it. You gain life equal to the damage dealt this way.").
+/// Its X amount and "damage dealt this way" lifegain rider need the rider bound
+/// to the fan-out's DamageAll total — deferred engine work. Declining keeps the
+/// lifegain sentence intact instead of silently lowering the card wrong, so the
+/// recognizer only fires for FIXED-amount Radiance damage.
+#[test]
+fn radiance_fanout_declines_variable_x_amount() {
+    let clause = parse_effect_clause(
+        "Brightflame deals X damage to target creature and each other creature that shares a color with it.",
+        &mut ParseContext::default(),
+    );
+    // The X-amount fan-out must NOT produce a DamageAll sub-ability here.
+    assert!(
+        !matches!(
+            clause.sub_ability.as_ref().map(|s| s.effect.as_ref()),
+            Some(Effect::DamageAll { .. })
+        ),
+        "X-amount Radiance damage must not lower to the color fan-out (deferred), got {:?}",
+        clause.sub_ability
     );
 }
 
@@ -26956,6 +27085,14 @@ fn return_destination_face_down_before_control_splice() {
     );
 }
 
+/// CR 508.4: bare "onto the battlefield attacking" without tapped.
+#[test]
+fn parse_battlefield_entry_qualifiers_bare_attacking() {
+    let (tapped, attacking) = parse_battlefield_entry_qualifiers(" attacking");
+    assert!(!tapped);
+    assert!(attacking);
+}
+
 /// CR 508.4: "return it to the battlefield tapped and attacking" (Jocasta,
 /// Automaton Avenger) must lower with both `enter_tapped` and
 /// `enters_attacking` when the anaphor refers to the trigger source.
@@ -32316,6 +32453,63 @@ fn conjure_quantity_graveyard() {
         }
         other => panic!("expected Conjure, got: {other:?}"),
     }
+}
+
+#[test]
+fn conjure_of_your_choice_from_spellbook_onto_battlefield() {
+    // "conjure a card of your choice from [X] spellbook onto the battlefield" is the
+    // "conjure ... of your choice" wording of draft-from-spellbook (digital-only Alchemy);
+    // it maps to the same Effect::DraftFromSpellbook as "draft a card from ~'s spellbook".
+    let e = parse_effect(
+        "conjure a card of your choice from the Planets Spellbook onto the battlefield",
+    );
+    match e {
+        Effect::DraftFromSpellbook {
+            destination,
+            tapped,
+        } => {
+            assert_eq!(destination, Zone::Battlefield);
+            assert!(!tapped);
+        }
+        other => panic!("expected DraftFromSpellbook, got: {other:?}"),
+    }
+}
+
+#[test]
+fn conjure_of_your_choice_from_spellbook_apostrophe_source() {
+    // The printed source name ("Follow the Tracks's spellbook") is irrelevant -- the
+    // resolver reads the spellbook list from the source object, not the text.
+    let e = parse_effect(
+        "conjure a card of your choice from Follow the Tracks's spellbook onto the battlefield",
+    );
+    assert!(matches!(
+        e,
+        Effect::DraftFromSpellbook {
+            destination: Zone::Battlefield,
+            tapped: false
+        }
+    ));
+}
+
+#[test]
+fn conjure_of_your_choice_from_spellbook_into_library() {
+    let e =
+        parse_effect("conjure a card of your choice from the Paradigm Spellbook into your library");
+    assert!(matches!(
+        e,
+        Effect::DraftFromSpellbook {
+            destination: Zone::Library,
+            tapped: false
+        }
+    ));
+}
+
+#[test]
+fn conjure_of_your_choice_from_spellbook_bare_form_is_not_parsed() {
+    // Every printed card states a destination; a bare form (no zone) is left to fall
+    // through rather than defaulting to a zone the text did not name.
+    let e = parse_effect("conjure a card of your choice from the Planets Spellbook");
+    assert!(!matches!(e, Effect::DraftFromSpellbook { .. }));
 }
 
 #[test]

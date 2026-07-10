@@ -100,7 +100,7 @@ pub(crate) fn affected_filter_uses_object_population(filter: &TargetFilter) -> b
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
         | TargetFilter::HasChosenName
-        | TargetFilter::ChosenDamageSource
+        | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
         | TargetFilter::Owner
         // CR 201.5a: append-only; GrantingObject is concretized to SpecificObject
@@ -125,6 +125,10 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         // so any entry/exit of a matching permanent can flip membership for a
         // pre-existing object. Unconditionally population dependent.
         FilterProp::DifferentNameFrom { .. } => true,
+        // CR 109.1: identity-exclusion against a resolved reference (e.g. the
+        // ability's chosen target) — the reference set can change, so treat as
+        // population dependent, mirroring `DifferentNameFrom`.
+        FilterProp::DistinctFrom { .. } => true,
         // CR 603.4: "shares a quality with" a reference set is population
         // dependent ONLY when a reference filter is present — the reference set
         // is battlefield-derived. The multi-target group-share form
@@ -153,6 +157,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         // `ColorCount` carries a `u8` constant, not a QuantityExpr.
         // `ManaSymbolCount` reads only the candidate's own printed mana cost.
         FilterProp::CanEnchant { .. }
+        | FilterProp::CouldBeTargetedByTriggeringSpell
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::TargetsOnly { .. }
@@ -317,7 +322,7 @@ pub(crate) fn entered_object_perturbs_affected_filter(
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
         | TargetFilter::HasChosenName
-        | TargetFilter::ChosenDamageSource
+        | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
         | TargetFilter::Owner
         // CR 201.5a: append-only; GrantingObject is concretized to SpecificObject
@@ -353,6 +358,11 @@ fn entered_object_perturbs_filter_prop(
         FilterProp::DifferentNameFrom { filter } => {
             matches_target_filter(state, entered_id, filter, ctx)
         }
+        // CR 109.1: an entering object perturbs the identity-exclusion iff it
+        // matches the reference filter (it could become a new reference object).
+        FilterProp::DistinctFrom { reference } => {
+            matches_target_filter(state, entered_id, reference, ctx)
+        }
         // CR 603.4: the reference set is battlefield-derived only when a
         // reference filter is present (classifier returns false for `None`). The
         // `None` arm is therefore unreachable here, but enumerated as `false`
@@ -381,6 +391,7 @@ fn entered_object_perturbs_filter_prop(
         // `filter_prop_uses_object_population` — candidate-local, stack-relative,
         // single-object, or threshold-free, so a board entry cannot perturb them.
         FilterProp::CanEnchant { .. }
+        | FilterProp::CouldBeTargetedByTriggeringSpell
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::TargetsOnly { .. }
@@ -1173,6 +1184,22 @@ pub fn matches_target_filter_on_battlefield_entry(
         ProposedEvent::ZoneChange { object_id, to, .. } if *to == Zone::Battlefield => {
             matches_target_filter(state, *object_id, filter, ctx)
         }
+        ProposedEvent::TokenEntry { entry_ref, .. } => {
+            state.liminal_entries.get(entry_ref).is_some_and(|entry| {
+                filter_inner_for_object(
+                    state,
+                    &entry.object,
+                    *entry_ref,
+                    filter,
+                    ctx.source_id,
+                    ctx.source_controller,
+                    ctx.ability,
+                    ctx.recipient_id,
+                    ctx.scoped_iteration_player,
+                    ControllerLookup::LiveOrLki,
+                )
+            })
+        }
         ProposedEvent::CreateToken {
             owner,
             spec,
@@ -1810,10 +1837,35 @@ fn filter_inner_for_object(
                 })
         }
         // CR 603.7: Match objects in a tracked set from the originating effect.
-        TargetFilter::TrackedSet { id } => state
-            .tracked_object_sets
-            .get(id)
-            .is_some_and(|set| set.contains(&object_id)),
+        // CR 608.2c: `TrackedSetId(0)` is the parser's "most recent set" sentinel.
+        // Resolve it via `targeting::resolve_tracked_set_id` — the single
+        // id-resolution authority (chain-first, then latest non-empty set) — so
+        // effect resolvers that match objects directly against the filter
+        // (`DestroyAll { TrackedSet }` — "destroy each permanent chosen this
+        // way", Druid of Purification #4780) read the just-published set instead
+        // of looking up the literal sentinel id and matching nothing. With no
+        // set published, a sentinel still matches nothing (fail-closed).
+        //
+        // Ladder inventory (deliberate, per review on #5505): the FILTER-level
+        // `targeting::resolve_tracked_set_sentinel` inserts one extra rung
+        // between chain and latest — `current_combat_damage_source_filter`
+        // (CR 510.2), which yields a `TargetFilter` rather than an id and so
+        // cannot fold into the shared id helper. The `TrackedSetFiltered`
+        // sibling arm below still carries its own pre-existing ladder (no chain
+        // rung; `max_by_key` over ALL sets including empty ones) — unifying it
+        // onto `resolve_tracked_set_id` would change empty-set shadowing for
+        // the Zimone's Experiment / Living Death class and is left to a
+        // follow-up rather than smuggled into this fix.
+        TargetFilter::TrackedSet { id } => {
+            let set_id = if id.0 == 0 {
+                crate::game::targeting::resolve_tracked_set_id(state)
+            } else {
+                Some(*id)
+            };
+            set_id
+                .and_then(|sid| state.tracked_object_sets.get(&sid))
+                .is_some_and(|set| set.contains(&object_id))
+        }
         // CR 701.33 + CR 701.18: Intersection of a tracked set with an inner
         // type filter. Used by Zimone's Experiment to route "X cards revealed
         // this way" — the Dig resolver populates a tracked set with the kept
@@ -1935,7 +1987,7 @@ fn filter_inner_for_object(
         }
         // CR 609.7a: "the chosen source" — match the ObjectId selected by
         // the prior damage-source choice while its continuation resolves.
-        TargetFilter::ChosenDamageSource => {
+        TargetFilter::ChosenDamageSource { .. } => {
             let recheck_ctx = FilterContext {
                 source_id,
                 source_controller,
@@ -1952,7 +2004,7 @@ fn filter_inner_for_object(
                     choice.source_id == object_id
                         && (matches!(
                             &choice.source_filter,
-                            TargetFilter::Any | TargetFilter::ChosenDamageSource
+                            TargetFilter::Any | TargetFilter::ChosenDamageSource { .. }
                         ) || matches_target_filter(
                             state,
                             object_id,
@@ -2168,7 +2220,7 @@ fn zone_change_filter_inner(
             });
             chosen_name.is_some_and(|name| record.name.eq_ignore_ascii_case(name))
         }
-        TargetFilter::ChosenDamageSource => false,
+        TargetFilter::ChosenDamageSource { .. } => false,
         TargetFilter::Named { name } => record.name == *name,
 
         // CR 603.10a + CR 603.6e + CR 702.6: `AttachedTo` against a zone-change
@@ -2516,7 +2568,7 @@ pub fn spell_record_matches_filter(
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
         | TargetFilter::HasChosenName
-        | TargetFilter::ChosenDamageSource
+        | TargetFilter::ChosenDamageSource { .. }
         // CR 201.5a: append-only (concretized before runtime).
         | TargetFilter::GrantingObject
         | TargetFilter::Owner => false,
@@ -2826,7 +2878,7 @@ fn spell_object_matches_filter_inner(
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
         | TargetFilter::HasChosenName
-        | TargetFilter::ChosenDamageSource
+        | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
         // CR 201.5a: append-only (concretized before runtime).
         | TargetFilter::GrantingObject
@@ -3028,6 +3080,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         // CR 303.4: "could enchant [target]" needs live target context and
         // Aura attachment legality; stack snapshots only record keyword values.
         FilterProp::CanEnchant { .. } => false,
+        FilterProp::CouldBeTargetedByTriggeringSpell => false,
         FilterProp::HasColor { color } => record.colors.contains(color),
         FilterProp::NotColor { color } => !record.colors.contains(color),
         FilterProp::HasSupertype { value } => record.supertypes.contains(value),
@@ -3148,6 +3201,10 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase
         | FilterProp::DifferentNameFrom { .. }
+        // CR 109.1: a spell on the stack is not the ability's chosen target
+        // permanent; identity-exclusion is a live-battlefield predicate the
+        // spell-cast snapshot cannot represent. Fail closed.
+        | FilterProp::DistinctFrom { .. }
         | FilterProp::SharesQuality { .. }
         | FilterProp::WasDealtDamageThisTurn
         | FilterProp::EnteredThisTurn
@@ -3546,6 +3603,10 @@ fn matches_filter_prop(
                 && !combat::has_summoning_sickness(obj)
         }
         FilterProp::WithKeyword { value } => obj.has_keyword(value),
+        // CR 115.1 + CR 707.10: Zada — "creature you control that the spell could target".
+        FilterProp::CouldBeTargetedByTriggeringSpell => {
+            crate::game::targeting::object_could_be_targeted_by_triggering_spell(state, object_id)
+        }
         FilterProp::CanEnchant { target } => obj.keywords.iter().any(|keyword| {
             let Keyword::Enchant(enchant_filter) = keyword else {
                 return false;
@@ -4115,6 +4176,39 @@ fn matches_filter_prop(
                 .collect();
             !controlled_names.contains(&obj.name.as_str())
         }
+        // CR 109.1 + CR 120.3: Match objects that are NOT the same object as any
+        // object the `reference` filter resolves to. `ParentTarget` resolves to
+        // the ability's chosen object target(s); other context refs resolve via
+        // the shared event-context machinery (mirrors the `SharesQuality`
+        // reference resolution below). Used by Radiance's "each OTHER creature
+        // that shares a color with it" — excludes the already-damaged target.
+        FilterProp::DistinctFrom { reference } => {
+            // `matches_filter_prop` runs once per candidate object, so short-circuit
+            // via `.any()` rather than collecting the reference ids into a `Vec`.
+            //
+            // NOTE (fail-open asymmetry): the `ParentTarget` arm reads ONLY
+            // `ability.targets` — it lacks the LKI / `recipient_id` /
+            // effect-context fallback ladder that `SharesQuality`'s `ParentTarget`
+            // path carries (see `parent_target_shared_quality_values` below). When
+            // `ability` is `None` or its targets are empty this excludes nothing
+            // (fails open). That is safe for the current Radiance class — the
+            // resolving `DamageAll` sub-ability always carries the chosen target —
+            // but a future reuse in a layer-eval or recipient context would need
+            // the same fallback ladder to avoid a silent double-hit.
+            let is_referenced = if matches!(**reference, TargetFilter::ParentTarget) {
+                source.ability.is_some_and(|ability| {
+                    ability
+                        .targets
+                        .iter()
+                        .any(|t| matches!(t, TargetRef::Object(id) if *id == object_id))
+                })
+            } else {
+                crate::game::targeting::resolve_event_context_targets(state, reference, source.id)
+                    .into_iter()
+                    .any(|t| matches!(t, TargetRef::Object(id) if id == object_id))
+            };
+            !is_referenced
+        }
         // CR 604.3: Match objects in any of the listed zones (OR semantics).
         FilterProp::InAnyZone { zones } => zones.contains(&obj.zone),
         FilterProp::SharesQuality {
@@ -4323,6 +4417,7 @@ fn zone_change_record_matches_property(
         // CR 303.4: Requires live target context; zone-change snapshots cannot
         // prove attachment legality against a referenced target.
         FilterProp::CanEnchant { .. } => false,
+        FilterProp::CouldBeTargetedByTriggeringSpell => false,
         // CR 205.4a: Supertype membership as of the zone change.
         FilterProp::HasSupertype { value } => record.supertypes.contains(value),
         FilterProp::NotSupertype { value } => !record.supertypes.contains(value),
@@ -4665,6 +4760,9 @@ fn zone_change_record_matches_property(
         // attachments) — a zone-change snapshot cannot represent it.
         | FilterProp::Modified
         | FilterProp::DifferentNameFrom { .. }
+        // CR 109.1: identity-exclusion is a live-battlefield predicate; a
+        // zone-change snapshot cannot represent it. Fail closed.
+        | FilterProp::DistinctFrom { .. }
         | FilterProp::InAnyZone { .. }
         | FilterProp::SharesQuality { .. }
         | FilterProp::EnteredThisTurn

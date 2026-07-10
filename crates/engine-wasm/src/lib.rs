@@ -10,9 +10,10 @@ use engine::ai_support::{auto_pass_recommended, legal_actions_for_viewer, legal_
 use engine::database::legality::{any_ai_difficulty_is_cedh, validate_cedh_bracket};
 use engine::database::{CardDatabase, CardSearchQuery};
 use engine::game::engine::{
-    apply, resolve_all_fast_forward, ResolveAllCallbackDecision,
+    apply, apply_for_simulation, resolve_all_fast_forward, ResolveAllCallbackDecision,
     ResolveAllFastForwardResult as BatchResolveResult,
 };
+use engine::game::preview::compute_preview_diff;
 use engine::game::{
     can_pair_commanders, deck_copy_limit_for, estimate_bracket, evaluate_deck_compatibility,
     filter_state_for_viewer, finalize_public_state, is_brawl_commander_eligible,
@@ -22,6 +23,7 @@ use engine::game::{
     PlayerDeckList, ReplayPlayer,
 };
 use engine::types::format::{FormatConfig, GameFormat};
+use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::match_config::MatchConfig;
@@ -1171,6 +1173,48 @@ pub fn get_legal_actions_for_viewer_js(player_id: u32) -> JsValue {
     }
 }
 
+/// Read-only preview of cast-time target slots for a currently castable spell.
+/// Returns `[]` for uncastable, untargeted, or target-ambiguous casts.
+#[wasm_bindgen]
+pub fn legal_targets_for_castable_js(object_id: u32) -> JsValue {
+    match with_state(|state| {
+        let slots = if let WaitingFor::Priority { player } = &state.waiting_for {
+            let probe = engine::game::casting::PriorityCastProbe::new(state, *player);
+            engine::game::casting::legal_target_slots_for_castable_spell_with_probe(
+                probe.state(),
+                *player,
+                ObjectId(object_id as u64),
+                Some(&probe),
+            )
+        } else {
+            Vec::new()
+        };
+        to_js(&slots)
+    }) {
+        Ok(val) => val,
+        Err(_) => JsValue::NULL,
+    }
+}
+
+/// Batch variant for hover/drag clients that need previews for many castable
+/// cards. The engine flushes layers once and reuses that snapshot for every id.
+#[wasm_bindgen]
+pub fn legal_targets_for_castables_js(object_ids: JsValue) -> JsValue {
+    let object_ids: Vec<u32> = serde_wasm_bindgen::from_value(object_ids).unwrap_or_default();
+    match with_state(|state| {
+        let object_ids = object_ids
+            .into_iter()
+            .map(|id| ObjectId(id as u64))
+            .collect::<Vec<_>>();
+        let slots =
+            engine::game::casting::legal_target_slots_for_castable_spells(state, object_ids);
+        to_js(&slots)
+    }) {
+        Ok(val) => val,
+        Err(_) => JsValue::NULL,
+    }
+}
+
 /// Combined filtered-state + viewer-scoped legal-actions snapshot. Collapses
 /// two WASM round-trips into one for the P2P host broadcast loop. Field names
 /// match `LegalActionsResult` so the existing `legalActionsToWire` helper on
@@ -1210,6 +1254,48 @@ pub fn get_viewer_snapshot_js(player_id: u32) -> JsValue {
     }) {
         Ok(val) => val,
         Err(_) => JsValue::NULL,
+    }
+}
+
+/// Issue #5468: non-mutating dry-run of `action` for `actor`. Runs the action on
+/// a throwaway clone (the live `GAME_STATE` is never touched) and returns the
+/// PUBLIC deltas — life-total changes, public-zone object transitions, created
+/// tokens, and objects that ceased to exist — a viewer could observe, for
+/// hover-preview UX ("this kills that", "you take 4").
+///
+/// Hidden-zone movements never leak: the diff is taken over
+/// `filter_state_for_viewer` snapshots (so any identity the viewer can't see is
+/// already redacted), AND a transition is surfaced only when at least one
+/// endpoint is a public zone (see `engine::game::preview`), so a fully-hidden
+/// hand↔library draw is elided even for the acting player's opponents. Returns
+/// an error string when `action` is malformed or illegal in the current state.
+#[wasm_bindgen]
+pub fn preview_action_js(actor: u8, action: JsValue) -> JsValue {
+    let action: GameAction = match serde_wasm_bindgen::from_value(action) {
+        Ok(a) => a,
+        Err(e) => {
+            return JsValue::from_str(&format!("Engine error: failed to deserialize action: {e}"));
+        }
+    };
+    let actor = PlayerId(actor);
+    match with_state(|state| {
+        // Simulate on a throwaway clone. `apply_for_simulation` is the same rules
+        // resolution the AI look-ahead uses; it mutates only `sim`, never the
+        // live `GAME_STATE` this closure borrows immutably.
+        let mut sim = state.clone();
+        engine::game::layers::flush_layers(&mut sim);
+        let before = filter_state_for_viewer(&sim, actor);
+        match apply_for_simulation(&mut sim, actor, action) {
+            Ok(_) => {
+                let after = filter_state_for_viewer(&sim, actor);
+                Ok(compute_preview_diff(&before, &after))
+            }
+            Err(e) => Err(format!("Engine error: {e}")),
+        }
+    }) {
+        Ok(Ok(diff)) => to_js(&diff),
+        Ok(Err(msg)) => JsValue::from_str(&msg),
+        Err(e) => e,
     }
 }
 

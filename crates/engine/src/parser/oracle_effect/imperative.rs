@@ -11788,6 +11788,19 @@ pub(super) fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAs
                     Duration::UntilEndOfCombat,
                     alt((tag("this combat if able"), tag("that combat if able"))),
                 ),
+                // CR 508.1d + CR 511.3: "attacks during its controller's next combat
+                // phase if able" — Trench Behemoth. The forced-attack requirement
+                // persists until the end of the target creature's controller's next
+                // combat phase (analogous to "doesn't untap during its controller's
+                // next untap step"). `PlayerScope::Controller` resolves to the
+                // affected object's controller at enforcement time.
+                value(
+                    Duration::UntilNextStepOf {
+                        step: Phase::EndCombat,
+                        player: PlayerScope::Controller,
+                    },
+                    tag("during its controller's next combat phase if able"),
+                ),
             )),
         ),
     )
@@ -16654,14 +16667,14 @@ mod tests {
         assert!(matches!(
             &*win.effect,
             Effect::CreateDamageReplacement {
-                source_filter: Some(TargetFilter::ChosenDamageSource),
+                source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
                 ..
             }
         ));
         assert!(matches!(
             &*lose.effect,
             Effect::PreventDamage {
-                damage_source_filter: Some(TargetFilter::ChosenDamageSource),
+                damage_source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
                 ..
             }
         ));

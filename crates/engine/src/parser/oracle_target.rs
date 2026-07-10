@@ -1347,6 +1347,43 @@ pub fn parse_target_with_syntax<'a>(
         );
     }
 
+    // CR 608.2c: "[each] <noun> chosen this way" is an anaphor over the exact set
+    // of objects a prior "[each player may] choose …" step selected, NOT a fresh
+    // board-wide type filter. Without this arm "destroy each permanent chosen this
+    // way" (Druid of Purification) parsed the head noun as `Typed(Permanent)` and
+    // dropped "chosen this way", destroying EVERY permanent instead of only the
+    // chosen ones (#4780). Recognize an optional "each "/"the " determiner, a head
+    // noun, then the "chosen this way" tail → the published `TrackedSet`.
+    if let Ok((rest_lower, _)) = (
+        opt(alt((
+            tag::<_, _, OracleError<'_>>("each "),
+            tag::<_, _, OracleError<'_>>("the "),
+        ))),
+        alt((
+            tag::<_, _, OracleError<'_>>("permanents"),
+            tag("permanent"),
+            tag("creatures"),
+            tag("creature"),
+            tag("artifacts"),
+            tag("artifact"),
+            tag("enchantments"),
+            tag("enchantment"),
+            tag("cards"),
+            tag("card"),
+        )),
+        tag::<_, _, OracleError<'_>>(" chosen this way"),
+    )
+        .parse(lower.as_str())
+    {
+        return (
+            TargetFilter::TrackedSet {
+                id: TrackedSetId(0),
+            },
+            &text[lower.len() - rest_lower.len()..],
+            syntax,
+        );
+    }
+
     // CR 608.2c: "each of those <type>" — anaphoric reference to objects
     // affected by a preceding instruction in the same ability (Urge to Feed:
     // vampires tapped for the optional cost; Zimone-class "revealed this way"
@@ -1980,14 +2017,20 @@ pub fn parse_type_phrase_with_ctx<'a>(
     let offset = lower.len() - lower_trimmed.len();
     pos += offset;
 
-    // Strip leading article ("a "/"an ") when followed by a recognized type word.
-    // Guard: "an opponent" → "opponent" fails type word check → no stripping.
+    // Strip leading article ("a "/"an ") when followed by a recognized type word
+    // or the "commander" class. Guard: "an opponent" → "opponent" fails type word
+    // check → no stripping. CR 903.3: "commander" is recognized by the commander
+    // atom below (it pushes `IsCommander`), not by `starts_with_type_phrase_lead`,
+    // so the article guard must also accept it — otherwise "a commander you own"
+    // (Hellkite Courser, #5256) keeps its article and never reaches the atom,
+    // collapsing to a match-anything filter. "commander you own" / "target
+    // commander" already work; this makes the indefinite article compose too.
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("a ").parse(&lower[pos..]) {
-        if starts_with_type_phrase_lead(rest) {
+        if starts_with_type_phrase_lead(rest) || starts_with_commander_word(rest) {
             pos += "a ".len();
         }
     } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("an ").parse(&lower[pos..]) {
-        if starts_with_type_phrase_lead(rest) {
+        if starts_with_type_phrase_lead(rest) || starts_with_commander_word(rest) {
             pos += "an ".len();
         }
     }
@@ -2457,26 +2500,48 @@ pub fn parse_type_phrase_with_ctx<'a>(
     // "sorcery spell", "creature card". When the core type is already Instant/Sorcery/etc.,
     // the word is informational — consuming it allows suffix parsers (e.g., "that targets only")
     // and event verb parsers to see what follows.
+    // Tracks whether the left leg ended in a "card"/"cards" noun — the discriminator
+    // that a following article-led "or a <type> card" is a card-type disjunction
+    // (Overlord of the Balemurk, #5331) rather than an elided-verb "you control X
+    // or a Y" clause the condition layer folds one level up (which must stay as
+    // `parse_type_phrase` remainder — `parse_type_phrase_leaves_article_led_or_rhs_as_remainder`).
+    let mut left_card_suffix = false;
     if card_type.is_some() && !matches!(card_type, Some(TypeFilter::Card) | Some(TypeFilter::Any)) {
         let rest_trimmed = lower[pos..].trim_start();
         let ws_len = lower[pos..].len() - rest_trimmed.len();
         // CR 108.1: "spell" and "card" are informational suffixes after a typed qualifier.
-        // Longest-match-first ordering (plurals before singular).
-        static REDUNDANT_SUFFIXES: &[&str] = &["spells ", "spell ", "cards ", "card "];
+        // Longest-match-first ordering (plurals before singular). The paired flag
+        // records whether the consumed noun was "card"/"cards" (vs "spell") — a
+        // card-type disjunction whose article-led RHS is a sibling type, not an
+        // elided-verb clause. Data-driven so the discriminator comes from the
+        // matched tag, not from string inspection of the suffix.
+        static REDUNDANT_SUFFIXES: &[(&str, bool)] = &[
+            ("spells ", false),
+            ("spell ", false),
+            ("cards ", true),
+            ("card ", true),
+        ];
         let mut consumed_suffix = false;
-        for suffix in REDUNDANT_SUFFIXES {
+        for (suffix, is_card) in REDUNDANT_SUFFIXES {
             if let Ok((after, _)) = tag::<_, _, OracleError<'_>>(*suffix).parse(rest_trimmed) {
                 let suffix_len = rest_trimmed.len() - after.len();
                 pos += ws_len + suffix_len;
                 consumed_suffix = true;
+                left_card_suffix = *is_card;
                 break;
             }
         }
         if !consumed_suffix {
             // Check end-of-input variants (no trailing space)
-            for suffix in &["spells", "spell", "cards", "card"] {
+            for (suffix, is_card) in &[
+                ("spells", false),
+                ("spell", false),
+                ("cards", true),
+                ("card", true),
+            ] {
                 if rest_trimmed == *suffix {
                     pos += ws_len + suffix.len();
+                    left_card_suffix = *is_card;
                     break;
                 }
             }
@@ -2515,7 +2580,28 @@ pub fn parse_type_phrase_with_ctx<'a>(
             let can_recurse = if separator.starts_with(',') {
                 starts_with_or_article_type_segment(after_trimmed)
             } else {
+                // A bare "and"/"or" disjunct may lead with an article
+                // ("non-Avatar creature card or *a* planeswalker card" — Overlord
+                // of the Balemurk, #5331). The comma path already accepts that via
+                // `starts_with_or_article_type_segment`; without it here the
+                // second disjunct is silently dropped and the card can only return
+                // creatures, never planeswalkers. `starts_with_type_word` still
+                // covers the article-less form ("creature or planeswalker card").
+                //
+                // The article-led form is gated on `left_card_suffix`: only a
+                // "<type> card or a <type> card" disjunction folds here. Without
+                // the "card" noun, an article-led "or a <type>" is an elided-verb
+                // clause ("you control an artifact creature or a Plan") that the
+                // condition layer (`parse_you_control_a`) folds one level up, so it
+                // must remain as remainder (asserted by
+                // `parse_type_phrase_leaves_article_led_or_rhs_as_remainder`).
+                // A BARE-card RHS ("or a card with disturb" — Shipwreck Sifters)
+                // is a keyword-membership branch folded at the trigger layer, not a
+                // type union, so it is excluded even though the left carried "card".
                 starts_with_type_word(after_trimmed)
+                    || (left_card_suffix
+                        && !is_article_led_bare_card(after_trimmed)
+                        && starts_with_or_article_type_segment(after_trimmed))
             };
             if can_recurse {
                 let sep_text = &text[pos + rest_offset + separator.len()..];
@@ -2549,7 +2635,29 @@ pub fn parse_type_phrase_with_ctx<'a>(
                     left_extras,
                 );
                 let combined = merge_or_filters(left, other_filter);
-                let combined = distribute_shared_properties(combined, &properties);
+                // CR 105.1 + CR 205.2: an article-led disjunct ("… or *an*
+                // artifact creature card") is a syntactically self-contained noun
+                // phrase, so the left leg's leading adjective properties
+                // (color/supertype/tapped — the leg-local set in
+                // `is_adjective_prefix_prop`) bind only to the left noun and must
+                // NOT distribute onto it. "red creature card or an artifact
+                // creature card" (Purphoros, Bronze-Blooded) does not require the
+                // artifact creature to be red — distributing `HasColor(Red)` would
+                // wrongly reject a colorless artifact creature. A bare disjunct
+                // ("… or creature") shares the left adjectives, unchanged.
+                let right_is_article_led = alt((tag::<_, _, OracleError<'_>>("an "), tag("a ")))
+                    .parse(after_trimmed)
+                    .is_ok();
+                let shared_props: Vec<FilterProp> = if right_is_article_led {
+                    properties
+                        .iter()
+                        .filter(|prop| !is_adjective_prefix_prop(prop))
+                        .cloned()
+                        .collect()
+                } else {
+                    properties.clone()
+                };
+                let combined = distribute_shared_properties(combined, &shared_props);
                 let combined = distribute_controller_to_or(combined);
                 let combined = distribute_core_type_to_or(combined);
                 let combined = distribute_neg_type_filters_to_or(combined);
@@ -3355,6 +3463,18 @@ fn classify_negation(negated: &str) -> NegationResult {
     }
 }
 
+/// CR 903.3 + CR 108.3: does `text` start with the "commander"/"commanders"
+/// class word (word-bounded)? Commander is not a card type or subtype — it is a
+/// per-object `IsCommander` flag recognized by the commander atom in
+/// `parse_type_phrase_with_ctx` — so `starts_with_type_phrase_lead` deliberately
+/// does not report it. The indefinite-article guard uses this to strip "a "/"an "
+/// before a commander subject ("a commander you own", Hellkite Courser).
+fn starts_with_commander_word(text: &str) -> bool {
+    alt((tag::<_, _, OracleError<'_>>("commanders"), tag("commander")))
+        .parse(text)
+        .is_ok_and(|(after, _)| after.is_empty() || after.starts_with([' ', ',', '.', ';']))
+}
+
 /// Guard: does text start with something `parse_type_phrase` would recognize?
 /// Used to prevent comma/and/or recursion on non-type text.
 pub(crate) fn starts_with_type_word(text: &str) -> bool {
@@ -3478,6 +3598,19 @@ fn starts_with_or_article_type_segment(text: &str) -> bool {
         return starts_with_article_core_type_segment(rest);
     }
     starts_with_type_phrase_lead(text)
+}
+
+/// True when `text` is an article-led BARE-card segment: "a/an card(s) …" with
+/// no type word before the "card" noun (e.g. "a card with disturb", Shipwreck
+/// Sifters). Such a disjunct is a keyword/predicate-membership branch folded at
+/// the trigger layer, NOT a card-*type* union like Overlord of the Balemurk's
+/// "a planeswalker card" (#5331) — so the type-disjunction splitter must not
+/// swallow it. `parse_card_or_cards_word` word-bounds "card"/"cards", so a typed
+/// lead ("a planeswalker card") returns false here.
+fn is_article_led_bare_card(text: &str) -> bool {
+    alt((tag::<_, _, OracleError<'_>>("an "), tag("a ")))
+        .parse(text.trim_start())
+        .is_ok_and(|(rest, _)| parse_card_or_cards_word(rest).is_ok())
 }
 
 fn starts_with_article_core_type_segment(text: &str) -> bool {
@@ -8050,6 +8183,46 @@ mod tests {
     }
 
     #[test]
+    fn indefinite_article_commander_lowers_with_is_commander() {
+        // CR 903.3: Hellkite Courser (#5256) — "put a commander you own from the
+        // command zone onto the battlefield". The indefinite article "a" must be
+        // stripped so the commander atom fires; before this it fell through to a
+        // match-anything `Any` filter (the reanimation put-path lost the subject).
+        let (f, rest) = parse_target("a commander you own from the command zone");
+        assert_eq!(
+            f,
+            TargetFilter::Typed(TypedFilter {
+                controller: None,
+                properties: vec![
+                    FilterProp::IsCommander,
+                    FilterProp::Owned {
+                        controller: ControllerRef::You,
+                    },
+                    FilterProp::InZone {
+                        zone: Zone::Command,
+                    },
+                ],
+                ..Default::default()
+            }),
+            "'a commander you own from the command zone' must lower to \
+             Typed{{IsCommander, Owned{{You}}, InZone{{Command}}}}, not Any"
+        );
+        assert_eq!(rest, "");
+
+        // Bare "a commander" (no suffix) still carries IsCommander, mirroring the
+        // "a creature card" indefinite form — not the empty match-anything filter.
+        let (bare, _) = parse_target("a commander");
+        assert_eq!(
+            bare,
+            TargetFilter::Typed(TypedFilter {
+                controller: None,
+                properties: vec![FilterProp::IsCommander],
+                ..Default::default()
+            }),
+        );
+    }
+
+    #[test]
     fn article_status_type_phrase_parses_as_target() {
         let (f, rest) = parse_target("a tapped land you control");
         assert_eq!(
@@ -9935,6 +10108,30 @@ mod tests {
         assert_eq!(rest, "");
     }
 
+    /// Issue #4780 — Druid of Purification: "Destroy each permanent chosen this
+    /// way." The "[each] <noun> chosen this way" anaphor must resolve to the
+    /// published tracked set (CR 608.2c), not a board-wide `Typed(Permanent)`
+    /// filter that would destroy every permanent.
+    #[test]
+    fn each_permanent_chosen_this_way_produces_tracked_set() {
+        for phrase in [
+            "each permanent chosen this way",
+            "permanent chosen this way",
+            "each creature chosen this way",
+            "the artifacts chosen this way",
+        ] {
+            let (f, rest) = parse_target(phrase);
+            assert_eq!(
+                f,
+                TargetFilter::TrackedSet {
+                    id: TrackedSetId(0)
+                },
+                "{phrase:?} must resolve to the published tracked set"
+            );
+            assert_eq!(rest, "", "{phrase:?} must be fully consumed");
+        }
+    }
+
     #[test]
     fn the_rest_produces_tracked_set() {
         let (f, rest) = parse_target("the rest");
@@ -11253,6 +11450,77 @@ mod tests {
             other => panic!("expected Or filter, got {other:?}"),
         }
         assert_eq!(rest.trim(), "");
+    }
+
+    #[test]
+    fn creature_card_or_a_planeswalker_card_keeps_both_disjuncts() {
+        // #5331 (Overlord of the Balemurk): "non-Avatar creature card or a
+        // planeswalker card" — the second disjunct leads with an article ("or *a*
+        // planeswalker card"), which the bare "or"/"and" separator previously
+        // rejected, silently dropping the planeswalker leg so the card could only
+        // return creatures. Both legs must survive.
+        let (f, _rest) = parse_type_phrase("non-Avatar creature card or a planeswalker card");
+        match f {
+            TargetFilter::Or { ref filters } => {
+                assert_eq!(filters.len(), 2, "both disjuncts kept: {filters:?}");
+                let has = |t: TypeFilter| {
+                    filters.iter().any(|leg| {
+                        matches!(leg, TargetFilter::Typed(tf) if tf.type_filters.contains(&t))
+                    })
+                };
+                assert!(
+                    has(TypeFilter::Creature),
+                    "creature leg present: {filters:?}"
+                );
+                assert!(
+                    has(TypeFilter::Planeswalker),
+                    "planeswalker leg present: {filters:?}"
+                );
+            }
+            other => panic!("expected Or with both disjuncts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn article_led_card_disjunct_does_not_inherit_left_leg_color() {
+        // Purphoros, Bronze-Blooded: "a red creature card or an artifact creature
+        // card". CR 105.1 + CR 205.2: the leading "red" binds only to the creature
+        // leg; the article-led "an artifact creature card" is an independent noun
+        // phrase and must NOT inherit `HasColor(Red)` — otherwise a colorless
+        // artifact creature (e.g. Ornithopter) would be wrongly rejected.
+        let (f, _rest) = parse_type_phrase("red creature card or an artifact creature card");
+        let TargetFilter::Or { filters } = f else {
+            panic!("expected Or, got {f:?}");
+        };
+        assert_eq!(filters.len(), 2, "both disjuncts kept: {filters:?}");
+        let has_red = |tf: &TypedFilter| {
+            tf.properties.iter().any(|p| {
+                matches!(
+                    p,
+                    FilterProp::HasColor {
+                        color: ManaColor::Red
+                    }
+                )
+            })
+        };
+        for leg in &filters {
+            let TargetFilter::Typed(tf) = leg else {
+                panic!("expected Typed legs, got {leg:?}");
+            };
+            if tf.type_filters.contains(&TypeFilter::Artifact) {
+                assert!(
+                    !has_red(tf),
+                    "artifact-creature leg must NOT require red: {:?}",
+                    tf.properties
+                );
+            } else {
+                assert!(
+                    has_red(tf),
+                    "creature leg must keep its red requirement: {:?}",
+                    tf.properties
+                );
+            }
+        }
     }
 
     #[test]

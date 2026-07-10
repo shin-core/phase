@@ -22,7 +22,7 @@ use super::mana::{
 };
 use super::phase::Phase;
 use super::player::{PlayerCounterKind, PlayerId};
-use super::proposed_event::ReplacementId;
+use super::proposed_event::AppliedReplacementKey;
 use super::replacements::ReplacementEvent;
 use super::statics::{ActivationExemption, CastFrequency, StaticMode};
 use super::stickers::{AppliedSticker, StickerKind};
@@ -3682,6 +3682,21 @@ pub enum FilterProp {
     DifferentNameFrom {
         filter: Box<TargetFilter>,
     },
+    /// CR 109.1 + CR 120.3: Matches objects that are NOT the same object as any
+    /// object the `reference` filter resolves to — the object-identity dual of
+    /// [`FilterProp::SharesQuality`] (which carries a `reference` and tests a
+    /// shared *quality*; this tests object *identity*). Used for the "each OTHER
+    /// <X> that ..." exclusion where "other" is relative to the ability's chosen
+    /// target rather than the source: Radiance's "target creature and each other
+    /// creature that shares a color with it" (Cleansing Beam) pairs
+    /// `DistinctFrom { reference: ParentTarget }` with
+    /// `SharesQuality { Color, reference: ParentTarget }` so the fan-out damages
+    /// every color-sharer EXCEPT the already-damaged target. Distinct from
+    /// [`FilterProp::Another`] (excludes the ability *source*) and
+    /// [`FilterProp::OtherThanTriggerObject`] (excludes the *triggering* object).
+    DistinctFrom {
+        reference: Box<TargetFilter>,
+    },
     /// CR 604.3: Matches objects whose current zone is any of the listed zones (OR semantics).
     /// Used for zone-based restrictions like "cards in graveyards and libraries".
     InAnyZone {
@@ -3776,6 +3791,10 @@ pub enum FilterProp {
     Targets {
         filter: Box<TargetFilter>,
     },
+    /// CR 115.1 + CR 707.10: Matches objects that could be chosen as a target of
+    /// the triggering spell on the stack. Used for Zada, Hedron Grinder's "for
+    /// each other creature you control that the spell could target" copy count.
+    CouldBeTargetedByTriggeringSpell,
     /// CR 107.3 + CR 202.1: Matches spells/objects whose printed mana cost contains
     /// an `{X}` shard. Used for "spell with {X} in its mana cost" qualifier on
     /// spell-cast triggers (Lattice Library, Nev the Practical Dean, Owlin
@@ -4539,7 +4558,15 @@ pub enum TargetFilter {
     /// CR 609.7a: Matches the object stored as the source's chosen damage source.
     /// Resolution-time prevention effects should resolve this to `SpecificObject`
     /// when the shield is created so global shields do not depend on a live source.
-    ChosenDamageSource,
+    /// CR 609.7 + CR 609.7b: `filter` optionally constrains which sources are LEGAL
+    /// to choose — e.g. "a blue source of your choice" (Circle/Rune of Protection)
+    /// restricts the choice to blue sources and is rechecked against the chosen
+    /// object's live properties when damage would be dealt; `None` is the bare "a
+    /// source of your choice" / "that source" form (any source is a legal choice).
+    ChosenDamageSource {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<Box<TargetFilter>>,
+    },
     /// Matches objects with a specific hardcoded name.
     /// Used for "card named [literal]" patterns.
     Named {
@@ -4862,6 +4889,12 @@ pub enum QuantityRef {
     LifeAboveStarting,
     /// CR 103.4: The format's starting life total (20 for Standard, 40 for Commander, etc.).
     StartingLifeTotal,
+    /// CR 701.57a: The mana-value limit `N` of the discover that fired the
+    /// current "whenever you discover" trigger — read from
+    /// `GameState::last_discover_value`. Curator of Sun's Creation: "discover
+    /// again for the same value". Resolves to 0 outside a discover-trigger
+    /// context (fail-safe; no card references it elsewhere).
+    TriggeringDiscoverValue,
     /// Count of objects on the battlefield matching a filter.
     /// Used for "for each creature you control" and similar patterns.
     ObjectCount { filter: TargetFilter },
@@ -12402,6 +12435,11 @@ pub enum CopyRetargetPermission {
     KeepOriginalTargets,
     /// Oracle text grants "you may choose new targets for the copy."
     MayChooseNewTargets,
+    /// CR 707.10d: Each copy is automatically targeted to a distinct iteration
+    /// member (Zada, Hedron Grinder — "each copy targets a different one of those
+    /// creatures"). No player choice — the member-driven `repeat_for` loop binds
+    /// the target before the copy is created.
+    RetargetEachCopyToIterationMember,
 }
 
 /// CR 611.2c: Which of a donor object's abilities a resolution-time
@@ -12603,6 +12641,9 @@ fn normalized_filter_prop(prop: FilterProp) -> FilterProp {
     match prop {
         FilterProp::DifferentNameFrom { filter } => FilterProp::DifferentNameFrom {
             filter: Box::new(filter.normalized()),
+        },
+        FilterProp::DistinctFrom { reference } => FilterProp::DistinctFrom {
+            reference: Box::new(reference.normalized()),
         },
         FilterProp::SharesQuality {
             quality,
@@ -18490,7 +18531,7 @@ pub struct ReplacementDefinition {
     /// is *not already present* in the proposed event's `TokenSpec.subtypes`
     /// is emitted as an additional `CreateToken` event via the same recursive
     /// `replace_event` path Chatterfang uses, preserving CR 616.1 ordering
-    /// and idempotence (the `applied: HashSet<ReplacementId>` set on each
+    /// and idempotence (the `applied: HashSet<AppliedReplacementKey>` set on each
     /// spawned event blocks re-application of the same Manufactor).
     ///
     /// Distinct from `additional_token_spec` (which always appends): this
@@ -19432,7 +19473,7 @@ pub struct ResolvedAbility {
     /// replacement's ChooseOneOf branch creates the substitute token), that event
     /// must inherit this set so the same replacement cannot apply to itself again.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    pub replacement_applied: HashSet<ReplacementId>,
+    pub replacement_applied: HashSet<AppliedReplacementKey>,
     /// CR 608.2c: How this ability links to its parent when present as a
     /// `sub_ability`. Copied through from the originating `AbilityDefinition`.
     /// `SequentialSibling` subs resolve even when an optional parent is declined.
@@ -19655,7 +19696,7 @@ impl ResolvedAbility {
 
     /// CR 614.5 + CR 616.1f: Carry replacement application identity through a
     /// post-replacement continuation and any branch/sub-chain it resolves.
-    pub fn set_replacement_applied_recursive(&mut self, applied: HashSet<ReplacementId>) {
+    pub fn set_replacement_applied_recursive(&mut self, applied: HashSet<AppliedReplacementKey>) {
         self.replacement_applied = applied.clone();
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.set_replacement_applied_recursive(applied.clone());

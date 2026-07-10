@@ -147,7 +147,9 @@ use self::subject::{
 };
 use crate::parser::oracle_ir::ast::*;
 pub(crate) use crate::parser::oracle_ir::context::{ParseContext, TokenPtFollowup};
-use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr, SpecialClause};
+use crate::parser::oracle_ir::effect_chain::{
+    AbilityIr, AbilityShellIr, ClauseIr, EffectChainIr, SpecialClause,
+};
 use crate::types::mana::ManaExpiry;
 
 /// CR 608.2k: True when `text` is a standalone object pronoun referring to
@@ -7763,6 +7765,28 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         });
     }
 
+    // CR 701.57a: "discover again for the same value" (Curator of Sun's
+    // Creation) — a re-discover whose N is the mana-value limit of the discover
+    // that fired the current "whenever you discover" trigger, read back via
+    // `QuantityRef::TriggeringDiscoverValue`. Composed from tags (the "again"
+    // marks the re-discover; "for the same value" is the fixed anaphor).
+    if let Ok((rest, _)) = (
+        tag::<_, _, OracleError<'_>>("discover "),
+        tag("again "),
+        tag("for the same value"),
+    )
+        .parse(tp.lower)
+    {
+        if rest.trim().trim_end_matches('.').trim().is_empty() {
+            return parsed_clause(Effect::Discover {
+                mana_value_limit: QuantityExpr::Ref {
+                    qty: QuantityRef::TriggeringDiscoverValue,
+                },
+                player: TargetFilter::Controller,
+            });
+        }
+    }
+
     // CR 701.57a: "[player] discover[s] N" / "[player] discover[s] X" — effect
     // variant. An optional leading player subject ("you", "that player", "target
     // opponent", …) redirects who performs the discover (Zoyowa's Justice: "Then
@@ -7863,6 +7887,13 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
 
     // Digital-only Alchemy: "draft a card from [X]'s spellbook [+ destination]".
     if let Some(effect) = try_parse_spellbook_draft(tp) {
+        return parsed_clause(effect);
+    }
+
+    // Digital-only Alchemy: "conjure a card of your choice from [X]'s spellbook
+    // [+ destination]" — the "conjure ... of your choice" wording of the same
+    // draft-from-spellbook operation.
+    if let Some(effect) = try_parse_conjure_from_spellbook(tp) {
         return parsed_clause(effect);
     }
 
@@ -8734,6 +8765,51 @@ fn try_parse_spellbook_draft(tp: TextPair) -> Option<Effect> {
     // Unmodeled tail ("twice, then …", a trailing chained clause, …) — leave it
     // to `Unimplemented` rather than dropping the rider.
     None
+}
+
+/// Digital-only Alchemy keyword action: parse "conjure a card of your choice from
+/// [X]'s spellbook [+ destination]". This is the "conjure ... of your choice" wording of
+/// the same operation as `draft a card from [X]'s spellbook`: reveal the source card's
+/// spellbook, the controller chooses one card, and it is created in the destination zone.
+/// Both map to `Effect::DraftFromSpellbook` — the resolver reads the spellbook list from the
+/// source object, so the printed source name in the text is irrelevant. The clause tail must
+/// be fully consumed (mirroring `try_parse_spellbook_draft`) so an unmodeled rider falls
+/// through to `Unimplemented` rather than parsing to a subtly wrong effect.
+///
+/// Coupling note: this mapping is correct while `Effect::DraftFromSpellbook` offers the
+/// controller the *entire* spellbook to choose from, which is exactly what "a card of your
+/// choice" means. (In Arena, `draft a card from ... spellbook` presents three random cards,
+/// whereas "conjure a card of your choice" reveals the whole book.) If `DraftFromSpellbook`
+/// is ever narrowed to model the real three-card draft, these conjure-of-your-choice cards
+/// must retain the whole-book choice rather than following it.
+fn try_parse_conjure_from_spellbook(tp: TextPair) -> Option<Effect> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("conjure a card of your choice from ")
+        .parse(tp.lower)
+        .ok()?;
+    // Consume the (irrelevant) source-card name up to "spellbook".
+    let (after_book, _src) = take_until::<_, _, OracleError<'_>>("spellbook")
+        .parse(rest)
+        .ok()?;
+    let (after_book, _) = tag::<_, _, OracleError<'_>>("spellbook")
+        .parse(after_book)
+        .ok()?;
+
+    // Destination via the shared conjure-zone parser; " tapped" only after the battlefield.
+    let (destination, zone_rest) = parse_conjure_zone(after_book)?;
+    let (tail, tapped) = if destination == Zone::Battlefield {
+        match tag::<_, _, OracleError<'_>>(" tapped").parse(zone_rest) {
+            Ok((tail, _)) => (tail, true),
+            Err(_) => (zone_rest, false),
+        }
+    } else {
+        (zone_rest, false)
+    };
+    // Fully consume the tail (nothing or a trailing period) so an unmodeled rider falls
+    // through to `Unimplemented` rather than being silently dropped.
+    (tail.is_empty() || tail == ".").then_some(Effect::DraftFromSpellbook {
+        destination,
+        tapped,
+    })
 }
 
 /// Digital-only keyword action: Parse "conjure [quantity] card(s) named {Name} into/onto {zone}"
@@ -14710,6 +14786,103 @@ fn try_parse_compound_object_player_damage(lower: &str) -> Option<ParsedEffectCl
 /// compounds like "deals 3 damage to any target and you gain 3 life" fall
 /// through to the caller's compound splitter unharmed. Returns `None` (and
 /// does not mutate `ctx`) if the text is not a multi-segment damage line.
+/// CR 120.3 + CR 207.2c: Radiance color fan-out damage — "deals N damage to
+/// target `<X>` and each other `<X>` that shares a color with it" (Cleansing
+/// Beam, Wojek Embermage). The chosen target takes the damage (a `DealDamage`
+/// that also supplies the required target slot), and a `DamageAll` sub-ability
+/// fans the same damage out to every OTHER object sharing a color with the
+/// target: `SharesQuality { Color, reference: ParentTarget }` selects the
+/// color-sharers (the target itself trivially shares its own color, so it is
+/// included by that predicate and must be removed) and
+/// `DistinctFrom { reference: ParentTarget }` excludes the already-damaged
+/// target so it is not dealt damage twice. Radiance is an ability word (CR
+/// 207.2c) with no independent rules meaning.
+///
+/// The fan-out noun's type is taken from the parsed primary target (creature
+/// here; the same shape generalizes to other permanent types), so the recognizer
+/// is not hard-coded to Creature.
+fn try_parse_radiance_color_fanout_damage(
+    text: &str,
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<ParsedEffectClause> {
+    let (primary_effect, remainder) = try_parse_damage_with_remainder(text, lower, ctx)?;
+
+    // Primary must be a single-target DealDamage at a typed object.
+    let Effect::DealDamage {
+        amount,
+        target: TargetFilter::Typed(target_typed),
+        damage_source: None,
+        excess: None,
+    } = &primary_effect
+    else {
+        return None;
+    };
+
+    // Scope: only fixed-amount Radiance damage (Cleansing Beam = 2, Wojek
+    // Embermage = 1). Brightflame deals *X* and carries a following "You gain
+    // life equal to the damage dealt this way" rider whose amount would need to
+    // bind to the fan-out's `DamageAll` total, not a preceding `DealDamage` —
+    // real engine work deferred to its own PR. Declining an X-amount fan-out
+    // keeps Brightflame honestly unsupported (its lifegain sentence is not
+    // silently dropped) rather than lowering it wrong. CR 120.3.
+    if !matches!(amount, QuantityExpr::Fixed { .. }) {
+        return None;
+    }
+
+    // The remainder must be exactly the color fan-out suffix.
+    let rem_lower = remainder.trim().trim_end_matches('.').trim().to_lowercase();
+    let matched = nom_on_lower(remainder.trim(), &rem_lower, |i| {
+        let (i, _) = opt(tag::<_, _, OracleError<'_>>(",")).parse(i)?;
+        let (i, _) = tag("and each other ").parse(i.trim_start())?;
+        // Consume the fan-out noun (must be a type word — creature/enchantment/…)
+        // then the fixed "that shares a color with it" tail. The noun value is not
+        // needed: the fan-out reuses the primary target's typed filter.
+        let (i, _) =
+            take_until::<_, _, OracleError<'_>>(" that shares a color with it").parse(i)?;
+        let (i, _) = tag(" that shares a color with it").parse(i)?;
+        Ok((i, ()))
+    })
+    .map(|(_, rest)| rest.trim().is_empty())
+    .unwrap_or(false);
+    if !matched {
+        return None;
+    }
+
+    // Build the fan-out filter: same object type as the target, restricted to
+    // color-sharers of the target, excluding the target itself.
+    let mut fanout = target_typed.clone();
+    fanout.properties.push(FilterProp::SharesQuality {
+        quality: SharedQuality::Color,
+        reference: Some(Box::new(TargetFilter::ParentTarget)),
+        relation: SharedQualityRelation::Shares,
+    });
+    fanout.properties.push(FilterProp::DistinctFrom {
+        reference: Box::new(TargetFilter::ParentTarget),
+    });
+
+    let fanout_effect = Effect::DamageAll {
+        amount: amount.clone(),
+        target: TargetFilter::Typed(fanout),
+        player_filter: None,
+        damage_source: None,
+    };
+
+    Some(ParsedEffectClause {
+        effect: primary_effect.clone(),
+        duration: None,
+        sub_ability: Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            fanout_effect,
+        ))),
+        distribute: None,
+        multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
 fn try_parse_multi_target_damage_chain(
     text: &str,
     ctx: &mut ParseContext,
@@ -15108,6 +15281,16 @@ fn try_split_damage_compound(text: &str, ctx: &mut ParseContext) -> Option<Parse
     // [with X | without X] and each player" (Pyrohemia / Earthquake / Hurricane
     // class). Must run before the general split so the player half isn't dropped.
     if let Some(clause) = try_parse_compound_object_player_damage(&lower) {
+        return Some(clause);
+    }
+
+    // CR 120.3 + CR 207.2c: Radiance color fan-out — "deals N damage to target
+    // <X> and each other <X> that shares a color with it" (Cleansing Beam, Wojek
+    // Embermage). The target <X> takes the damage AND every OTHER <X> sharing a
+    // color with it. Must run before the multi-target chain (which only handles
+    // "and M damage to T2" segments) so the fan-out isn't dropped as an ignored
+    // remainder. Radiance is an ability word (CR 207.2c) with no rules meaning.
+    if let Some(clause) = try_parse_radiance_color_fanout_damage(text, &lower, ctx) {
         return Some(clause);
     }
 
@@ -23007,38 +23190,113 @@ fn rewrite_filter_prop_another_to_tracked_set(prop: &mut FilterProp) {
     }
 }
 
-pub fn parse_effect_chain(text: &str, kind: AbilityKind) -> AbilityDefinition {
-    if let Some(def) =
-        try_parse_conditional_protection_grant_ability(text, kind, &mut ParseContext::default())
-    {
-        return def;
+/// Which whole-body bypass set a chain-lowering entry point runs.
+///
+/// The two entry points do **not** run the same set, and the difference is
+/// carried here as typed data rather than duplicated as two hand-maintained
+/// `if let` stacks:
+///
+/// | mode | bypasses | bypass #1's `ParseContext` |
+/// |---|---|---|
+/// | `Standalone` | 8 | a fresh `default()`, discarded |
+/// | `WithContext` | the same 8 as a strict prefix, plus `try_parse_exile_pile_shuffle_cloak` | the caller's real `ctx` |
+///
+/// Callers split cleanly: die-result branch bodies (`oracle_special.rs`) take
+/// `Standalone`; spell/activated dispatch takes `WithContext`.
+///
+/// **The asymmetry is suspected-accidental and is preserved byte-for-byte on
+/// purpose.** Nothing about a die-roll branch body should exclude the cloak
+/// recognizer, but unifying to 9 makes die branches newly take it and unifying
+/// to 8 makes spells lose it — either is silent lowered drift across the
+/// die-result cards. Fixing it is a separate, reviewed change with its own
+/// discriminating card; a parity migration never absorbs a bug fix.
+///
+/// Exhaustive match, no `_` arm and no `Default`: a third entry point must state
+/// which set it runs and fail to compile until it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainLoweringMode {
+    Standalone,
+    WithContext,
+}
+
+/// Run the whole-body recognizers that build a definition directly, in order.
+///
+/// Returns `None` when the text falls through to the ordinary clause pipeline.
+fn try_parse_chain_bypass(
+    text: &str,
+    kind: AbilityKind,
+    mode: ChainLoweringMode,
+    ctx: &mut ParseContext,
+) -> Option<AbilityDefinition> {
+    // The eight shared bypasses, in their established order. Only the first
+    // consults `ctx`.
+    if let Some(def) = try_parse_conditional_protection_grant_ability(text, kind, ctx) {
+        return Some(def);
     }
     if let Some(def) = try_parse_exile_top_each_library_with_collection_counter(text, kind) {
-        return def;
+        return Some(def);
     }
     if let Some(def) = try_parse_grant_graveyard_keyword_to_target(text, kind) {
-        return def;
+        return Some(def);
     }
     if let Some(def) = try_parse_balance_equalization(text, kind) {
-        return def;
+        return Some(def);
     }
     if let Some(def) = try_parse_each_player_copy_chosen(text, kind) {
-        return def;
+        return Some(def);
     }
     if let Some(def) = try_parse_catch_up_draw(text, kind) {
-        return def;
+        return Some(def);
     }
     if let Some(def) = try_parse_return_target_and_same_name_from_your_graveyard(text, kind) {
-        return def;
+        return Some(def);
     }
     if let Some(def) = try_parse_for_each_attacker_copy_blocker(text, kind) {
+        return Some(def);
+    }
+    match mode {
+        ChainLoweringMode::Standalone => None,
+        ChainLoweringMode::WithContext => try_parse_exile_pile_shuffle_cloak(text, kind),
+    }
+}
+
+/// Lowering: assemble an `AbilityDefinition` from an `AbilityIr`.
+///
+/// The single authority for what an effect-chain entry point does *after*
+/// parsing: lower the chain, finalize it, anchor it, then apply the shell. Every
+/// caller that lowers a whole ability body goes through here, so no call site
+/// can forget a step.
+///
+/// `finalize_effect_chain` and the owner-library anchor belong here and not in
+/// `lower_effect_chain_ir`: pushing them down would newly apply them at the
+/// production callers that lower a *chain* without being a whole ability body.
+pub(crate) fn lower_ability_ir(ir: &AbilityIr) -> AbilityDefinition {
+    let mut def = lower_effect_chain_ir(&ir.body);
+    finalize_effect_chain(&mut def);
+    apply_owner_library_reveal_anchor_from_text(&mut def, &ir.source_text);
+    // CR 608.2e: a root the chain cannot describe (it has no previous boundary).
+    if let Some(sub_link) = ir.shell.sub_link {
+        def.sub_link = sub_link;
+    }
+    def
+}
+
+pub fn parse_effect_chain(text: &str, kind: AbilityKind) -> AbilityDefinition {
+    // A fresh context per call, exactly as before: the bypasses may mutate `ctx`
+    // before declining, and those mutations must not reach `parse_effect_chain_ir`.
+    if let Some(def) = try_parse_chain_bypass(
+        text,
+        kind,
+        ChainLoweringMode::Standalone,
+        &mut ParseContext::default(),
+    ) {
         return def;
     }
-    let ir = parse_effect_chain_ir(text, kind, &mut ParseContext::default());
-    let mut def = lower_effect_chain_ir(&ir);
-    finalize_effect_chain(&mut def);
-    apply_owner_library_reveal_anchor_from_text(&mut def, text);
-    def
+    lower_ability_ir(&AbilityIr {
+        source_text: text.to_string(),
+        body: parse_effect_chain_ir(text, kind, &mut ParseContext::default()),
+        shell: AbilityShellIr::default(),
+    })
 }
 
 /// Parse a compound effect chain with subject context for pronoun resolution.
@@ -23049,38 +23307,14 @@ pub(crate) fn parse_effect_chain_with_context(
     kind: AbilityKind,
     ctx: &mut ParseContext,
 ) -> AbilityDefinition {
-    if let Some(def) = try_parse_conditional_protection_grant_ability(text, kind, ctx) {
+    if let Some(def) = try_parse_chain_bypass(text, kind, ChainLoweringMode::WithContext, ctx) {
         return def;
     }
-    if let Some(def) = try_parse_exile_top_each_library_with_collection_counter(text, kind) {
-        return def;
-    }
-    if let Some(def) = try_parse_grant_graveyard_keyword_to_target(text, kind) {
-        return def;
-    }
-    if let Some(def) = try_parse_balance_equalization(text, kind) {
-        return def;
-    }
-    if let Some(def) = try_parse_each_player_copy_chosen(text, kind) {
-        return def;
-    }
-    if let Some(def) = try_parse_catch_up_draw(text, kind) {
-        return def;
-    }
-    if let Some(def) = try_parse_return_target_and_same_name_from_your_graveyard(text, kind) {
-        return def;
-    }
-    if let Some(def) = try_parse_for_each_attacker_copy_blocker(text, kind) {
-        return def;
-    }
-    if let Some(def) = try_parse_exile_pile_shuffle_cloak(text, kind) {
-        return def;
-    }
-    let ir = parse_effect_chain_ir(text, kind, ctx);
-    let mut def = lower_effect_chain_ir(&ir);
-    finalize_effect_chain(&mut def);
-    apply_owner_library_reveal_anchor_from_text(&mut def, text);
-    def
+    lower_ability_ir(&AbilityIr {
+        source_text: text.to_string(),
+        body: parse_effect_chain_ir(text, kind, ctx),
+        shell: AbilityShellIr::default(),
+    })
 }
 
 /// CR 701.24a + CR 701.58a/e + CR 608.2c: Expose the Culprit mode 2 — "Exile any
@@ -23746,6 +23980,9 @@ pub(crate) fn parse_effect_chain_ir(
             };
         }
     }
+    let (chain_zada_distinct_copy_targets, text) =
+        lower::strip_each_copy_targets_distinct_member_suffix(text);
+    let text = text.as_str();
     let chunks = split_clause_sequence(text);
     // CR 107.3i: "Normally, all instances of X on an object have the same value."
     // Build a per-chunk sentence-scoped `where X is <expr>` binding so that when
@@ -23842,6 +24079,9 @@ pub(crate) fn parse_effect_chain_ir(
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         let normalized_text = strip_leading_sequence_connector(&chunk.text).trim();
         if normalized_text.is_empty() {
+            continue;
+        }
+        if lower::recognize_zada_copy_distinct_target_rider(&normalized_text.to_ascii_lowercase()) {
             continue;
         }
 
@@ -26065,10 +26305,25 @@ pub(crate) fn parse_effect_chain_ir(
         } else {
             let (suffix_repeat_for, stripped_text_no_qty) =
                 strip_for_each_repeat_suffix(&text_no_qty);
-            let stripped_clause = parse_effect_clause(&stripped_text_no_qty, ctx);
+            let mut stripped_clause = parse_effect_clause(&stripped_text_no_qty, ctx);
             if suffix_repeat_for.is_some()
                 && matches!(stripped_clause.effect, Effect::CopySpell { .. })
             {
+                let zada_distinct_copy_targets = chain_zada_distinct_copy_targets
+                    || suffix_repeat_for
+                        .as_ref()
+                        .is_some_and(lower::zada_repeat_for_implies_distinct_copy_targets);
+                if let Effect::CopySpell {
+                    target, retarget, ..
+                } = &mut stripped_clause.effect
+                {
+                    if zada_distinct_copy_targets {
+                        *retarget = CopyRetargetPermission::RetargetEachCopyToIterationMember;
+                    }
+                    if matches!(target, TargetFilter::ParentTarget | TargetFilter::Any) {
+                        *target = TargetFilter::TriggeringSource;
+                    }
+                }
                 (stripped_clause, repeat_for.or(suffix_repeat_for))
             } else if let Some((fanout_clause, fanout_spec, fanout_ctx)) =
                 parse_for_each_opponent_target_fanout_clause(
@@ -27539,6 +27794,14 @@ fn parse_battlefield_entry_qualifiers(tail_lower: &str) -> (bool, bool) {
     if scan_at_boundaries(tapped_and_attacking_clause) {
         return (true, true);
     }
+    // CR 508.4: bare "attacking" without tapped ("put it onto the battlefield
+    // attacking" — Senu, Keen-Eyed Protector).
+    fn attacking_clause(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
+        preceded(tag(" attacking"), qualifier_boundary).parse(input)
+    }
+    if scan_at_boundaries(attacking_clause) {
+        return (false, true);
+    }
     if scan_at_boundaries(tapped_clause) {
         return (true, false);
     }
@@ -28286,6 +28549,13 @@ fn infer_origin_zone(lower: &str) -> Option<Zone> {
         || contains_possessive(lower, "from", "library")
     {
         Some(Zone::Library)
+    } else if scan_contains_phrase(lower, "from the command zone") {
+        // CR 408.1 + CR 903.6: The command zone holds a player's commander(s)
+        // until moved. "put a commander you own from the command zone onto the
+        // battlefield" (Hellkite Courser, #5256) reanimates from the command
+        // zone; without this the origin was inferred as None and the commander
+        // was never found.
+        Some(Zone::Command)
     } else if scan_contains_phrase(lower, "graveyard") && !scan_contains_phrase(lower, "from") {
         // CR 404.1: Possessive graveyard references without "from" — e.g.,
         // "exile each opponent's graveyard", "exile target player's graveyard"
