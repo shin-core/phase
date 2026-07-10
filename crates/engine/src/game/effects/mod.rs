@@ -3214,7 +3214,29 @@ pub fn resolve_effect(
         Effect::Reveal { .. } => reveal::resolve(state, ability, events),
         Effect::RevealTop { .. } => reveal_top::resolve(state, ability, events),
         Effect::ExileTop { .. } => exile_top::resolve(state, ability, events),
-        Effect::TargetOnly { .. } => Ok(()), // no-op: targeting is established at cast time
+        // CR 608.2c: `TargetOnly` is the "choose <filter>" step — targeting is
+        // established at selection time, so there is nothing to mutate here. But
+        // the chosen object(s) must be PUBLISHED into the chain tracked set so a
+        // downstream "chosen this way" consumer (the `TrackedSet(0)` sentinel —
+        // "Destroy each permanent chosen this way", Druid of Purification #4780)
+        // reads exactly the chosen set. The chain-extending publish unions the
+        // per-player iterations of a `player_scope` fan-out ("starting with you,
+        // each player may choose …"); for chains with no tracked-set consumer the
+        // published set is simply never read.
+        Effect::TargetOnly { .. } => {
+            let chosen: Vec<crate::types::identifiers::ObjectId> = ability
+                .targets
+                .iter()
+                .filter_map(|t| match t {
+                    TargetRef::Object(id) => Some(*id),
+                    TargetRef::Player(_) => None,
+                })
+                .collect();
+            if !chosen.is_empty() {
+                publish_tracked_set(state, chosen);
+            }
+            Ok(())
+        }
         Effect::Choose { .. } => choose::resolve(state, ability, events),
         Effect::OpponentGuess { .. } => opponent_guess::resolve(state, ability, events),
         Effect::SwapChosenLabels { .. } => swap_chosen_labels::resolve(state, ability, events),

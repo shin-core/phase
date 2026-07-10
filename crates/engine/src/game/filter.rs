@@ -1810,10 +1810,27 @@ fn filter_inner_for_object(
                 })
         }
         // CR 603.7: Match objects in a tracked set from the originating effect.
-        TargetFilter::TrackedSet { id } => state
-            .tracked_object_sets
-            .get(id)
-            .is_some_and(|set| set.contains(&object_id)),
+        // CR 608.2c: `TrackedSetId(0)` is the parser's "most recent set" sentinel.
+        // Resolve it chain-first, then latest non-empty set — the same order as
+        // `targeting::resolve_tracked_set_sentinel` and the `TrackedSetFiltered`
+        // sibling arm below — so effect resolvers that match objects directly
+        // against the filter (`DestroyAll { TrackedSet }` — "destroy each
+        // permanent chosen this way", Druid of Purification #4780) read the
+        // just-published set instead of looking up the literal sentinel id and
+        // matching nothing. With no set published, a sentinel still matches
+        // nothing (the correct fail-closed fallback).
+        TargetFilter::TrackedSet { id } => {
+            let set_id = if id.0 == 0 {
+                state
+                    .chain_tracked_set_id
+                    .or_else(|| crate::game::targeting::latest_tracked_set_id(state))
+            } else {
+                Some(*id)
+            };
+            set_id
+                .and_then(|sid| state.tracked_object_sets.get(&sid))
+                .is_some_and(|set| set.contains(&object_id))
+        }
         // CR 701.33 + CR 701.18: Intersection of a tracked set with an inner
         // type filter. Used by Zimone's Experiment to route "X cards revealed
         // this way" — the Dig resolver populates a tracked set with the kept
