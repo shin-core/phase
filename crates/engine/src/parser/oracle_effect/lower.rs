@@ -5365,10 +5365,13 @@ pub(crate) fn player_lookback_relative_clause_owns_suffix(input: &str) -> bool {
     let after_who = &input[who_idx + " who ".len()..];
     // A player look-back relative clause: a look-back verb phrase, then a tail
     // that ends exactly at " this turn" (the suffix the stripper is testing).
+    // `alt` returns the first success, so longer matches must precede their own
+    // prefixes ("was dealt combat damage " before "was dealt "), else the prefix
+    // shadows the longer branch into dead code.
     let lookback_verb = alt((
-        tag::<_, _, OracleError<'_>>("was dealt "),
+        tag::<_, _, OracleError<'_>>("was dealt combat damage "),
+        tag("was dealt "),
         tag("were dealt "),
-        tag("was dealt combat damage "),
         tag("lost life "),
         tag("gained life "),
         tag("has lost life "),
@@ -10587,6 +10590,73 @@ mod where_x_tests {
             execute.duration, None,
             "the steal is permanent (CR 611.2a) — no phantom UntilEndOfTurn from the look-back clause, got {:?}",
             execute.duration
+        );
+    }
+
+    /// Issue #4735 — Admiral Beckett Brass: the end-step steal target must now
+    /// carry the CONTROLLER PREDICATE `FilterProp::ControllerMatches` wrapping
+    /// `OpponentDealtDamage { CombatOnly, Some(Typed(Pirate)) }` (the object-side
+    /// bridge into the PlayerFilter enum), and the whole card must lower with ZERO
+    /// `Effect::Unimplemented` (positive reach-guard: the target now parses
+    /// semantically, not just structurally for duration purposes). The numeric
+    /// "three or more" is a documented DEFERRED gap — consumed, not enforced.
+    #[test]
+    fn beckett_brass_gain_control_target_carries_controller_matches() {
+        use crate::types::ability::{
+            DamageKindFilter, Effect, FilterProp, PlayerFilter, TargetFilter, TypeFilter,
+        };
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "Other Pirates you control get +1/+1.\nAt the beginning of your end step, gain control of target nonland permanent controlled by a player who was dealt combat damage by three or more Pirates this turn.",
+            "Admiral Beckett Brass",
+            &[],
+            &["Creature".to_string()],
+            &["Human".to_string(), "Pirate".to_string()],
+        );
+
+        // Positive reach-guard: nothing on this card lowered to Unimplemented.
+        assert!(
+            !parsed.triggers.iter().any(|t| {
+                t.execute
+                    .as_ref()
+                    .is_some_and(|e| matches!(&*e.effect, Effect::Unimplemented { .. }))
+            }),
+            "Beckett must not produce any Unimplemented effect once the look-back target parses"
+        );
+
+        let steal = parsed
+            .triggers
+            .iter()
+            .find_map(|t| match &*t.execute.as_ref()?.effect {
+                Effect::GainControl { target } => Some(target.clone()),
+                _ => None,
+            })
+            .expect("Beckett's end-step trigger must lower to GainControl");
+
+        let TargetFilter::Typed(typed) = &steal else {
+            panic!("expected a Typed GainControl target, got {steal:?}");
+        };
+        let has_predicate = typed.properties.iter().any(|p| {
+            matches!(
+                p,
+                FilterProp::ControllerMatches { player }
+                    if matches!(
+                        &**player,
+                        PlayerFilter::OpponentDealtDamage {
+                            kind: DamageKindFilter::CombatOnly,
+                            source: Some(src),
+                        } if matches!(
+                            &**src,
+                            TargetFilter::Typed(t)
+                                if t.type_filters
+                                    .contains(&TypeFilter::Subtype("Pirate".to_string()))
+                        )
+                    )
+            )
+        });
+        assert!(
+            has_predicate,
+            "GainControl target must carry ControllerMatches{{OpponentDealtDamage{{CombatOnly, Some(Pirate)}}}}, got {:?}",
+            typed.properties
         );
     }
 

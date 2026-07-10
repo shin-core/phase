@@ -3297,6 +3297,20 @@ pub enum FilterProp {
     ControllerChoseLabel {
         label: String,
     },
+    /// CR 109.4 + CR 608.2c + CR 611.2c: Matches objects whose CONTROLLER
+    /// satisfies an inner `PlayerFilter` predicate — the object-axis
+    /// generalization of `ControllerChoseLabel` (which hard-codes a single
+    /// chosen-label predicate). Evaluated via the single-authority
+    /// `matches_player_scope` against `obj.controller`, so ANY player predicate
+    /// ("who was dealt combat damage by a Pirate this turn", "who lost life this
+    /// turn", "who controls an artifact", …) can scope a target's controller.
+    /// `Box` breaks the FilterProp→PlayerFilter→…→TargetFilter→FilterProp size
+    /// cycle (mirrors other boxed inner filters). Object-axis mirror of the
+    /// player-axis PlayerFilter enum. Admiral Beckett Brass (controller
+    /// look-back predicate on the steal target).
+    ControllerMatches {
+        player: Box<PlayerFilter>,
+    },
     /// CR 305.1 + CR 601.2a: Matches objects entering from being played
     /// (land play) or cast (spell), excluding tokens put directly onto the
     /// battlefield without a prior zone.

@@ -168,6 +168,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::Token
         | FilterProp::NonToken
         | FilterProp::ControllerChoseLabel { .. }
+        | FilterProp::ControllerMatches { .. }
         | FilterProp::WasPlayed
         | FilterProp::Attacking { .. }
         | FilterProp::Blocking
@@ -402,6 +403,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::Token
         | FilterProp::NonToken
         | FilterProp::ControllerChoseLabel { .. }
+        | FilterProp::ControllerMatches { .. }
         | FilterProp::WasPlayed
         | FilterProp::Attacking { .. }
         | FilterProp::Blocking
@@ -3159,6 +3161,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         // CR 607 (by analogy): the controller's per-player anchor label is a
         // live-game read, not a cast-time snapshot property — fail closed.
         FilterProp::ControllerChoseLabel { .. }
+        | FilterProp::ControllerMatches { .. }
         | FilterProp::Attacking { .. }
         | FilterProp::Blocking
         | FilterProp::BlockingSource
@@ -3523,6 +3526,17 @@ fn matches_filter_prop(
         FilterProp::ControllerChoseLabel { label } => {
             crate::game::players::player_last_chose_label(state, obj.controller, label)
         }
+        // CR 109.4 + CR 608.2c: the matched object's CONTROLLER satisfies the inner
+        // player predicate. Delegates to the single-authority player-scope matcher
+        // (obj.controller as the candidate; source controller/id for opponent-relative
+        // inner filters like OpponentDealtDamage).
+        FilterProp::ControllerMatches { player } => crate::game::effects::matches_player_scope(
+            state,
+            obj.controller,
+            player,
+            source.controller.unwrap_or(obj.controller),
+            source.id,
+        ),
         // CR 305.1 + CR 601.2a: "played by" entry replacements (Uphill Battle).
         FilterProp::WasPlayed => obj.played_from_zone.is_some() || obj.cast_from_zone.is_some(),
         // CR 508.1b: Attacking creatures may be scoped by defending player
@@ -4794,6 +4808,9 @@ fn zone_change_record_matches_property(
         // CR 607 (by analogy): the controller's per-player anchor label is a
         // live-game read; a zone-change snapshot does not carry it. Fail closed.
         | FilterProp::ControllerChoseLabel { .. }
+        // CR 608.2c + CR 608.2i: the controller's look-back player predicate is a
+        // live turn-history read; a zone-change snapshot does not carry it. Fail closed.
+        | FilterProp::ControllerMatches { .. }
         // CR 608.2c: Tracked-set membership is a live resolution-chain selection
         // over battlefield objects; a zone-change snapshot is not consulted for
         // "chosen this way" / "the rest" filters. Fail closed.
@@ -11069,6 +11086,140 @@ mod tests {
         assert!(
             !spell_record_matches_filter(&from_hand, &filter, controller, &[]),
             "a spell cast from hand must NOT satisfy InAnyZone[everything except hand]"
+        );
+    }
+
+    /// CR 109.4 + CR 608.2i (Admiral Beckett Brass #4735): the object-side
+    /// controller-predicate bridge `FilterProp::ControllerMatches`. Builds the
+    /// exact filter the parser emits for Beckett's steal target and drives it
+    /// through the real filter-eval pipeline (`matches_target_filter`) — the
+    /// candidate matches iff its CONTROLLER was dealt combat damage by a Pirate
+    /// this turn. Uses the explicit-controller wrapper so the source ability
+    /// (Beckett, controlled by P0) is an opponent of the damaged controller (P1),
+    /// as `opponent_dealt_damage_matches` requires.
+    fn beckett_controller_matches_filter() -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::default().properties(vec![
+            FilterProp::ControllerMatches {
+                player: Box::new(crate::types::ability::PlayerFilter::OpponentDealtDamage {
+                    kind: crate::types::ability::DamageKindFilter::CombatOnly,
+                    source: Some(Box::new(TargetFilter::Typed(
+                        TypedFilter::creature().with_type(
+                            crate::types::ability::TypeFilter::Subtype("Pirate".to_string()),
+                        ),
+                    ))),
+                }),
+            },
+        ]))
+    }
+
+    fn push_combat_damage_by_pirate(state: &mut GameState, victim: PlayerId) {
+        state
+            .damage_dealt_this_turn
+            .push_back(crate::types::game_state::DamageRecord {
+                source_id: ObjectId(999),
+                source_controller: victim, // irrelevant to the match
+                target: crate::types::ability::TargetRef::Player(victim),
+                target_controller: victim,
+                amount: 2,
+                is_combat: true,
+                source_core_types: vec![CoreType::Creature],
+                source_subtypes: vec!["Pirate".to_string()],
+                ..Default::default()
+            });
+    }
+
+    #[test]
+    fn controller_matches_pirate_combat_damage_positive() {
+        let mut state = setup();
+        // Beckett (source) controlled by P0; the steal candidate controlled by P1.
+        let beckett = add_creature(&mut state, PlayerId(0), "Admiral Beckett Brass");
+        let candidate = add_creature(&mut state, PlayerId(1), "Stolen Goblin");
+        push_combat_damage_by_pirate(&mut state, PlayerId(1));
+
+        let filter = beckett_controller_matches_filter();
+        assert!(
+            matches_target_filter_controlled(&state, candidate, &filter, beckett, PlayerId(0)),
+            "candidate's controller (P1) was dealt combat damage by a Pirate this turn — must match"
+        );
+    }
+
+    #[test]
+    fn controller_matches_non_pirate_source_negative() {
+        let mut state = setup();
+        let beckett = add_creature(&mut state, PlayerId(0), "Admiral Beckett Brass");
+        let candidate = add_creature(&mut state, PlayerId(1), "Stolen Goblin");
+        // Combat damage, but the source is a Goblin, not a Pirate.
+        state
+            .damage_dealt_this_turn
+            .push_back(crate::types::game_state::DamageRecord {
+                source_id: ObjectId(999),
+                target: crate::types::ability::TargetRef::Player(PlayerId(1)),
+                target_controller: PlayerId(1),
+                amount: 2,
+                is_combat: true,
+                source_core_types: vec![CoreType::Creature],
+                source_subtypes: vec!["Goblin".to_string()],
+                ..Default::default()
+            });
+
+        let filter = beckett_controller_matches_filter();
+        assert!(
+            !matches_target_filter_controlled(&state, candidate, &filter, beckett, PlayerId(0)),
+            "combat damage by a non-Pirate must NOT satisfy the Pirate-source predicate"
+        );
+    }
+
+    #[test]
+    fn controller_matches_noncombat_pirate_damage_negative() {
+        let mut state = setup();
+        let beckett = add_creature(&mut state, PlayerId(0), "Admiral Beckett Brass");
+        let candidate = add_creature(&mut state, PlayerId(1), "Stolen Goblin");
+        // A Pirate source, but NONCOMBAT damage (e.g. a Pirate's activated ability).
+        state
+            .damage_dealt_this_turn
+            .push_back(crate::types::game_state::DamageRecord {
+                source_id: ObjectId(999),
+                target: crate::types::ability::TargetRef::Player(PlayerId(1)),
+                target_controller: PlayerId(1),
+                amount: 2,
+                is_combat: false,
+                source_core_types: vec![CoreType::Creature],
+                source_subtypes: vec!["Pirate".to_string()],
+                ..Default::default()
+            });
+
+        let filter = beckett_controller_matches_filter();
+        assert!(
+            !matches_target_filter_controlled(&state, candidate, &filter, beckett, PlayerId(0)),
+            "noncombat damage by a Pirate must NOT satisfy the combat-only predicate"
+        );
+    }
+
+    #[test]
+    fn controller_matches_undamaged_controller_negative() {
+        let mut state = setup();
+        let beckett = add_creature(&mut state, PlayerId(0), "Admiral Beckett Brass");
+        let candidate = add_creature(&mut state, PlayerId(1), "Stolen Goblin");
+        // No damage record at all — controller was not dealt any damage this turn.
+        let filter = beckett_controller_matches_filter();
+        assert!(
+            !matches_target_filter_controlled(&state, candidate, &filter, beckett, PlayerId(0)),
+            "an undamaged controller must NOT match the look-back predicate"
+        );
+    }
+
+    #[test]
+    fn controller_matches_serde_round_trips() {
+        let filter = beckett_controller_matches_filter();
+        let TargetFilter::Typed(typed) = &filter else {
+            panic!("expected Typed filter");
+        };
+        let prop = &typed.properties[0];
+        let json = serde_json::to_string(prop).expect("serialize ControllerMatches");
+        let back: FilterProp = serde_json::from_str(&json).expect("deserialize ControllerMatches");
+        assert_eq!(
+            *prop, back,
+            "ControllerMatches must round-trip through serde"
         );
     }
 }
