@@ -5355,7 +5355,7 @@ fn for_each_quantity_clause_owns_this_turn_suffix(lower: &str) -> bool {
 /// turn" to end-of-input. A genuine OUTER duration after the relative clause
 /// ("… who lost life this turn until end of turn") leaves a non-empty remainder,
 /// so the guard declines and the real duration still strips.
-fn player_lookback_relative_clause_owns_suffix(input: &str) -> bool {
+pub(crate) fn player_lookback_relative_clause_owns_suffix(input: &str) -> bool {
     // Anchor on the LAST " who " so an earlier "who" (in an unrelated preceding
     // clause) cannot mask the outer duration on a later clause.
     // allow-noncombinator: rfind anchors the word-boundary slice for the nom scan below (Pattern 5), not parsing dispatch.
