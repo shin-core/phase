@@ -866,6 +866,7 @@ mod tomb_cradle_atropal_deathtouch_runtime;
 mod tomb_oubliette_discard_sacrifice_runtime;
 mod tomb_sandfall_cell_life_loss_runtime;
 mod tomb_veils_of_fear_life_loss_runtime;
+mod trench_behemoth_landfall_force_attack;
 mod triumphant_chomp;
 mod umbra_stalker_graveyard_chroma_4066;
 mod unless_pay_routes_through_authority;
