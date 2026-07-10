@@ -11093,10 +11093,11 @@ mod tests {
     /// controller-predicate bridge `FilterProp::ControllerMatches`. Builds the
     /// exact filter the parser emits for Beckett's steal target and drives it
     /// through the real filter-eval pipeline (`matches_target_filter`) — the
-    /// candidate matches iff its CONTROLLER was dealt combat damage by a Pirate
-    /// this turn. Uses the explicit-controller wrapper so the source ability
-    /// (Beckett, controlled by P0) is an opponent of the damaged controller (P1),
-    /// as `opponent_dealt_damage_matches` requires.
+    /// candidate matches iff its CONTROLLER was dealt combat damage by THREE OR
+    /// MORE distinct Pirates this turn (Beckett's real `min_sources = 3`). Uses
+    /// the explicit-controller wrapper so the source ability (Beckett, controlled
+    /// by P0) is an opponent of the damaged controller (P1), as
+    /// `opponent_dealt_damage_matches` requires.
     fn beckett_controller_matches_filter() -> TargetFilter {
         TargetFilter::Typed(TypedFilter::default().properties(vec![
             FilterProp::ControllerMatches {
@@ -11107,16 +11108,24 @@ mod tests {
                             crate::types::ability::TypeFilter::Subtype("Pirate".to_string()),
                         ),
                     ))),
+                    min_sources: 3,
                 }),
             },
         ]))
     }
 
-    fn push_combat_damage_by_pirate(state: &mut GameState, victim: PlayerId) {
+    /// Stage one combat-damage-by-a-Pirate record with a DISTINCT `source_id` so
+    /// the distinct-source count can be exercised (Beckett needs ≥3 distinct
+    /// Pirate sources).
+    fn push_combat_damage_by_distinct_pirate(
+        state: &mut GameState,
+        victim: PlayerId,
+        pirate_source: ObjectId,
+    ) {
         state
             .damage_dealt_this_turn
             .push_back(crate::types::game_state::DamageRecord {
-                source_id: ObjectId(999),
+                source_id: pirate_source,
                 source_controller: victim, // irrelevant to the match
                 target: crate::types::ability::TargetRef::Player(victim),
                 target_controller: victim,
@@ -11134,12 +11143,52 @@ mod tests {
         // Beckett (source) controlled by P0; the steal candidate controlled by P1.
         let beckett = add_creature(&mut state, PlayerId(0), "Admiral Beckett Brass");
         let candidate = add_creature(&mut state, PlayerId(1), "Stolen Goblin");
-        push_combat_damage_by_pirate(&mut state, PlayerId(1));
+        // Three DISTINCT Pirate sources dealt P1 combat damage this turn.
+        push_combat_damage_by_distinct_pirate(&mut state, PlayerId(1), ObjectId(901));
+        push_combat_damage_by_distinct_pirate(&mut state, PlayerId(1), ObjectId(902));
+        push_combat_damage_by_distinct_pirate(&mut state, PlayerId(1), ObjectId(903));
 
         let filter = beckett_controller_matches_filter();
         assert!(
             matches_target_filter_controlled(&state, candidate, &filter, beckett, PlayerId(0)),
-            "candidate's controller (P1) was dealt combat damage by a Pirate this turn — must match"
+            "candidate's controller (P1) was dealt combat damage by 3 distinct Pirates this turn — must match"
+        );
+    }
+
+    #[test]
+    fn controller_matches_two_distinct_pirates_below_threshold_negative() {
+        let mut state = setup();
+        let beckett = add_creature(&mut state, PlayerId(0), "Admiral Beckett Brass");
+        let candidate = add_creature(&mut state, PlayerId(1), "Stolen Goblin");
+        // Only TWO distinct Pirates — below Beckett's "three or more" threshold.
+        // This is the defining restriction of the card: 1–2 Pirates must NOT
+        // qualify even though the source/kind predicate matches.
+        push_combat_damage_by_distinct_pirate(&mut state, PlayerId(1), ObjectId(901));
+        push_combat_damage_by_distinct_pirate(&mut state, PlayerId(1), ObjectId(902));
+
+        let filter = beckett_controller_matches_filter();
+        assert!(
+            !matches_target_filter_controlled(&state, candidate, &filter, beckett, PlayerId(0)),
+            "combat damage by only 2 distinct Pirates is below min_sources=3 — must NOT match"
+        );
+    }
+
+    #[test]
+    fn controller_matches_same_pirate_twice_is_one_source_negative() {
+        let mut state = setup();
+        let beckett = add_creature(&mut state, PlayerId(0), "Admiral Beckett Brass");
+        let candidate = add_creature(&mut state, PlayerId(1), "Stolen Goblin");
+        // The SAME Pirate dealing combat damage across two combat steps is ONE
+        // distinct source (CR 120.9 counts distinct sources, not damage events),
+        // so three records from two objects (901 twice, 902 once) = 2 distinct.
+        push_combat_damage_by_distinct_pirate(&mut state, PlayerId(1), ObjectId(901));
+        push_combat_damage_by_distinct_pirate(&mut state, PlayerId(1), ObjectId(901));
+        push_combat_damage_by_distinct_pirate(&mut state, PlayerId(1), ObjectId(902));
+
+        let filter = beckett_controller_matches_filter();
+        assert!(
+            !matches_target_filter_controlled(&state, candidate, &filter, beckett, PlayerId(0)),
+            "the same Pirate counted once — 2 distinct sources is below min_sources=3, must NOT match"
         );
     }
 

@@ -6164,9 +6164,11 @@ fn rw_player_filter(x: &PlayerFilter) -> RwProfile {
         PlayerFilter::OpponentLostLife | PlayerFilter::OpponentGainedLife => {
             reads_player_of(StateKind::JournalLife)
         }
-        PlayerFilter::OpponentDealtDamage { source: _, kind: _ } => {
-            reads_player_of(StateKind::JournalLife)
-        }
+        PlayerFilter::OpponentDealtDamage {
+            source: _,
+            kind: _,
+            min_sources: _,
+        } => reads_player_of(StateKind::JournalLife),
         // D5 carrier.
         PlayerFilter::TriggeringPlayer => legacy_ref(),
         PlayerFilter::OpponentOtherThanTriggering

@@ -5673,13 +5673,12 @@ fn parse_ownership_or_controller_suffix(
 /// " this turn" is required so the whole relative clause is consumed.
 ///
 /// Supported predicates (each a leaf of the `alt`, composed — not enumerated):
-///   - "was dealt combat damage by [<count> ]<subtype>" →
-///     `OpponentDealtDamage { CombatOnly, Some(Typed(subtype)) }`
-///     (Admiral Beckett Brass: "by three or more Pirates"). The numeric
-///     quantifier is CONSUMED but NOT enforced — a documented DEFERRED gap; the
-///     bridge carries ≥1 combat-damage-by-a-Pirate semantics.
+///   - "was dealt combat damage by [<N> or more ]<subtype>" →
+///     `OpponentDealtDamage { CombatOnly, Some(Typed(subtype)), min_sources: N }`
+///     (Admiral Beckett Brass: "by three or more Pirates" → `min_sources = 3`).
+///     The "<N> or more" threshold IS enforced (distinct-source count at runtime).
 ///   - "was dealt combat damage" (no source) → `OpponentDealtDamage {
-///     CombatOnly, None }`.
+///     CombatOnly, None, min_sources: 1 }`.
 ///   - "lost life" → `OpponentLostLife` (sibling unlocked by the bridge).
 fn parse_controller_predicate_clause(input: &str) -> OracleResult<'_, PlayerFilter> {
     let (input, _) = tag("controlled by a player who ").parse(input)?;
@@ -5693,6 +5692,7 @@ fn parse_controller_predicate_clause(input: &str) -> OracleResult<'_, PlayerFilt
             PlayerFilter::OpponentDealtDamage {
                 kind: DamageKindFilter::CombatOnly,
                 source: None,
+                min_sources: 1,
             },
             terminated(tag("was dealt combat damage"), peek(tag(" this turn"))),
         ),
@@ -5707,23 +5707,21 @@ fn parse_controller_predicate_clause(input: &str) -> OracleResult<'_, PlayerFilt
     Ok((input, pf))
 }
 
-/// CR 120.2a + CR 120.9 + CR 608.2i: "was dealt combat damage by [<count> ]<subtype>".
-/// The optional leading count quantifier ("three or more ", …) is consumed so the
-/// subtype noun is reached, but the count is a DEFERRED gap and is NOT threaded
-/// into the `PlayerFilter`. The subtype phrase (which handles plural head nouns
-/// like "Pirates" → `Typed(Pirate)`) is parsed by the shared `parse_target`
-/// building block, then isolated from the trailing " this turn".
+/// CR 120.2a + CR 120.9 + CR 608.2i: "was dealt combat damage by [<count> or more ]<subtype>".
+/// The optional leading "<N> or more " quantifier is parsed into `min_sources` so
+/// the threshold is ENFORCED at runtime (Admiral Beckett Brass: "by three or more
+/// Pirates" → `min_sources = 3`, requiring 3 distinct combat-damaging Pirate
+/// sources); absence means the historical `min_sources = 1` (any matching source).
+/// The subtype phrase (which handles plural head nouns like "Pirates" →
+/// `Typed(Pirate)`) is parsed by the shared `parse_target` building block, then
+/// isolated from the trailing " this turn".
 fn parse_controller_dealt_combat_damage_by(input: &str) -> OracleResult<'_, PlayerFilter> {
     let (input, _) = tag("was dealt combat damage by ").parse(input)?;
-    // Consume an optional "N or more " / "N or fewer " quantifier. `// count deferred`:
-    // the threshold is not enforced (documented gap); consuming it lets the subtype
-    // noun be reached so the whole clause parses instead of falling through.
-    let (input, _) = opt(alt((
-        tag("one or more "),
-        tag("two or more "),
-        tag("three or more "),
-    )))
-    .parse(input)?;
+    // Optional "<N> or more " count threshold → `min_sources`. `parse_number`
+    // handles both digit and English number words ("three" → 3). Absent → 1.
+    let (input, min_sources) = opt(terminated(nom_primitives::parse_number, tag(" or more ")))
+        .map(|n| n.unwrap_or(1).max(1))
+        .parse(input)?;
     // Reuse the shared target-phrase building block for the source subtype; it
     // maps "Pirates" → `Typed(Pirate)` (plural head noun handled) and stops before
     // the trailing " this turn".
@@ -5745,6 +5743,7 @@ fn parse_controller_dealt_combat_damage_by(input: &str) -> OracleResult<'_, Play
         PlayerFilter::OpponentDealtDamage {
             kind: DamageKindFilter::CombatOnly,
             source: Some(Box::new(source)),
+            min_sources,
         },
     ))
 }

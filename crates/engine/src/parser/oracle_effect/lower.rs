@@ -10644,6 +10644,9 @@ mod where_x_tests {
                         PlayerFilter::OpponentDealtDamage {
                             kind: DamageKindFilter::CombatOnly,
                             source: Some(src),
+                            // "three or more Pirates" → the count threshold is
+                            // enforced (not dropped), so min_sources must be 3.
+                            min_sources: 3,
                         } if matches!(
                             &**src,
                             TargetFilter::Typed(t)
@@ -10655,7 +10658,7 @@ mod where_x_tests {
         });
         assert!(
             has_predicate,
-            "GainControl target must carry ControllerMatches{{OpponentDealtDamage{{CombatOnly, Some(Pirate)}}}}, got {:?}",
+            "GainControl target must carry ControllerMatches{{OpponentDealtDamage{{CombatOnly, Some(Pirate), min_sources: 3}}}}, got {:?}",
             typed.properties
         );
     }

@@ -5794,6 +5794,13 @@ pub enum PlayerFilter {
     /// source matching `f` — matched against each record's CR 608.2i look-back
     /// source snapshot, so the source's qualities are checked as they were at
     /// damage time (Estinien Varlineau: "by ~ or a Dragon").
+    ///
+    /// `min_sources` (CR 120.9) requires damage from at least that many DISTINCT
+    /// matching sources ("was dealt combat damage by three or more Pirates this
+    /// turn" → `min_sources = 3`; Admiral Beckett Brass). Distinct sources are
+    /// counted by `DamageRecord::source_id` across the matching records; the
+    /// default `1` preserves the historical "≥1 matching source" semantics for
+    /// every existing card.
     #[serde(alias = "OpponentDealtCombatDamage")]
     OpponentDealtDamage {
         /// CR 120.2a/120.2b: which damage kind counts. Defaults to `CombatOnly`
@@ -5802,6 +5809,11 @@ pub enum PlayerFilter {
         kind: DamageKindFilter,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<Box<TargetFilter>>,
+        /// CR 120.9: minimum number of DISTINCT matching sources (by
+        /// `source_id`) that must have dealt the qualifying damage. Defaults to
+        /// `1` (any matching source) for back-compat; Beckett sets `3`.
+        #[serde(default = "default_one", skip_serializing_if = "is_one")]
+        min_sources: u32,
     },
     /// CR 508.6: Each opponent that `subject` attacked (declared one or more
     /// creatures attacking, per CR 508.1b; CR 508.5 resolves planeswalker/battle
@@ -12242,6 +12254,13 @@ where
 
 fn default_one() -> u32 {
     1
+}
+
+/// `serde` skip predicate for count fields whose default is `1` (e.g.
+/// `PlayerFilter::OpponentDealtDamage::min_sources`) — omit from serialized
+/// output when unset so existing card-data stays byte-identical.
+fn is_one(n: &u32) -> bool {
+    *n == 1
 }
 
 /// `serde` default for the `up_to` flag of `Effect::ForEachCategoryExile` — the
