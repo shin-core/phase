@@ -43359,3 +43359,64 @@ fn grimoire_thief_counter_all_named_spells_unchanged() {
         "single conjunct must NOT become an Or: {target:?}"
     );
 }
+
+/// CR 400.7 + CR 202.3: Dance of the Manse returns cards from the *graveyard*,
+/// so its target filter must be scoped to the graveyard (and to your own
+/// cards). A bare "artifact and/or non-Aura enchantment cards" filter with no
+/// zone defaults to the battlefield, which made target selection offer
+/// battlefield permanents instead of graveyard cards. Each disjunctive `Or`
+/// branch carries the inferred `InZone { Graveyard }` + `Owned { You }`
+/// constraints AND the distributive "each with mana value X or less" bound
+/// (comma-less distributive-"each" linker).
+#[test]
+fn dance_of_the_manse_targets_graveyard_not_battlefield() {
+    use crate::types::ability::{Comparator, QuantityExpr, QuantityRef};
+    let effect = parse_effect("Return up to X target artifact and/or non-Aura enchantment cards each with mana value X or less from your graveyard to the battlefield.");
+    let Effect::ChangeZone {
+        origin,
+        destination,
+        target,
+        ..
+    } = effect
+    else {
+        panic!("expected ChangeZone, got {effect:?}");
+    };
+    assert_eq!(origin, Some(Zone::Graveyard));
+    assert_eq!(destination, Zone::Battlefield);
+    let TargetFilter::Or { filters } = &target else {
+        panic!("expected an Or target filter, got {target:?}");
+    };
+    assert!(!filters.is_empty(), "Or filter must have branches");
+    for branch in filters {
+        assert_eq!(
+            branch.extract_in_zone(),
+            Some(Zone::Graveyard),
+            "each Or branch must be scoped to the graveyard: {branch:?}"
+        );
+        let TargetFilter::Typed(tf) = branch else {
+            panic!("expected Typed branch, got {branch:?}");
+        };
+        // "from your graveyard" parses ownership into the canonical `controller`
+        // field; older fallback paths stamp an `Owned { You }` prop. Accept
+        // either representation — the point is the leg is scoped to your cards.
+        let owner_scoped = tf.controller == Some(ControllerRef::You)
+            || tf.properties.contains(&FilterProp::Owned {
+                controller: ControllerRef::You,
+            });
+        assert!(
+            owner_scoped,
+            "each Or branch must be scoped to your own cards: {tf:?}"
+        );
+        assert!(
+            tf.properties.contains(&FilterProp::Cmc {
+                comparator: Comparator::LE,
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::Variable {
+                        name: "X".to_string(),
+                    },
+                },
+            }),
+            "each Or branch must carry the 'mana value X or less' bound: {tf:?}"
+        );
+    }
+}
