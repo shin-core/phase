@@ -48,7 +48,7 @@ from pathlib import Path
 # free to drift, and their disagreements would be silent in both directions.
 from zone_authority_census import (
     REPO_ROOT,
-    SCOPES,
+    SCOPES as ENGINE_SCOPES,
     TEST_SUPPORT_FILES,
     iter_production_lines,
 )
@@ -57,35 +57,85 @@ PRODUCERS_BASELINE = REPO_ROOT / "scripts" / "draw-replacement-producers.txt"
 CORPUS_BASELINE = REPO_ROOT / "scripts" / "draw-replacement-corpus.tsv"
 CARD_DATA = REPO_ROOT / "data" / "card-data.json"
 
+# The zone census scans the engine, because only the engine mutates zones. A Draw
+# REPLACEMENT DEFINITION, though, can be minted by anything that builds one and
+# hands it to the engine — and `crates/mtgish-import` does exactly that. Scanning
+# it is a READ; nothing here modifies it.
+#
+# Omitting it is how the first cut of this gate froze 6 producers while a 7th was
+# live: a census is only as honest as the population it admits, and "the engine"
+# was the wrong population for this question.
+SCOPES = ENGINE_SCOPES + ("crates/mtgish-import/src",)
+
 # ---------------------------------------------------------------------------
 # (A) Producer surface
 # ---------------------------------------------------------------------------
+#
+# Three shapes mint a Draw `ReplacementDefinition`. All three are matched, and all
+# three are named here with the file they live in, so this block cannot drift away
+# from the regexes below:
+#
+#   ReplacementDefinition::new(ReplacementEvent::Draw)     -> family `constructor`
+#       parser/oracle_replacement.rs  (x2)
+#       database/synthesis.rs::synthesize_dredge
+#       game/effects/create_draw_replacement.rs::resolve
+#
+#   => ReplacementEvent::Draw                              -> family `event-decode`
+#       types/replacements.rs::from_str
+#   => Ok(ReplacementEvent::Draw)                          -> family `event-decode`
+#       database/forge/replacement.rs  (Result-returning, hence the Ok wrap)
+#
+#   ReplacementDefinition { .. event: ReplacementEvent::Draw .. }
+#                                                          -> family `struct-literal`
+#       mtgish-import/convert/replacement.rs::convert_replace_would_draw
+#
+# The struct-literal family is not hypothetical scaffolding for the one mtgish
+# site: `ReplacementDefinition { .. }` is a live idiom inside the engine too --
+# 50 literals across crates/engine/src (non-test files), 17 of them in
+# database/synthesis.rs, 13 of those in production code. None is a Draw today, so
+# the family has exactly one occupant -- but the next engine Draw written as a
+# literal would have been invisible to a constructor+decode census.
+#
+# KNOWN-UNMATCHED, ZERO OCCUPANTS: a fourth mint shape exists in principle --
+# field assignment after construction (`def.event = ReplacementEvent::Draw;`).
+# None of the three patterns matches it. There are ZERO occurrences of
+# `.event = ReplacementEvent::` anywhere under crates/ today (any variant, not
+# just Draw), so the shape is latent rather than live. It is named here rather
+# than silently omitted: an instrument that lists what it misses is honest; one
+# that implies completeness is not.
 
-# A definition built in Rust: `ReplacementDefinition::new(ReplacementEvent::Draw)`.
-# This is where `.draw_scope(..)` has to be threaded.
+# Matches ONE of the two live ways Rust code builds a `ReplacementDefinition`:
+# the `::new(..)` builder. It does NOT match the other one -- a struct literal --
+# which is why `STRUCT_LITERAL` below exists. Across `crates/` today: 429 `::new(`
+# sites and 91 `ReplacementDefinition {` sites, so neither shape is exotic.
+#
+# Naming this "the way a definition is built in Rust" is what the first cut of
+# this comment did, and it is the same category error that hid the mtgish
+# producer for a full review cycle: a comment that describes a family instead of
+# a pattern invites the reader to believe the pattern covers the family.
 CONSTRUCTOR = re.compile(r"ReplacementDefinition::new\(\s*ReplacementEvent::Draw(Cards)?\b")
 
-# A definition decoded from text: a match arm YIELDING `ReplacementEvent::Draw`.
-# These mint Draw definitions without ever calling the constructor above, so a
-# constructor-only census misses them. Both shapes in the tree are matched, and
-# both are named here so this comment cannot drift away from the regex below:
+# A match arm YIELDING the event (see the two shapes above). Keyed on the arm's
+# RESULT, not on a `"Draw"` string literal, because the shared scanner strips
+# string literals before matching (brace counting must not see a `{` inside a
+# string) — a pattern spelled `"Draw"\s*=>` would match nothing and the census
+# would report zero decode sites while passing green.
 #
-#     => ReplacementEvent::Draw           types/replacements.rs::from_str
-#     => Ok(ReplacementEvent::Draw)       database/forge/replacement.rs
-#                                         (Result-returning, hence the Ok wrap)
-#
-# Keyed on the arm's RESULT, not on its `"Draw"` string literal, because the
-# shared scanner strips string literals before matching (brace counting must not
-# see a `{` inside a string). A pattern spelled `"Draw"\s*=>` would match nothing
-# and the census would silently report zero decode sites while passing green.
-#
-# Direction matters: an arrow BEFORE the variant produces the event; an arrow
-# AFTER it merely matches on the event (e.g. coverage.rs's
-# `ReplacementEvent::Draw | ReplacementEvent::DrawCards => {`). Only the former
-# is a producer, so the `=>` must lead.
+# Direction matters: an arrow BEFORE the variant produces it; an arrow AFTER it
+# merely matches on it (coverage.rs's `ReplacementEvent::Draw | ... => {`). Only
+# the former is a producer, so the `=>` must lead.
 EVENT_DECODE = re.compile(r"=>\s*(?:Ok\()?\s*ReplacementEvent::Draw(Cards)?\b")
 
-FAMILIES = (("constructor", CONSTRUCTOR), ("event-decode", EVENT_DECODE))
+# The `event:` field of a struct literal. Keyed on the field binding rather than
+# on `ReplacementDefinition {`, because the literal spans many lines and the
+# scanner is line-oriented: the type name and the event sit on different lines.
+STRUCT_LITERAL = re.compile(r"\bevent:\s*ReplacementEvent::Draw(Cards)?\b")
+
+FAMILIES = (
+    ("constructor", CONSTRUCTOR),
+    ("event-decode", EVENT_DECODE),
+    ("struct-literal", STRUCT_LITERAL),
+)
 
 
 def collect_producers() -> dict[tuple[str, str, str], int]:
@@ -110,8 +160,14 @@ def collect_producers() -> dict[tuple[str, str, str], int]:
 
 
 PRODUCERS_HEADER = """\
-# Frozen census of every production site that can mint a `ReplacementEvent::Draw`
-# replacement definition (Plan 03 / CR 121.2).
+# Frozen census of every production site MATCHING THE THREE SHAPES BELOW that
+# mints a `ReplacementEvent::Draw` replacement definition (Plan 03 / CR 121.2).
+#
+# The phrasing is deliberate. This is not "every site that can mint one" -- that
+# is a claim about a CATEGORY, and this file implements PATTERNS. A fourth shape
+# exists in principle (field assignment, `def.event = ReplacementEvent::Draw;`)
+# and no pattern here matches it; it has zero occurrences under crates/ today.
+# See the family block in draw_replacement_census.py.
 #
 # Generated by scripts/draw_replacement_census.py --producers --write.
 # Columns: file <TAB> enclosing fn <TAB> family <TAB> count.
@@ -123,11 +179,20 @@ PRODUCERS_HEADER = """\
 # row below is a site the rewrite must touch. A new row means a new producer
 # that would otherwise get a silently wrong default scope.
 #
-# family=constructor   `ReplacementDefinition::new(ReplacementEvent::Draw)`
-# family=event-decode  a string -> ReplacementEvent::Draw decode. Mints a Draw
-#                      definition without calling the constructor.
+# family=constructor     `ReplacementDefinition::new(ReplacementEvent::Draw)`
+# family=event-decode    `=> ReplacementEvent::Draw` / `=> Ok(ReplacementEvent::Draw)`
+#                        (from_str; the Forge importer). Mints a definition
+#                        without calling the constructor.
+# family=struct-literal  `ReplacementDefinition { .. event: ReplacementEvent::Draw .. }`
+#                        (mtgish-import). Same: no constructor call.
 #
-# Coverage boundary, stated so it is not mistaken for "every possible source":
+# SCOPE, stated exactly rather than implied: this scans the engine crates AND
+# crates/mtgish-import/src. It does NOT scan any other crate. The first cut of
+# this gate scanned the engine only, and froze 6 producers while a 7th was live in
+# mtgish-import -- the count was right about the population it looked at and wrong
+# about the question it claimed to answer.
+#
+# COVERAGE BOUNDARY, stated so this is not mistaken for "every possible source":
 # a `ReplacementDefinition` also comes back to life via its plain serde derive
 # when the engine loads the card-data export. That path is structurally singular
 # (one struct's own derive, not a scanned set of call sites), so it is gated by
@@ -166,7 +231,23 @@ def reads_event_context_amount(count: object) -> bool:
     return any(d.get("type") == "EventContextAmount" for d in walk(count))
 
 
-def classify_scope(repl: dict) -> str:
+# The only `quantity_modification` values this classifier has been taught to
+# reason about. `Prevent` cancels the event outright and says nothing about
+# instruction-vs-individual scope, so it falls through to the execute-shape rule
+# (and both pool cards carrying it -- Living Conundrum, Possessed Portal -- have
+# singular antecedents and classify IndividualDraw, which is correct).
+#
+# Every OTHER variant (`Times`, `Half`, `Plus`, `Minus`, ...) modifies the COUNT.
+# On a Draw row that is a CR 121.2a instruction-count modifier by definition, and
+# the execute-shape rule below would silently call it IndividualDraw -- wrong.
+KNOWN_QUANTITY_MODIFICATIONS = {"Prevent"}
+
+
+class ClassificationError(Exception):
+    """The classifier met a shape it was never taught. Refuse to guess."""
+
+
+def classify_scope(card: str, repl: dict) -> str:
     """The `DrawReplacementScope` this definition must be assigned.
 
     CR 121.2a: an instruction to draw multiple cards can be modified by
@@ -176,7 +257,28 @@ def classify_scope(repl: dict) -> str:
     prevention, Notion-Thief-class substitution, the Words runtime shields)
     replaces one individual draw: CR 121.2, "cards may only be drawn one at a
     time".
+
+    A count-modifying `quantity_modification` would ALSO be `InstructionCount`,
+    and this function does not classify one -- it refuses. No card in the pool
+    carries one on a Draw row today, so any rule written for it would ship with
+    zero validating cases, and an unvalidated rule in a gate that a human is
+    invited to trust is exactly where a wrong answer hides. Better to stop and
+    make someone look: that is what an exact-match gate is FOR.
     """
+    qm = repl.get("quantity_modification")
+    if isinstance(qm, dict):
+        qm = qm.get("type")
+    if qm is not None and qm not in KNOWN_QUANTITY_MODIFICATIONS:
+        raise ClassificationError(
+            f"{card}: Draw replacement carries quantity_modification `{qm}`, which "
+            f"this classifier has never seen.\n"
+            f"A count-modifying quantity_modification is a CR 121.2a instruction-count "
+            f"modifier and must be classified InstructionCount -- but no pool card has "
+            f"exercised that path, so the rule is unwritten rather than wrong.\n"
+            f"Decide the scope for this row deliberately, teach it to classify_scope() "
+            f"(and to KNOWN_QUANTITY_MODIFICATIONS), then re-freeze."
+        )
+
     effect = ((repl.get("execute") or {}).get("effect")) or {}
     if effect.get("type") == "Draw" and reads_event_context_amount(effect.get("count")):
         return "InstructionCount"
@@ -210,7 +312,7 @@ def corpus_rows(export: dict) -> list[tuple[str, ...]]:
                     str(qm or "none"),
                     effect.get("type", "none") if execute else "none",
                     "nested-draw" if nested_draw else "-",
-                    classify_scope(repl),
+                    classify_scope(card, repl),
                 )
             )
     return sorted(rows)
@@ -318,7 +420,11 @@ def main() -> int:
             )
             return 2
         export = json.loads(args.card_data.read_text(encoding="utf-8"))
-        rows = corpus_rows(export)
+        try:
+            rows = corpus_rows(export)
+        except ClassificationError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 3
         baseline_path, header, kind = CORPUS_BASELINE, CORPUS_HEADER, "corpus"
         refreeze = "scripts/draw_replacement_census.py --corpus --write"
 
