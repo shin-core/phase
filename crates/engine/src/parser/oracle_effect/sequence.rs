@@ -433,16 +433,10 @@ pub(super) fn parse_choice_partition_destination(
     .parse(input)
 }
 
-fn append_definition_to_sub_chain(ability: &mut AbilityDefinition, mut next: AbilityDefinition) {
+fn append_definition_to_sub_chain(ability: &mut AbilityDefinition, next: AbilityDefinition) {
     let mut cursor = ability;
     loop {
         if cursor.sub_ability.is_none() {
-            if cursor.optional
-                && super::lower::is_linked_exile_cast_bottom_cleanup(&cursor.effect, &next.effect)
-            {
-                super::lower::normalize_linked_exile_cast_bottom_cleanup(&mut next.effect);
-                cursor.else_ability = Some(Box::new(next.clone()));
-            }
             cursor.sub_ability = Some(Box::new(next));
             break;
         }
@@ -7531,8 +7525,7 @@ mod tests {
         // Field-Tested Frying Pan (#835): "create a 1/1 white Halfling creature
         // token and attach this Equipment to it" — "attach " is an imperative game
         // action, so the conjunct must peel into its own clause and lower to a
-        // Token -> Attach sibling (rewire_token_attach_sibling rebinds onto
-        // LastCreated). Without the split the attach is silently dropped.
+        // Token -> Attach sibling. Without the split the attach is silently dropped.
         let chunks = clause_texts(
             "create a 1/1 white Halfling creature token and attach this Equipment to it",
         );
