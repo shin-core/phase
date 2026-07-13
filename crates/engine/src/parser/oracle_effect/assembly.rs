@@ -38,7 +38,7 @@ use super::lower::{
     gate_reflexive_rider_on_declined_optional_target, is_exile_until_cast_bottom_cleanup,
     is_land_enters_tapped_rider, is_linked_exile_cast_bottom_cleanup,
     is_spend_mana_as_any_color_rider, is_stable_branch_amount,
-    is_until_next_same_source_exile_rider, nest_whenever_this_turn_token_cleanup_delayed_trigger,
+    nest_whenever_this_turn_token_cleanup_delayed_trigger,
     normalize_exile_until_cast_bottom_cleanup, normalize_linked_exile_cast_bottom_cleanup,
     parse_controlled_by_different_players_target_constraint,
     parse_same_zone_owner_target_constraint, parse_total_mana_value_target_constraint,
