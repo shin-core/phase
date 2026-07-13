@@ -2146,6 +2146,68 @@ pub(super) fn selected_exile_alt_cost_permission_enters_with_counter(
         })
 }
 
+// CR 122.1 + CR 614.1c + CR 607.1: read the enters-with counter rider carried by
+// the STATIC cast permission (`GraveyardCastPermission` / `ExileCastPermission`)
+// that authorized this cast. The authorizing source is embedded in
+// `casting_variant` (`GraveyardPermission`/`ExilePermission { source }`) rather
+// than re-derivable from zone — by the `finalize_cast` seam the cast object is
+// already on the stack, so the zone-scan resolvers can no longer be called for
+// it. The source permanent never changes zone during the cast, so reading its
+// `active_static_definitions` is safe (CR 607.1: the enters-with rider is linked
+// to the "cast a spell this way" permission on that same object).
+//
+// Assumes at most one counter-bearing cast permission per source — true for every
+// printed card today (Noctis / Intrepid / Leonardo each carry exactly one); if a
+// future card stacks two, `find_map` takes the first. See the field docs on
+// `StaticMode::{Graveyard,Exile}CastPermission.enters_with_counter`.
+pub(super) fn selected_static_permission_enters_with_counter(
+    state: &GameState,
+    casting_variant: &crate::types::game_state::CastingVariant,
+) -> Option<crate::types::counter::CounterType> {
+    use crate::types::game_state::CastingVariant;
+    let source = match casting_variant {
+        CastingVariant::GraveyardPermission { source, .. }
+        | CastingVariant::ExilePermission { source, .. } => *source,
+        _ => return None,
+    };
+    let source_obj = state.objects.get(&source)?;
+    fn permission_counter(def: &StaticDefinition) -> Option<crate::types::counter::CounterType> {
+        match &def.mode {
+            StaticMode::GraveyardCastPermission {
+                enters_with_counter,
+                ..
+            }
+            | StaticMode::ExileCastPermission {
+                enters_with_counter,
+                ..
+            } => enters_with_counter.clone(),
+            _ => None,
+        }
+    }
+    // Existing path (unchanged for BB3 separate-battlefield-source cards): the
+    // permission still functions in zone on a source that never left the
+    // battlefield during the cast.
+    active_static_definitions(state, source_obj)
+        .find_map(permission_counter)
+        // CR 601.3 + CR 607.1 + CR 113.6b: self-granting-permission fallback.
+        // A self-granting source (Undead Sprinter — Gravecrawler shape) IS the
+        // cast object, now on the Stack, so its Graveyard-scoped permission no
+        // longer "functions in zone" (CR 113.6b) and the primary functioning-
+        // abilities scan yields None. The permission that AUTHORIZED this cast
+        // (CR 601.3, embedded in `casting_variant`) is a committed fact, and its
+        // enters-with rider is CR 607.1-linked to it, so read the rider directly
+        // from the printed definition — bypassing the now-zone-blocked gate.
+        // Additive: fires only when the primary path is None, so BB3 cards
+        // (Noctis / Leonardo / Intrepid) stay byte-identical. (CR 614.1c: the
+        // rider is a replacement effect applied as the object enters.)
+        .or_else(|| {
+            source_obj
+                .static_definitions
+                .iter_all()
+                .find_map(permission_counter)
+        })
+}
+
 // CR 205.1b + CR 613.1d: read the enters-with type-grant rider ("… is a [type]
 // in addition to its other types") from the *consumed* cast-this-way permission
 // only (the one supporting THIS cast), not any permission carrying modifications,
@@ -2725,6 +2787,9 @@ fn exile_permission_sources(state: &GameState, player: PlayerId) -> Vec<ExilePer
                     mana_spend_permission,
                     grants_flash,
                     ref extra_cost,
+                    // enters-with counter is read at the finalize_cast seam via
+                    // `selected_static_permission_enters_with_counter`, not here.
+                    ..
                 } => definition
                     .affected
                     .as_ref()
@@ -3038,6 +3103,9 @@ fn graveyard_permission_sources(
                     play_mode,
                     graveyard_destination_replacement,
                     ref extra_cost,
+                    // enters-with counter is read at the finalize_cast seam via
+                    // `selected_static_permission_enters_with_counter`, not here.
+                    ..
                 } if graveyard_permission_play_mode_matches(play_mode, play_mode_filter) => {
                     definition
                         .affected
@@ -9355,6 +9423,38 @@ pub fn handle_cast_spell_with_payment_mode(
                 events,
             );
         }
+    }
+    // CR 601.2a + CR 113.6b: A static `ExileCastPermission` where the exiled card
+    // is the only cast option yields exactly ONE candidate, so
+    // `had_multiple_candidates` is false and the block above is skipped. That
+    // single ExilePermission variant must still be elected — otherwise the cast
+    // falls through to a `Normal` cast that drops the permission's context
+    // (once-per-turn slot tracking, `WithoutPayingManaCost` zeroing, and the
+    // `enters_with_counter` rider). Maralen, Fae Ascendant; Intrepid
+    // Paleontologist; The Matrix of Time.
+    //
+    // ponytail: scoped to `ExilePermission` — the one variant class whose
+    // single-candidate cast currently mis-elects to Normal. The GENERAL rule is
+    // "don't skip single-candidate election when the elected option carries
+    // context a Normal cast would drop" (would also cover a hypothetical single
+    // Flashback/Escape/etc.). Not generalized here because the fall-through below
+    // routes single-candidate Warp/Evoke/Dash hand casts through their own
+    // cost-choice `WaitingFor` handlers; electing them via `continue_cast_with_
+    // variant` would preempt those prompts. Widen to the general predicate only
+    // after auditing those keyword handlers tolerate pre-election.
+    if let Some(option) = variant_choices
+        .options
+        .first()
+        .filter(|option| matches!(option.variant, CastingVariant::ExilePermission { .. }))
+    {
+        return continue_cast_with_variant(
+            state,
+            player,
+            object_id,
+            option.variant,
+            payment_mode,
+            events,
+        );
     }
 
     // Warp: when a hand card has Keyword::Warp and both costs are affordable,

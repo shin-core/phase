@@ -40,7 +40,7 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaCost, ManaExpiry};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::ActivationExemption;
-use crate::types::statics::StaticMode;
+use crate::types::statics::{CastCostMode, StaticMode};
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
 use nom::{
@@ -2837,6 +2837,81 @@ fn conditional_enter_counters_if_is_only_if_marker(
     !has_other_if
 }
 
+/// CR 607.1 + CR 614.1c + CR 122.1: a cast-permission static with an
+/// `enters_with_counter` rider represents "if you cast a spell this way, that
+/// permanent enters with a counter". Suppress only that represented sentence;
+/// a separate conditional in the same item must remain visible to the audit.
+fn enters_with_finality_this_way_is_only_if_marker(
+    stripped: &str,
+    evidence: &UnitEvidence,
+) -> bool {
+    if !evidence.any_static_mode(|mode| {
+        matches!(
+            mode,
+            StaticMode::GraveyardCastPermission {
+                enters_with_counter: Some(_),
+                ..
+            } | StaticMode::ExileCastPermission {
+                enters_with_counter: Some(_),
+                ..
+            }
+        )
+    }) {
+        return false;
+    }
+
+    let residual: String = stripped
+        .split('.')
+        .filter(|sentence| {
+            crate::parser::oracle_effect::parse_cast_this_way_enters_with_counter(
+                sentence.trim_start(),
+            )
+            .is_none()
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
+    !has_other_if
+}
+
+/// CR 118.9 + CR 607.1 + CR 608.2c: an alternative-cost rider on a cast
+/// permission represents its linked "if you cast a spell this way, pay …"
+/// clause. Additional-cost riders deliberately remain outside this exemption.
+fn cast_this_way_alt_cost_is_only_if_marker(stripped: &str, evidence: &UnitEvidence) -> bool {
+    if !evidence.any_static_mode(|mode| {
+        matches!(
+            mode,
+            StaticMode::GraveyardCastPermission {
+                extra_cost: Some(cost),
+                ..
+            } | StaticMode::ExileCastPermission {
+                extra_cost: Some(cost),
+                ..
+            } if matches!(cost.mode, CastCostMode::Alternative)
+        )
+    }) {
+        return false;
+    }
+
+    let residual: String = stripped
+        .split('.')
+        .filter(|sentence| {
+            let sentence = sentence.trim_start();
+            let is_rider = (sentence.contains("cast a spell this way") // allow-noncombinator: swallow detector marker scan on classified text
+                || sentence.contains("cast it this way")) // allow-noncombinator: swallow detector marker scan on classified text
+                && crate::parser::oracle_effect::try_parse_alt_cost_rider(sentence).is_some();
+            !is_rider
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
+    !has_other_if
+}
+
 // ── Detector G: Condition_If ────────────────────────────────────────────
 
 /// CR 608.2c: "if [condition], [effect]" — conditional gate. Must be
@@ -2943,6 +3018,12 @@ fn detect_condition_if(
     if conditional_enter_counters_if_is_only_if_marker(&stripped, evidence) {
         return;
     }
+    if enters_with_finality_this_way_is_only_if_marker(&stripped, evidence) {
+        return;
+    }
+    if cast_this_way_alt_cost_is_only_if_marker(&stripped, evidence) {
+        return;
+    }
     // CR 615.5: "If damage is prevented this way, [effect]" is not an
     // independent condition; prevention replacements encode it by storing the
     // follow-up in `execute`, which the replacement pipeline only fires from
@@ -2988,11 +3069,12 @@ fn detect_condition_if(
     {
         return;
     }
-    // CR 117.6 / 702.8: A `SpellCastingOption` with `cost: Some(_)` encodes
-    // the "if you pay [cost]" surcharge gate inline (Ghitu Fire, Rout-class
-    // "as though it had flash if you pay X" cycle). The "if" is a cost
-    // payment trigger, not a conditional check on game state.
-    let has_pay_phrase = stripped.contains("if you pay "); // allow-noncombinator: swallow detector marker scan on classified text
+    // CR 117.6 / CR 702.8: A `SpellCastingOption` with `cost: Some(_)`
+    // encodes the cost-gated casting permission inline: either an "if you pay"
+    // surcharge or an "as an additional cost" surface such as Molten Exhale's
+    // behold cost. The "if" is a cost-payment gate, not a game-state condition.
+    let has_pay_phrase = stripped.contains("if you pay ") // allow-noncombinator: swallow detector marker scan on classified text
+        || stripped.contains("as an additional cost"); // allow-noncombinator: swallow detector marker scan on classified text
     if parsed.casting_options.iter().any(|o| o.cost.is_some()) && has_pay_phrase {
         return;
     }
@@ -3783,6 +3865,7 @@ fn detect_duration_this_turn(
                 | TriggerCondition::DealtDamageBySourceThisTurn
                 | TriggerCondition::DealtDamageThisTurnBySource { .. }
                 | TriggerCondition::FirstTimeObjectTappedThisTurn
+                | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
                 | TriggerCondition::AttackedThisTurn
                 | TriggerCondition::CastSpellThisTurn { .. }
                 | TriggerCondition::SpellCastWithVariantThisTurn { .. }
