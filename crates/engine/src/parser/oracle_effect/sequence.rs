@@ -433,6 +433,13 @@ pub(super) fn parse_choice_partition_destination(
 }
 
 fn append_definition_to_sub_chain(ability: &mut AbilityDefinition, mut next: AbilityDefinition) {
+    // CR 608.2c + CR 701.13a: The Jodah, the Unifier "put the rest on the
+    // bottom" cleanup gate is head-aware — it needs the chain HEAD's effect
+    // (`ExileFromTopUntil { NextMatches }`) as well as the cast link (`cursor`)
+    // and the cleanup (`next`). Snapshot the head effect before the traversal
+    // consumes the `&mut` walk to the deepest sub. The plain linked-exile gate
+    // is head-independent, so it stays inside the loop.
+    let head_effect = ability.effect.clone();
     let mut cursor = ability;
     loop {
         if cursor.sub_ability.is_none() {
@@ -440,6 +447,15 @@ fn append_definition_to_sub_chain(ability: &mut AbilityDefinition, mut next: Abi
                 && super::lower::is_linked_exile_cast_bottom_cleanup(&cursor.effect, &next.effect)
             {
                 super::lower::normalize_linked_exile_cast_bottom_cleanup(&mut next.effect);
+                cursor.else_ability = Some(Box::new(next.clone()));
+            } else if cursor.optional
+                && super::lower::is_exile_until_cast_bottom_cleanup(
+                    &head_effect,
+                    &cursor.effect,
+                    &next.effect,
+                )
+            {
+                super::lower::normalize_exile_until_cast_bottom_cleanup(&mut next.effect);
                 cursor.else_ability = Some(Box::new(next.clone()));
             }
             cursor.sub_ability = Some(Box::new(next));
