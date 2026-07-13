@@ -18,15 +18,15 @@ use crate::parser::oracle_util::SELF_REF_TYPE_PHRASES;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction,
     AdditionalCost, AggregateFunction, AttackScope, AttackSubject, CardTypeSetSource, ChoiceType,
-    Comparator, ContinuousModification, ControllerRef, CountScope, CounterSourceRider,
-    DelayedTriggerCondition, DieRollModifier, DoublePTMode, Duration, EachDamageRecipient, Effect,
-    EffectOutcomeSignal, EffectScope, FilterProp, GameRestriction, LibraryPosition, ManaProduction,
-    ObjectProperty, ObjectScope, PerpetualModification, PlayerFilter, PlayerScope, PtStat, PtValue,
-    PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition,
-    ReplacementMode, SeatDirection, SharedQuality, SharedQualityRelation, SpeedDelta,
-    SpellCastingOption, SpellCastingOptionKind, SpellStackToGraveyardReplacement, StaticCondition,
-    StaticDefinition, TapStateChange, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter,
-    ZoneRef,
+    CoinFlipResult, Comparator, ContinuousModification, ControllerRef, CountScope,
+    CounterSourceRider, DelayedTriggerCondition, DieRollModifier, DoublePTMode, Duration,
+    EachDamageRecipient, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
+    ForEachCategoryAction, GameRestriction, LibraryPosition, ManaProduction, ObjectProperty,
+    ObjectScope, PerpetualModification, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope,
+    QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode,
+    SeatDirection, SharedQuality, SharedQualityRelation, SpeedDelta, SpellCastingOption,
+    SpellCastingOptionKind, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition,
+    TapStateChange, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::CoreType;
@@ -258,6 +258,11 @@ pub(crate) fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // Watchdog). Runtime enforcement is in morph::turn_face_up. Not
             // registry-keyed.
             | StaticMode::CantBeTurnedFaceUp
+            // CR 122.1d + CR 101.2: CountersCantBeRemoved carries the
+            // `CounterType` axis (Fear of Sleep Paralysis = Stun). Runtime
+            // enforcement is in turns.rs::counter_removal_blocked. Not
+            // registry-keyed.
+            | StaticMode::CountersCantBeRemoved { .. }
     )
 }
 
@@ -3146,7 +3151,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         Effect::RememberCard { target } => {
             d.push(("target".into(), fmt_target(target)));
         }
-        Effect::ForEachCategoryExile { category, zone, .. } => {
+        Effect::ForEachCategory { category, action, .. } => {
             d.push((
                 "category".into(),
                 match category {
@@ -3154,7 +3159,19 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                     crate::types::ability::IterationCategory::CardType => "card type".to_string(),
                 },
             ));
-            d.push(("zone".into(), fmt_zone(zone)));
+            match action {
+                ForEachCategoryAction::ExileFromPool { zone, .. } => {
+                    d.push(("zone".into(), fmt_zone(zone)));
+                }
+                ForEachCategoryAction::PutCounter {
+                    target,
+                    counter_type,
+                    ..
+                } => {
+                    d.push(("target".into(), fmt_target(target)));
+                    d.push(("counter_type".into(), counter_type.as_str().to_string()));
+                }
+            }
         }
         Effect::ChooseObjectsIntoTrackedSet {
             chooser,
@@ -3645,6 +3662,10 @@ fn fmt_ability_condition(cond: &AbilityCondition) -> String {
         AbilityCondition::AlternativeManaCostPaid => "alternative mana cost was paid".into(),
         AbilityCondition::EffectOutcome { .. } => "previous effect outcome".into(),
         AbilityCondition::EventOutcomeWon => "you won the event".into(),
+        AbilityCondition::CoinFlipOutcome { result } => match result {
+            CoinFlipResult::Won => "you won the flip".into(),
+            CoinFlipResult::Lost => "you lost the flip".into(),
+        },
         AbilityCondition::WhenYouDo => "when you do".into(),
         AbilityCondition::CastFromZone { zone } => format!("cast from {}", fmt_zone(zone)),
         AbilityCondition::CastDuringPhase { phases } => {
@@ -4019,6 +4040,9 @@ fn fmt_static_condition(cond: &StaticCondition) -> String {
         SC::SourceIsHarnessed => "source is harnessed".into(),
         SC::SourceAttachedToCreature => "source is attached to a creature".into(),
         SC::SourceMatchesFilter { filter } => format!("source is {}", fmt_target(filter)),
+        SC::TopOfLibraryMatches { filter } => {
+            format!("top card of library is {}", fmt_target(filter))
+        }
         SC::RecipientMatchesFilter { filter } => format!("recipient is {}", fmt_target(filter)),
         SC::RecipientAttackingOwnerTarget { .. } => {
             "recipient is attacking its owner's target".into()
@@ -4026,6 +4050,7 @@ fn fmt_static_condition(cond: &StaticCondition) -> String {
         SC::SourceIsPaired => "source is paired".into(),
         SC::SourceInZone { zone } => format!("source is in {}", fmt_zone(zone)),
         SC::EnchantedIsFaceDown => "enchanted creature is face-down".into(),
+        SC::SourceIsFaceUp => "source plane is face up".into(),
         SC::AdditionalCostPaid => "additional cost was paid".into(),
         SC::CastingAsVariant { variant } => format!("casting as {variant:?}"),
         SC::None => "none".into(),
@@ -4049,11 +4074,20 @@ fn fmt_modification(m: &crate::types::ability::ContinuousModification) -> String
             format!("remove {}", keyword_label(keyword))
         }
         ContinuousModification::GrantAbility { .. } => "grant ability".into(),
-        ContinuousModification::GrantAllActivatedAbilitiesOf { .. } => {
-            "grant all activated abilities of".into()
+        ContinuousModification::GrantAllActivatedAbilitiesOf { source, cap } => {
+            // Blind spot (same class as #5492/#5495/#5501/#5507): this rendered
+            // only the bare label, swallowing `source`/`cap` with `..`, so a parser
+            // change to which permanents' abilities are granted showed as a removal
+            // with no compensating addition in the sticky. Expose the source filter
+            // (and cap only when set, so unqualified signatures stay byte-identical).
+            let mut s = format!("grant all activated abilities of {}", fmt_target(source));
+            if let Some(cap) = cap {
+                s.push_str(&format!(" (cap {cap:?})"));
+            }
+            s
         }
-        ContinuousModification::GrantAllTriggeredAbilitiesOf { .. } => {
-            "grant all triggered abilities of".into()
+        ContinuousModification::GrantAllTriggeredAbilitiesOf { source } => {
+            format!("grant all triggered abilities of {}", fmt_target(source))
         }
         ContinuousModification::GrantTrigger { .. } => "grant trigger".into(),
         ContinuousModification::RemoveAllAbilities => "remove all abilities".into(),
@@ -4428,6 +4462,38 @@ fn build_ability_item(def: &AbilityDefinition) -> ParsedItem {
     // Modal abilities
     for mode_ability in &def.mode_abilities {
         children.push(build_ability_item(mode_ability));
+    }
+
+    // CR 705.2 (#5601): coin-flip branch effects are embedded `AbilityDefinition`s
+    // (not `sub_ability` links), so — like the sub-ability / else / modal chains
+    // above — recurse into them here. Without this the win/lose branch parse
+    // signatures are swallowed by the bare `("win"/"lose", "yes")` presence
+    // markers in `effect_details`, making a real parser change inside a branch
+    // (e.g. Desperate Gambit's lose-branch `damage_source_filter` flipping
+    // `SelfRef` → `ChosenDamageSource`) invisible to the coverage parse-diff.
+    // Same swallowed-structure class as #5492/#5495/#5501.
+    match &*def.effect {
+        Effect::FlipCoin {
+            win_effect,
+            lose_effect,
+            ..
+        }
+        | Effect::FlipCoins {
+            win_effect,
+            lose_effect,
+            ..
+        } => {
+            if let Some(win) = win_effect {
+                children.push(build_ability_item(win));
+            }
+            if let Some(lose) = lose_effect {
+                children.push(build_ability_item(lose));
+            }
+        }
+        Effect::FlipCoinUntilLose { win_effect } => {
+            children.push(build_ability_item(win_effect));
+        }
+        _ => {}
     }
 
     ParsedItem {
@@ -6989,6 +7055,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
             EffectOutcomeSignal::Guessed { .. } => ("EffectOutcomeGuessed", Handled),
         },
         AbilityCondition::EventOutcomeWon => ("EventOutcomeWon", Handled),
+        AbilityCondition::CoinFlipOutcome { .. } => ("CoinFlipOutcome", Handled),
         AbilityCondition::WhenYouDo => ("WhenYouDo", Handled),
         AbilityCondition::CastFromZone { .. } => ("CastFromZone", Handled),
         AbilityCondition::RevealedHasCardType { .. } => ("RevealedHasCardType", Handled),
@@ -7390,11 +7457,17 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::SourceAttachedToCreature => ("SourceAttachedToCreature", Handled),
         // SourceMatchesFilter resolved by layers::evaluate_condition (layers.rs:1104)
         StaticCondition::SourceMatchesFilter { .. } => ("SourceMatchesFilter", Handled),
+        // CR 401.1 + CR 401.5: top-of-library gate, resolved by
+        // layers::evaluate_condition_with_context against the controller's library top.
+        StaticCondition::TopOfLibraryMatches { .. } => ("TopOfLibraryMatches", Handled),
         StaticCondition::SourceIsPaired => ("SourceIsPaired", Handled),
         // CR 113.6b: evaluated by `layers::evaluate_condition` — checks source
         // object's zone against the specified zone. Runtime-handled.
         StaticCondition::SourceInZone { .. } => ("SourceInZone", Handled),
         StaticCondition::EnchantedIsFaceDown => ("EnchantedIsFaceDown", Handled),
+        // CR 311.2 / CR 901.7: evaluated by `layers::evaluate_condition` against
+        // the command-zone active plane. Runtime-handled.
+        StaticCondition::SourceIsFaceUp => ("SourceIsFaceUp", Handled),
         StaticCondition::AdditionalCostPaid => ("AdditionalCostPaid", Handled),
         StaticCondition::CastingAsVariant { .. } => ("CastingAsVariant", Handled),
     }
@@ -8718,6 +8791,10 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 effective_lower.contains("can't be blocked")
             }
             StaticMode::CantBeBlockedBy { .. } => effective_lower.contains("can't be blocked"),
+            // CR 509.1b: CantBeBlockedUnlessAllBlock — "can't be blocked" anchor
+            // (Tromokratis). The "unless all creatures" clause is validated by
+            // parser tests.
+            StaticMode::CantBeBlockedUnlessAllBlock => effective_lower.contains("can't be blocked"),
             // CR 502.3: Smoke / Damping Field / Winter Orb max-untap cap. Anchor
             // on the verb phrase; the type filter half is the reused TargetFilter
             // and is validated by parser tests.
@@ -10477,6 +10554,83 @@ mod tests {
         );
     }
 
+    /// #5601 (same swallowed-structure class as #5492/#5495/#5501): a parser
+    /// change INSIDE a coin-flip branch — e.g. Desperate Gambit's lose-branch
+    /// `damage_source_filter` flipping `SelfRef` → `ChosenDamageSource` — must be
+    /// visible to the coverage parse-diff. The FlipCoin branch effects are
+    /// embedded `AbilityDefinition`s (not `sub_ability` links), so
+    /// `build_ability_item` must recurse into `win_effect`/`lose_effect` rather
+    /// than emit only the bare `("lose", "yes")` presence marker — otherwise the
+    /// change is swallowed and the sticky reports a false "No card-parse changes".
+    #[test]
+    fn flip_coin_branch_effects_are_exposed_in_parse_details() {
+        use crate::types::ability::{AbilityDefinition, AbilityKind};
+
+        let lose = Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PreventDamage {
+                amount: PreventionAmount::All,
+                amount_dynamic: None,
+                target: TargetFilter::Any,
+                scope: PreventionScope::AllDamage,
+                damage_source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+                prevention_duration: None,
+            },
+        ));
+        let def = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::FlipCoin {
+                win_effect: None,
+                lose_effect: Some(lose),
+                flipper: TargetFilter::Controller,
+            },
+        );
+        let item = build_ability_item(&def);
+        assert!(
+            item.children
+                .iter()
+                .any(|c| c.details.iter().any(|(k, _)| k == "damage_source_filter")),
+            "FlipCoin lose-branch damage_source_filter must be exposed as a child \
+             parse detail; got children {:#?}",
+            item.children
+        );
+    }
+
+    #[test]
+    fn grant_all_abilities_signature_exposes_source() {
+        // Same class as #5492/#5495/#5501/#5507: GrantAllActivatedAbilitiesOf /
+        // GrantAllTriggeredAbilitiesOf rendered only the bare label, swallowing their
+        // `source` filter with `..`, so a parser change to which permanents' abilities
+        // are granted showed as a removal with no compensating addition in the sticky.
+        use crate::types::ability::{ContinuousModification, TargetFilter};
+
+        let act = |source: TargetFilter| {
+            fmt_modification(&ContinuousModification::GrantAllActivatedAbilitiesOf {
+                source,
+                cap: None,
+            })
+        };
+        let trg = |source: TargetFilter| {
+            fmt_modification(&ContinuousModification::GrantAllTriggeredAbilitiesOf { source })
+        };
+
+        // The source filter must appear in each signature ...
+        assert!(
+            act(TargetFilter::Controller).contains(&fmt_target(&TargetFilter::Controller)),
+            "activated-grant signature must expose its source filter",
+        );
+        assert!(
+            trg(TargetFilter::SelfRef).contains(&fmt_target(&TargetFilter::SelfRef)),
+            "triggered-grant signature must expose its source filter",
+        );
+        // ... so different source filters produce distinct signatures, not one bare label.
+        assert_ne!(
+            act(TargetFilter::Controller),
+            act(TargetFilter::SelfRef),
+            "different source filters must produce different activated-grant signatures",
+        );
+    }
+
     #[test]
     fn mana_signature_exposes_grants() {
         use crate::types::ability::ManaContribution;
@@ -11066,9 +11220,10 @@ mod tests {
     #[test]
     fn card_face_with_replacement_decline_unimplemented_is_detected() {
         let mut face = make_face();
-        face.replacements
-            .push(ReplacementDefinition::new(ReplacementEvent::Draw).mode(
-                ReplacementMode::Optional {
+        face.replacements.push(
+            ReplacementDefinition::new(ReplacementEvent::Draw)
+                .draw_scope(crate::types::ability::DrawReplacementScope::IndividualDraw)
+                .mode(ReplacementMode::Optional {
                     decline: Some(Box::new(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::Unimplemented {
@@ -11076,8 +11231,8 @@ mod tests {
                             description: None,
                         },
                     ))),
-                },
-            ));
+                }),
+        );
 
         assert!(card_face_has_unimplemented_parts(&face));
     }
@@ -13098,6 +13253,31 @@ mod tests {
         assert!(
             gaps.is_empty(),
             "Data-carrying combat statics should be fully supported, but got gaps: {:?}",
+            gaps
+        );
+    }
+
+    /// CR 509.1b: CantBeBlockedUnlessAllBlock is a nullary registry-keyed
+    /// static enforced by combat.rs declare-blockers validation (Tromokratis).
+    #[test]
+    fn cant_be_blocked_unless_all_block_has_no_coverage_gap() {
+        let mut face = make_face();
+        face.oracle_text = Some(
+            "Tromokratis can't be blocked unless all creatures defending player controls block it."
+                .to_string(),
+        );
+        face.static_abilities.push(
+            StaticDefinition::new(StaticMode::CantBeBlockedUnlessAllBlock)
+                .affected(TargetFilter::SelfRef)
+                .description(
+                    "Tromokratis can't be blocked unless all creatures defending player controls block it.".to_string(),
+                ),
+        );
+
+        let gaps = card_face_gaps(&face);
+        assert!(
+            gaps.is_empty(),
+            "CantBeBlockedUnlessAllBlock should be fully supported, but got gaps: {:?}",
             gaps
         );
     }

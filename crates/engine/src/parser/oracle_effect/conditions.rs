@@ -25,10 +25,10 @@ use crate::parser::oracle_ir::ast::ContinuationAst;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, AdditionalCostOrigin, CastManaObjectScope,
-    CastManaSpentMetric, CastVariantPaid, Comparator, ControllerRef, CountScope, DamageChannel,
-    DigSource, Duration, Effect, EffectOutcomeSignal, FilterProp, GuessOutcome, ObjectScope,
-    ParsedCondition, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, StaticCondition,
-    TargetFilter, TypeFilter, TypedFilter,
+    CastManaSpentMetric, CastVariantPaid, CoinFlipResult, Comparator, ControllerRef, CountScope,
+    DamageChannel, DigSource, Duration, Effect, EffectOutcomeSignal, FilterProp, GuessOutcome,
+    ObjectScope, ParsedCondition, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef,
+    StaticCondition, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -870,6 +870,7 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
         if let Ok((after_clause, condition)) =
             nom_cond::parse_you_control_or_returned_this_way_condition(rest)
                 .or_else(|_| nom_cond::parse_you_put_into_hand_this_way_condition(rest))
+                .or_else(|_| nom_cond::parse_you_put_counters_on_type_this_way_condition(rest))
                 .or_else(|_| nom_cond::parse_you_draw_this_way_condition(rest))
         {
             let body_lower = strip_reflexive_conditional_body_separator(after_clause);
@@ -1402,6 +1403,30 @@ pub(super) fn try_parse_moved_card_subtype_attach_followup(
         target: TargetFilter::ParentTarget,
     };
     Some((condition, attach, is_optional))
+}
+
+/// CR 705.2 + CR 608.2c: Strip a resolution-scoped "if you {win|lose} the flip,"
+/// gate that precedes a "repeat this process" directive, mapping it to
+/// `AbilityCondition::CoinFlipOutcome`. Scoped to the repeat-directive context
+/// (called first inside `try_parse_repeat_process_directive`) so inline
+/// Krark-style "if you win the flip, <effect>" branches — whose body is NOT
+/// "repeat this process" — still fall through to the coin-flip fold. Returns the
+/// original text unchanged when no flip gate is present.
+pub(super) fn strip_coin_flip_conditional(text: &str) -> (Option<AbilityCondition>, String) {
+    let lower = text.to_lowercase();
+    match nom_on_lower(text, &lower, |i| {
+        let (i, _) = tag::<_, _, OracleError<'_>>("if you ").parse(i)?;
+        let (i, result) = alt((
+            value(CoinFlipResult::Won, tag("win the flip")),
+            value(CoinFlipResult::Lost, tag("lose the flip")),
+        ))
+        .parse(i)?;
+        let (i, _) = tag(", ").parse(i)?;
+        Ok((i, AbilityCondition::CoinFlipOutcome { result }))
+    }) {
+        Some((condition, remainder)) => (Some(condition), remainder.to_string()),
+        None => (None, text.to_string()),
+    }
 }
 
 pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityCondition>, String) {
@@ -4049,9 +4074,11 @@ fn counter_threshold_to_condition(
     }
 }
 
-/// CR 609.3: Compose a `QuantityExpr::Difference` from a two-operand quantity
+/// CR 608.2c: Compose a `QuantityExpr::Difference` from a two-operand quantity
 /// comparison condition — the unsigned magnitude gap between the operands, as
 /// referenced by "a number of times equal to the difference" repeat suffixes.
+/// "The difference" is an anaphoric back-reference to the operands the earlier
+/// condition text established (read the whole text, apply the rules of English).
 ///
 /// Class-general: any `AbilityCondition::QuantityCheck` yields the difference
 /// of its operands. Both `lhs` and `rhs` are already `QuantityExpr`, so they
@@ -4376,6 +4403,10 @@ pub(crate) fn static_condition_to_ability_condition(
         | StaticCondition::CompletedADungeon
         | StaticCondition::ControlsCommander { .. }
         | StaticCondition::EnchantedIsFaceDown
+        // CR 311.2 / CR 901.7: plane face-up status is a duration-only continuous-
+        // effect condition (evaluated in the layer system), never an
+        // effect-resolution-time `AbilityCondition` — lowering returns `None`.
+        | StaticCondition::SourceIsFaceUp
         | StaticCondition::SourceControllerEquals { .. }
         // CR 702.166a: Bargain payment is a cost-determination predicate with no
         // effect-resolution (`AbilityCondition`) equivalent.
@@ -4393,6 +4424,10 @@ pub(crate) fn static_condition_to_ability_condition(
         // an effect-resolution gate — no `AbilityCondition` equivalent.
         | StaticCondition::IsTapped { .. }
         | StaticCondition::CastingAsVariant { .. }
+        // CR 401.1 + CR 401.5: the top-of-library gate is a continuous-static-only
+        // predicate (Layer 6 / duration `ForAsLongAs`); no effect-resolution
+        // (`AbilityCondition`) equivalent — lowering returns `None`.
+        | StaticCondition::TopOfLibraryMatches { .. }
         | StaticCondition::None => None,
     }
 }
@@ -4473,6 +4508,7 @@ pub(crate) fn ability_condition_to_static_condition(
         // a continuous-effect gate.
         AbilityCondition::EffectOutcome { .. }
         | AbilityCondition::EventOutcomeWon
+        | AbilityCondition::CoinFlipOutcome { .. }
         | AbilityCondition::WhenYouDo
         | AbilityCondition::RevealedHasCardType { .. }
         | AbilityCondition::ObjectsShareQuality { .. }
@@ -6630,6 +6666,26 @@ mod tests {
     }
 
     #[test]
+    fn s07_if_put_counters_on_type_this_way() {
+        // Call the Spirit Dragons: "if you put +1/+1 counters on five Dragons this way".
+        let (cond, body) = strip_if_you_do_conditional(
+            "if you put +1/+1 counters on five Dragons this way, you win the game",
+        );
+        assert_eq!(body, "you win the game");
+        assert!(
+            matches!(
+                cond,
+                Some(AbilityCondition::QuantityCheck {
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 5 },
+                    ..
+                })
+            ),
+            "got {cond:?}"
+        );
+    }
+
+    #[test]
     fn s07_if_put_no_cards_into_hand_this_way_is_count_zero() {
         // Nashi: "if you put no cards into your hand this way" → TrackedSetSize == 0.
         let (cond, body) = strip_if_you_do_conditional(
@@ -7417,8 +7473,8 @@ mod tests {
 
     #[test]
     fn difference_expr_composes_unsigned_gap_from_quantity_check() {
-        // CR 609.3: a two-operand comparison yields the difference of its
-        // operands — class-general over any QuantityCheck.
+        // CR 608.2c: "the difference" back-references the two operands the earlier
+        // condition established — class-general over any QuantityCheck.
         let cond = AbilityCondition::QuantityCheck {
             lhs: QuantityExpr::Ref {
                 qty: QuantityRef::TrackedSetSize,

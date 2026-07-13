@@ -106,6 +106,10 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
         parse_event_object_pt_vs_source_comparison,
         parse_attached_object_is_filter_condition,
         parse_recipient_is_filter_condition,
+        // CR 401.1 + CR 401.5: "the top card of your library is [predicate]" — a
+        // distinctive "the top card of your library is " prefix, so ordering
+        // relative to the other filter conditions is not sensitive.
+        parse_top_of_library_condition,
         parse_source_state_conditions,
         parse_player_state_conditions,
         parse_you_have_conditions,
@@ -1406,6 +1410,45 @@ fn attached_filter_condition(filter: TargetFilter) -> StaticCondition {
 /// the `" or "` separator for the next iteration.
 fn parse_bare_predicate_disjunction(input: &str) -> OracleResult<'_, Vec<TargetFilter>> {
     nom::multi::separated_list1(tag(" or "), parse_bare_predicate_tail).parse(input)
+}
+
+/// CR 401.1 + CR 401.5: "the top card of your library is [predicate]" — a
+/// continuous-static gate reading the top card of the controller's library
+/// (Vampire Nocturnus "is black", Mul Daya Channelers "is a creature card",
+/// Conspicuous Snoop "is a Goblin card", Skill Borrower "is an artifact or
+/// creature card", Oura "is a Faerie or instant card"). The predicate reuses
+/// `parse_bare_predicate_disjunction`, so the informational " card" suffix,
+/// bare colors, and N-way "a X or Y" disjunction are folded exactly as in the
+/// recipient/attached filter paths — no bespoke type parsing. A single filter
+/// emits `TopOfLibraryMatches`; a disjunction wraps them in the existing `Or`
+/// combinator (matching `parse_recipient_is_filter_condition`'s shape). The
+/// controller-scoped "your library" reading needs no player field on the
+/// variant. A terminal-boundary guard (end / "," / ";" / ".") rejects partial
+/// matches so a longer combinator can own an unrelated trailing phrase.
+fn parse_top_of_library_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("the top card of your library is ").parse(input)?;
+    let (rest, filters) = parse_bare_predicate_disjunction(rest)?;
+    if !(rest.is_empty()
+        || alt((tag::<_, _, OracleError<'_>>(","), tag(";"), tag(".")))
+            .parse(rest)
+            .is_ok())
+    {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    // Fold any disjunction into a single gate over an `Or` *filter* (the runtime
+    // `matches_target_filter` handles `TargetFilter::Or`). The common "X or Y
+    // card" form is already one `Or` filter (parse_type_phrase folds it); an
+    // article-delimited "a X or a Y" would yield multiple filters, which we wrap
+    // here so the result is always one `TopOfLibraryMatches`.
+    let filter = if filters.len() > 1 {
+        TargetFilter::Or { filters }
+    } else {
+        filters.into_iter().next().expect("non-empty")
+    };
+    Ok((rest, StaticCondition::TopOfLibraryMatches { filter }))
 }
 
 /// CR 611.3a: "it's a Zombie" / "it isn't white" / "it's a Zombie or a Skeleton" —
@@ -7708,6 +7751,30 @@ fn player_count_comparison_filters(type_text: &str) -> Option<(TargetFilter, Tar
     Some((type_filter, you_filter))
 }
 
+/// CR 614.1a: "an opponent who controls at least as many <filter> as you do" —
+/// the applicability condition of an "instead" replacement effect (Land
+/// Equilibrium). The relative clause ("who controls …") binds to the SPECIFIC
+/// entering/acting opponent — the player who would put the permanent onto the
+/// battlefield — not to an existential aggregate over all opponents. Returns the
+/// bare `(type_filter, you_filter)` pair (via the comparator-agnostic
+/// `player_count_comparison_filters` helper) so the replacement-condition builder
+/// can compose it directly into `ReplacementCondition::OnlyIfQuantity` with the
+/// scoped-player controller stamped on `type_filter`. This deliberately does NOT
+/// build `StaticCondition::QuantityComparison` / `PlayerFilter::ControlsCount`
+/// (the shape used by `parse_opponent_controls_more_than_you`): that shape is an
+/// existential "an opponent controls more <filter> than you" aggregate check and
+/// would be WRONG here — it does not bind the count to the specific entering
+/// player the replacement is evaluated against.
+pub(crate) fn parse_opponent_who_controls_at_least_as_many(
+    input: &str,
+) -> OracleResult<'_, (TargetFilter, TargetFilter)> {
+    let (rest, _) = tag("an opponent who controls at least as many ").parse(input)?;
+    let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" as you do").parse(rest)?;
+    let (rest, _) = tag(" as you do").parse(rest)?;
+    let pair = player_count_comparison_filters(type_text).ok_or_else(|| oracle_err(type_text))?;
+    Ok((rest, pair))
+}
+
 /// CR 118.12a: Parse "[player] pays {cost}" → UnlessPay { cost }.
 ///
 /// Handles "you pay {N}", "their controller pays {N}", "its controller pays {N}".
@@ -8072,6 +8139,57 @@ pub fn parse_you_put_into_hand_this_way_condition(
     Ok((rest, AbilityCondition::ZoneChangedThisWay { filter }))
 }
 
+/// CR 608.2c + CR 122.1: Parse "you put [counter type] counters on [N] [type]
+/// this way" — active-voice reflexive gate for counter-placement producers
+/// (Call the Spirit Dragons: "If you put +1/+1 counters on five Dragons this
+/// way, you win the game"). Counts filtered tracked-set members matching the
+/// type phrase against the parsed threshold.
+pub fn parse_you_put_counters_on_type_this_way_condition(
+    input: &str,
+) -> OracleResult<'_, AbilityCondition> {
+    let (rest, _) = tag("you put ").parse(input)?;
+    let (rest, _) = opt(terminated(
+        super::primitives::parse_counter_type_typed,
+        alt((tag(" counters "), tag(" counter "))),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag("on ").parse(rest)?;
+    let (count_expr, rest) =
+        crate::parser::oracle_util::parse_count_expr(rest).ok_or_else(|| {
+            nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Fail))
+        })?;
+    let threshold = match count_expr {
+        QuantityExpr::Fixed { value } => value,
+        _ => {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Fail,
+            )))
+        }
+    };
+    let (filter, after_filter) = parse_type_phrase(rest);
+    if matches!(filter, TargetFilter::Any) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    let (rest, _) = tag("this way").parse(after_filter.trim())?;
+    Ok((
+        rest,
+        AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::FilteredTrackedSetSize {
+                    filter: Box::new(filter),
+                    caused_by: None,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: threshold },
+        },
+    ))
+}
+
 /// CR 400.7 + CR 608.2c: Parse "returned [quantifier] [type] to your hand this
 /// way" — the passive/elided-subject bounce gate (Cache Grab's disjunct:
 /// "returned a Squirrel card to your hand this way"). Returns the matched type
@@ -8134,7 +8252,7 @@ pub fn parse_you_control_or_returned_this_way_condition(
     ))
 }
 
-/// CR 121 + CR 608.2c + CR 609.3: Parse "you draw [one or more] card[s] this
+/// CR 121 + CR 608.2c: Parse "you draw [one or more] card[s] this
 /// way" — the active-voice draw-count gate (Transcendent Archaic: "you may draw
 /// X cards … If you draw one or more cards this way, discard two cards"). Reads
 /// the amount moved by the immediately preceding draw effect in the sub-ability
@@ -16567,6 +16685,95 @@ mod tests {
             assert!(rest.is_empty(), "{text}: leftover {rest:?}");
             assert_eq!(c, expected, "{text}");
         }
+    }
+
+    /// CR 401.1 + CR 401.5: Vampire Nocturnus's "the top card of your library is
+    /// black" parses to a top-of-library color gate. Full-shape assert on the
+    /// `HasColor` filter (bare color, no article, no " card" suffix).
+    #[test]
+    fn parse_inner_condition_top_of_library_is_black() {
+        let (rest, c) = parse_inner_condition("the top card of your library is black").unwrap();
+        assert!(rest.is_empty(), "leftover: {rest:?}");
+        assert_eq!(
+            c,
+            StaticCondition::TopOfLibraryMatches {
+                filter: TargetFilter::Typed(TypedFilter::default().properties(vec![
+                    FilterProp::HasColor {
+                        color: ManaColor::Black
+                    }
+                ])),
+            }
+        );
+    }
+
+    /// CR 401.1: Mul Daya Channelers's "the top card of your library is a creature
+    /// card" / "... a land card" parse to top-of-library core-type gates. The
+    /// informational " card" suffix is folded by `parse_type_phrase` (the same
+    /// helper the graveyard-presence gate uses), so the filter is exactly the bare
+    /// core-type filter — asserted against `parse_type_phrase`'s own output.
+    #[test]
+    fn parse_inner_condition_top_of_library_is_type_card() {
+        for (text, phrase) in [
+            (
+                "the top card of your library is a creature card",
+                "creature card",
+            ),
+            ("the top card of your library is a land card", "land card"),
+        ] {
+            let (rest, c) = parse_inner_condition(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert!(rest.is_empty(), "{text}: leftover {rest:?}");
+            let (expected_filter, _) = parse_type_phrase(phrase);
+            assert_eq!(
+                c,
+                StaticCondition::TopOfLibraryMatches {
+                    filter: expected_filter
+                },
+                "{text}"
+            );
+        }
+    }
+
+    /// CR 401.1: Conspicuous Snoop's "the top card of your library is a Goblin
+    /// card" parses to a top-of-library subtype gate (the subtype-word path of
+    /// `parse_type_phrase`). The condition parser runs on lowercased text.
+    #[test]
+    fn parse_inner_condition_top_of_library_is_subtype_card() {
+        let (rest, c) =
+            parse_inner_condition("the top card of your library is a goblin card").unwrap();
+        assert!(rest.is_empty(), "leftover: {rest:?}");
+        let (expected_filter, _) = parse_type_phrase("goblin card");
+        assert_eq!(
+            c,
+            StaticCondition::TopOfLibraryMatches {
+                filter: expected_filter
+            }
+        );
+    }
+
+    /// CR 401.1: Skill Borrower's "the top card of your library is an
+    /// artifact or creature card" folds the "X or Y card" disjunction into a
+    /// single top-of-library gate over an `Or` *filter* — `parse_type_phrase`
+    /// consumes the whole compound (no per-disjunct article), so
+    /// `parse_bare_predicate_disjunction` yields one filter and the runtime
+    /// `matches_target_filter` disjunction handles the two card types. The `Or`
+    /// filter is asserted against `parse_type_phrase`'s own compound output.
+    #[test]
+    fn parse_inner_condition_top_of_library_is_disjunction() {
+        let (rest, c) =
+            parse_inner_condition("the top card of your library is an artifact or creature card")
+                .unwrap();
+        assert!(rest.is_empty(), "leftover: {rest:?}");
+        let (expected_filter, _) = parse_type_phrase("artifact or creature card");
+        assert!(
+            matches!(&expected_filter, TargetFilter::Or { filters } if filters.len() == 2),
+            "sanity: expected an Or filter, got {expected_filter:?}"
+        );
+        assert_eq!(
+            c,
+            StaticCondition::TopOfLibraryMatches {
+                filter: expected_filter
+            }
+        );
     }
 
     /// CR 119.3 + CR 109.4: Thought-Stalker Warlock's "they lost life this turn"

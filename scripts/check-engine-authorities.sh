@@ -17,8 +17,17 @@
 #               consults off_zone_characteristics — required for anything that
 #               can run on a non-battlefield object)
 #
+#   (B) Raw zone mutation: the movers in game/zones.rs, direct writes to the
+#       zone containers, and direct `GameObject::zone` assignment. Any of these
+#       skips replacement consultation, `ZoneChanged`, triggers, and draw
+#       bookkeeping. Gameplay zone changes go through zone_pipeline.
+#       Unlike (A), this section is FULL-TREE, not diff-only: it is a ratchet
+#       against a frozen baseline, so a pre-existing site cannot be quietly
+#       duplicated into a new one. See scripts/zone_authority_census.py.
+#
 # Exempt: lines (or the line immediately above) with
-#     // allow-raw-authority: <reason>
+#     // allow-raw-authority: <reason>      (A)
+#     // allow-raw-zone: <reason>           (B)
 # Allowed files (the authorities themselves and the layer/copy machinery that
 # must read raw keyword state): see ALLOWED_KEYWORD_FILES below.
 #
@@ -75,10 +84,9 @@ filter_allow_annotation() {
     printf '%s' "${added%$'\n'}"
 }
 
+# NB: no early exit on an empty diff — section (B) is full-tree and must run
+# even when this change touched no engine source.
 files=$(git diff $DIFF_MODE --name-only "$BASE" -- "$SCOPE" ':(exclude)**/*.md' 2>/dev/null || true)
-if [ -z "$files" ]; then
-    exit 0
-fi
 
 while IFS= read -r file; do
     [ -f "$file" ] || continue
@@ -126,7 +134,38 @@ snapshots), annotate the line with:
     // allow-raw-authority: <one-line reason>
 
 EOF
-    exit 1
 fi
 
-exit 0
+# (B0) The census scanner's own seam suite. Gates (B) and (C) both stand on
+# `strip_noncode` in zone_authority_census.py; a lexer regression there would
+# not fail those gates — it would silently mis-scope them (a swallowed hit
+# reads as migration progress). So the suite that pins the lexer runs here,
+# ahead of the gates it protects.
+if ! python3 "$(dirname "$0")/zone_authority_census_tests.py"; then
+    FAIL=1
+fi
+
+# (B) Raw zone mutation — full-tree ratchet against the frozen baseline.
+if ! python3 "$(dirname "$0")/zone_authority_census.py" --check; then
+    FAIL=1
+fi
+
+# (C) Draw replacement-definition producers — exact-match freeze.
+# Plan 03 gives every `ReplacementEvent::Draw` definition an explicit CR 121.2
+# scope (instruction-count vs individual-draw) assigned at construction. A
+# producer the rewrite misses would silently take a default scope, so the set of
+# producers is frozen here. The corpus half of this census needs the generated
+# card-data and therefore runs in the card-data CI job, not this one.
+#
+# SCOPE: three crates — engine, engine-wasm, mtgish-import — of a 13-crate
+# workspace. NOT full-tree, and previously mislabelled as such. The historical
+# blocker (no raw-string branch in `strip_noncode`, which made a workspace-wide
+# scan die on crates/draft-wasm/src/suggest.rs:437) was fixed in #5704; the
+# scope has simply not been widened yet. Widening it changes this gate's frozen
+# producer population, so it is its own unit with its own baseline review — not
+# a drive-by.
+if ! python3 "$(dirname "$0")/draw_replacement_census.py" --producers --check; then
+    FAIL=1
+fi
+
+exit "$FAIL"

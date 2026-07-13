@@ -1929,12 +1929,12 @@ pub(crate) fn parse_static_line_inner(
         {
             let after = &tp.original[pos + verb_len..];
             let predicate = format!("{}{}", verb_prefix, after);
-            let predicate_lower = predicate.to_lowercase();
 
-            // CR 604.1: Strip suffix turn conditions —
-            // "has first strike during your turn" → condition + "has first strike"
-            let (effective_predicate, suffix_condition) =
-                strip_suffix_turn_condition(&predicate_lower);
+            // CR 604.1: Strip suffix turn conditions from the ORIGINAL-case
+            // predicate so a granted ability's serialized `description` keeps its
+            // printed case (issue #5599) — "has first strike during your turn" →
+            // condition + "has first strike".
+            let (effective_predicate, suffix_condition) = strip_suffix_turn_condition(&predicate);
 
             if let Some(mut def) =
                 parse_continuous_gets_has(&effective_predicate, TargetFilter::SelfRef, tp.original)
@@ -2302,8 +2302,9 @@ pub(crate) fn parse_static_line_inner(
     }
 
     // --- "Spells and abilities <scope> can't cause their controller to search their library" ---
-    // CR 701.23 + CR 609.3: Ashiok, Dream Render's first static. Subject-scoped
-    // prohibition where `cause` identifies whose spells/abilities are muzzled.
+    // CR 701.23 + CR 101.2: Ashiok, Dream Render's first static. Subject-scoped
+    // prohibition — the "can't" effect takes precedence over any effect directing
+    // a search — where `cause` identifies whose spells/abilities are muzzled.
     if let Some(def) = parse_cant_search_library(&tp, &text) {
         return Some(def);
     }
@@ -2318,9 +2319,10 @@ pub(crate) fn parse_static_line_inner(
     }
 
     // --- "Triggered abilities <scope> can't cause you to sacrifice or exile <affected>" ---
-    // CR 603.2 + CR 609.3: The Master, Multiplied class. Subject-scoped prohibition
-    // where `cause` identifies whose triggered abilities are muzzled and `affected`
-    // identifies the protected objects.
+    // CR 603.2 + CR 101.2: The Master, Multiplied class. Subject-scoped prohibition
+    // — the "can't" effect takes precedence over the triggered ability directing the
+    // action — where `cause` identifies whose triggered abilities are muzzled and
+    // `affected` identifies the protected objects.
     if let Some(def) = parse_cant_cause_sacrifice_or_exile(&tp, &text) {
         return Some(def);
     }
@@ -2666,6 +2668,12 @@ pub(crate) fn parse_static_line_inner(
         return Some(def);
     }
 
+    // CR 122.1d + CR 101.2: "<Counter> counters can't be removed from <subject>."
+    // (Fear of Sleep Paralysis) — counter-removal prohibition.
+    if let Some(def) = parse_counters_cant_be_removed_static(&tp, &text) {
+        return Some(def);
+    }
+
     // NOTE: "enters with N counters" patterns are now handled by oracle_replacement.rs
     // as proper Moved replacement effects (paralleling the "enters tapped" pattern).
 
@@ -2912,31 +2920,12 @@ pub(crate) fn parse_static_line_inner(
     // either the chosen-name source phrase (→ HasChosenName) or a type phrase.
     if let Some(((amount_n, is_x, mode, subject_filter, dynamic_count, keyword), _)) =
         nom_on_lower(tp.original, tp.lower, |i| {
-            let (i, keyword) = alt((
-                value("activated", tag("activated abilities of ")),
-                value("loyalty", tag("loyalty abilities of ")),
-            ))
-            .parse(i)?;
-            let (i, subject) = take_until(" cost ").parse(i)?;
-            let (i, _) = tag(" cost ").parse(i)?;
-            // CR 107.3 + CR 601.2f: the amount is a fixed `{N}` (Training Grounds)
-            // or the variable `{X}` (Agatha), whose value is supplied by the
-            // trailing "where X is …" referent parsed below.
-            let (i, (amount_n, is_x)) = nom::sequence::delimited(
-                tag("{"),
-                alt((
-                    map(nom_primitives::parse_number, |n| (n, false)),
-                    value((0u32, true), tag("x")),
-                )),
-                tag("}"),
-            )
-            .parse(i)?;
-            let (i, _) = tag(" ").parse(i)?;
-            let (i, mode) = alt((
-                value(CostModifyMode::Reduce, tag("less to activate")),
-                value(CostModifyMode::Raise, tag("more to activate")),
-            ))
-            .parse(i)?;
+            // CR 601.2f + CR 606.1: shared grammar head (also used by the transient
+            // this-turn form, which lowers to a `GenericEffect` carrying this same
+            // `ReduceAbilityCost` static) — "<activated|loyalty> abilities of
+            // <subject> cost {N|X} <less|more> to activate".
+            let (i, (keyword, subject, amount_n, is_x, mode)) =
+                super::cost_mod::parse_activated_ability_cost_head(i)?;
             // CR 208.1 + CR 113.7: optional dynamic referent for `{X}`
             // ("where X is ~'s power", Agatha).
             let (i, dynamic_count) = opt(parse_where_x_is_self_stat).parse(i)?;
@@ -3562,6 +3551,46 @@ pub(crate) fn try_parse_counts_as_named_static(text: &str) -> Option<StaticDefin
     Some(
         StaticDefinition::new(StaticMode::CountsAsNamed { name })
             .active_zones(vec![Zone::Graveyard])
+            .description(text.to_string()),
+    )
+}
+
+/// CR 122.1d + CR 101.2: "<Counter> counters can't be removed from <subject>."
+/// (Fear of Sleep Paralysis) — counter-removal prohibition. Parses the Oracle
+/// text pattern and builds a `StaticMode::CountersCantBeRemoved` static whose
+/// `affected` filter scopes the protected permanents.
+fn parse_counters_cant_be_removed_static(
+    tp: &TextPair<'_>,
+    text: &str,
+) -> Option<StaticDefinition> {
+    // Composed grammar (CR 122.1d + CR 101.2):
+    //   <counter_type> " counters can't be removed from " <subject> [.] EOF
+    // Uses nom combinators for the counter-type prefix and the fixed anchor,
+    // then parse_type_phrase for the subject (same pattern as
+    // parse_damage_not_removed_during_cleanup).
+
+    // Step 1: Parse the counter type from the start of the lowercase text.
+    let (after_counter, counter_type) = nom_primitives::parse_strict_counter_type(tp.lower).ok()?;
+
+    // Step 2: Consume the fixed anchor via nom_tag_lower.
+    let body = nom_tag_lower(
+        after_counter,
+        after_counter,
+        " counters can't be removed from ",
+    )?;
+
+    // Step 3: Parse the subject from the original-case text at the same byte
+    // offset as `body` within `tp.lower`.
+    let consumed = tp.lower.len() - body.len();
+    let subject_original = tp.original[consumed..].trim_end_matches('.').trim();
+    let (filter, remainder) = parse_type_phrase(subject_original);
+    if matches!(&filter, TargetFilter::Any) || !remainder.trim().is_empty() {
+        return None;
+    }
+
+    Some(
+        StaticDefinition::new(StaticMode::CountersCantBeRemoved { counter_type })
+            .affected(filter)
             .description(text.to_string()),
     )
 }

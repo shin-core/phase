@@ -924,8 +924,34 @@ fn parse_multi_sentence_statics(text: &str) -> Option<Vec<StaticDefinition>> {
         return None;
     }
     let mut defs = Vec::new();
+    let mut attached_scope: Option<TargetFilter> = None;
     for segment in &segments {
-        let segment_defs = parse_static_line_multi_inner(segment);
+        let mut segment_defs = parse_static_line_multi_inner(segment);
+        // CR 608.2c: In an Aura/Equipment, a continuation sentence whose subject is
+        // the pronoun "It" refers to the enchanted/equipped creature, not the
+        // Aura/Equipment object itself. Its static parses with `SelfRef` (the
+        // pronoun resolves to self at the line level, with no attachment context);
+        // rebind it to the attached scope the first sentence established (Spider-Man
+        // No More: "Enchanted creature is a Citizen ... It has defender and loses all
+        // other abilities." — the second sentence applies to the enchanted creature).
+        if let Some(scope) = &attached_scope {
+            if segment_subject_is_pronoun_it(segment) {
+                for def in &mut segment_defs {
+                    if def.affected.as_ref() == Some(&TargetFilter::SelfRef) {
+                        def.affected = Some(scope.clone());
+                    }
+                }
+            }
+        } else {
+            attached_scope = segment_defs
+                .iter()
+                .find_map(|def| {
+                    def.affected
+                        .as_ref()
+                        .filter(|f| affected_is_attached_scope(f))
+                })
+                .cloned();
+        }
         if segment_defs.is_empty() {
             // CR 602.5b + CR 602.5c: An "activate ... only once each turn" rider
             // carries no standalone static — it folds a once-per-turn use-restriction
@@ -945,6 +971,29 @@ fn parse_multi_sentence_statics(text: &str) -> Option<Vec<StaticDefinition>> {
         defs.extend(segment_defs);
     }
     Some(defs)
+}
+
+/// CR 608.2c: True iff the sentence's subject is the bare pronoun "It" — an
+/// Aura/Equipment continuation referring to the enchanted/equipped creature,
+/// distinct from a self-name (`~`) or a typed subject.
+fn segment_subject_is_pronoun_it(segment: &str) -> bool {
+    // `trim_start` normalizes leading whitespace on the pre-split sentence chunk
+    // and `to_lowercase` builds the TextPair lower half — both structural, not
+    // dispatch. The "it " subject test itself runs through nom's `tag()` via the
+    // `nom_tag_tp` bridge so the pronoun match stays on the combinator path.
+    let trimmed = segment.trim_start();
+    let lower = trimmed.to_lowercase();
+    nom_tag_tp(&TextPair::new(trimmed, &lower), "it ").is_some()
+}
+
+/// True iff a filter is scoped to an attached object — the enchanted (Aura,
+/// `EnchantedBy`) or equipped (Equipment, `EquippedBy`) creature.
+fn affected_is_attached_scope(filter: &TargetFilter) -> bool {
+    matches!(
+        filter,
+        TargetFilter::Typed(tf)
+            if tf.properties.iter().any(|p| matches!(p, FilterProp::EnchantedBy | FilterProp::EquippedBy))
+    )
 }
 
 /// CR 611.3a: Recognize a sentence whose leading connector binds it to the
@@ -1173,6 +1222,80 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
     defs
 }
 
+/// CR 611.3a + CR 702 (#5257 Rayami, First of the Fallen): "As long as an exiled
+/// <type> card [with a <counter> counter on it] has <K0>, ~ has <K0>. The same is
+/// true for <K1>, …, and <Kn>." Each listed keyword is an INDEPENDENT conditional
+/// grant — the source has keyword K as long as an exiled matching card that HAS K
+/// is present — so this emits one Continuous SelfRef static per keyword, gated on
+/// `IsPresent { filter + WithKeyword(K) }`. The shared runtime already evaluates
+/// this: `IsPresent` scans every object and `WithKeyword` reads the exiled card's
+/// keywords. Modeling it as one static with a shared condition (the prior fallback
+/// left the condition `Unrecognized`) made every keyword apply unconditionally.
+fn parse_keyword_grant_from_exiled_object_static(text: &str) -> Option<Vec<StaticDefinition>> {
+    // "As long as a[n] exiled " → the object phrase (original case for parse_type_phrase).
+    let lower = text.to_lowercase();
+    let (_, obj) = nom_on_lower(text, &lower, |i| {
+        let (i, _) = tag::<_, _, OracleError<'_>>("as long as ").parse(i)?;
+        let (i, _) = alt((tag("an "), tag("a "))).parse(i)?;
+        let (i, _) = tag("exiled ").parse(i)?;
+        Ok((i, ()))
+    })?;
+
+    // The object type phrase; the remainder begins at " has <keyword>".
+    let (base_filter, remainder) = parse_type_phrase(obj);
+    let TargetFilter::Typed(mut typed) = base_filter else {
+        return None;
+    };
+    // CR 400.1: "exiled" scopes the presence check to the exile zone.
+    typed
+        .properties
+        .push(FilterProp::InZone { zone: Zone::Exile });
+    let base = typed;
+
+    // remainder (lowercased for keyword matching): "has <K0>, ~ has <K0>. The same
+    // is true for <list>." The condition keyword and the granted keyword must match.
+    let rem = remainder.trim_start().to_lowercase();
+    let (i, _) = tag::<_, _, OracleError<'_>>("has ")
+        .parse(rem.as_str())
+        .ok()?;
+    let (i, k0_name) = crate::parser::oracle_nom::primitives::parse_keyword_name(i).ok()?;
+    let (i, _) = tag::<_, _, OracleError<'_>>(", ").parse(i).ok()?;
+    let (i, _) = alt((tag::<_, _, OracleError<'_>>("~ has "), tag("it has ")))
+        .parse(i)
+        .ok()?;
+    let (tail, k0b_name) = crate::parser::oracle_nom::primitives::parse_keyword_name(i).ok()?;
+    if k0_name != k0b_name {
+        return None;
+    }
+    let k0: Keyword = k0_name.parse().ok()?;
+
+    // tail: ". the same is true for <list>." (or "." / "" for a single keyword).
+    let tail = tail.trim_start_matches('.').trim_start();
+    let mut keywords = vec![k0];
+    if !tail.is_empty() {
+        keywords.extend(
+            super::super::oracle_effect::sequence::try_parse_same_is_true_continuation(tail)?,
+        );
+    }
+
+    let defs = keywords
+        .into_iter()
+        .map(|ki| {
+            let mut tf = base.clone();
+            tf.properties
+                .push(FilterProp::WithKeyword { value: ki.clone() });
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddKeyword { keyword: ki }])
+                .condition(StaticCondition::IsPresent {
+                    filter: Some(TargetFilter::Typed(tf)),
+                })
+                .description(text.to_string())
+        })
+        .collect();
+    Some(defs)
+}
+
 fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
     let stripped = strip_reminder_text(text);
     let lower = stripped.to_lowercase();
@@ -1209,6 +1332,16 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
     // there are 2+ segments and EVERY segment yields at least one static, which
     // restricts the path to genuine sibling-static lines and leaves trailing
     // non-static prose to the single-sentence fallback below.
+    // CR 611.3a + CR 702 (#5257 Rayami): "As long as an exiled <type> card
+    // [with a <counter> counter on it] has <K0>, ~ has <K0>. The same is true
+    // for <K1>, …" — one independent conditional keyword grant per listed
+    // keyword. Must precede generic multi-sentence splitting, which would strand
+    // the shared condition on the first keyword only (the observed bug: the grant
+    // applies unconditionally to every keyword).
+    if let Some(defs) = parse_keyword_grant_from_exiled_object_static(&stripped) {
+        return defs;
+    }
+
     if let Some(defs) = parse_multi_sentence_statics(&stripped) {
         return defs;
     }

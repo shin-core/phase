@@ -298,6 +298,15 @@ pub(crate) fn typed_filter_for_subtype(subtype: &str) -> TypedFilter {
             .push(FilterProp::HasSupertype { value: supertype });
         return filter;
     }
+    // CR 110.5a + CR 506.3: a bare battlefield descriptor ("Untapped", "Tapped",
+    // "Attacking", …) used as a whole creature descriptor names a status the
+    // creature HAS (CR 110.5a: "status is not a characteristic") or a combat role
+    // it's in (CR 506.3), not a creature subtype — resolve it to a typed FilterProp
+    // instead of fabricating a zero-match `Subtype("Untapped")` (Builder's
+    // Blessing / Castle "Untapped creatures you control get +0/+2").
+    if let Some(filter) = bare_status_creature_filter(subtype) {
+        return filter;
+    }
     if let Some(core_type) = infer_core_type_for_subtype(subtype) {
         let type_filter = match core_type {
             crate::types::card_type::CoreType::Artifact => TypeFilter::Artifact,
@@ -309,6 +318,21 @@ pub(crate) fn typed_filter_for_subtype(subtype: &str) -> TypedFilter {
     } else {
         TypedFilter::creature().subtype(subtype.to_string())
     }
+}
+
+/// CR 110.5a + CR 506.3: Recognize a bare battlefield descriptor ("untapped",
+/// "tapped", "attacking", "blocking", "transformed", "suspected") used as a whole
+/// creature descriptor and resolve it to a creature filter carrying the matching
+/// `FilterProp`. These name a permanent's status (CR 110.5, "not a characteristic"
+/// per CR 110.5a) or its combat role (CR 506.3), never a creature subtype.
+/// Reuses the `parse_combat_status_prefix`
+/// allowlist (appending a space to satisfy its prefix-boundary rule, then
+/// requiring the whole word be consumed) so "Untapped creatures you control"
+/// filters on `FilterProp::Untapped` rather than a zero-match `Subtype("Untapped")`.
+fn bare_status_creature_filter(descriptor: &str) -> Option<TypedFilter> {
+    let with_space = format!("{} ", descriptor.to_lowercase());
+    let (prop, consumed) = crate::parser::oracle_target::parse_combat_status_prefix(&with_space)?;
+    (consumed == with_space.len()).then(|| TypedFilter::creature().properties(vec![prop]))
 }
 
 /// CR 205.4a: Peel a leading supertype word off a compound "<supertype>
@@ -1522,11 +1546,37 @@ pub(crate) fn is_text_based_cost_prefix(lower_prefix: &str) -> bool {
 /// no boundary is present. Mirrors the keyword recognition in
 /// `extract_keyword_clause` but in the inverse direction (returns the
 /// pre-boundary span instead of the post-boundary one).
+/// Peel a trailing grant conjunct off a dynamic "for each <count>" clause so the
+/// count itself parses cleanly. Strips a trailing keyword grant (" and has
+/// flying") and — CR 205.1b — a trailing type-addition (" and is an Avatar in
+/// addition to its other types"). The peeled clause is recovered separately by
+/// the caller (`extract_keyword_clause` / `parse_additive_type_clause_modifications`
+/// over the full description); without this the count parse fails on the tail and
+/// the whole dynamic pump collapses to a fixed +N/+M (Avatar Destiny, Machinist's
+/// Arsenal). The type-addition arm is guarded on the "in addition to" marker so a
+/// genuine "<count> and is <...>" count phrase is never mis-truncated.
 pub(crate) fn strip_trailing_keyword_clause(clause: &str) -> &str {
     for needle in [" and gains ", " and gain ", " and has ", " and have "] {
         if let Some(pos) = clause.find(needle) {
             return &clause[..pos];
         }
+    }
+    // CR 205.1b: peel a trailing type-addition (" and is an Avatar in addition
+    // to its other types"), guarded on the "in addition to " tail so a genuine
+    // "<count> and is <...>" count phrase is never mis-truncated. Mirrors the
+    // type-addition grammar in `type_change.rs`: scan word boundaries for the
+    // "and is " verb boundary whose remainder reaches " in addition to ", and
+    // return the span preceding it. `clause` is already lowercase (caller passes
+    // `after_for_each.lower`), so tags match directly.
+    if let Some((before, _)) = nom_primitives::scan_split_at_phrase(clause, |i| {
+        (
+            tag::<_, _, OracleError<'_>>("and is "),
+            take_until::<_, _, OracleError<'_>>(" in addition to "),
+            tag::<_, _, OracleError<'_>>(" in addition to "),
+        )
+            .parse(i)
+    }) {
+        return before.trim_end();
     }
     clause
 }

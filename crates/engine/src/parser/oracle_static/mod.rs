@@ -24,11 +24,12 @@ mod prelude {
     };
     pub(super) use super::super::oracle_ir::context::ParseContext;
     pub(super) use super::super::oracle_ir::static_ir::StaticIr;
-    pub(super) use super::super::oracle_nom::bridge::nom_on_lower;
+    pub(super) use super::super::oracle_nom::bridge::{nom_on_lower, nom_parse_lower};
     pub(super) use super::super::oracle_nom::condition as nom_condition;
     pub(super) use super::super::oracle_nom::error::OracleResult;
     pub(super) use super::super::oracle_nom::filter as nom_filter;
     pub(super) use super::super::oracle_nom::primitives as nom_primitives;
+    pub(super) use super::super::oracle_nom::quantity as nom_quantity;
     pub(super) use super::super::oracle_nom::target as nom_target;
     pub(super) use super::super::oracle_quantity::{
         parse_cda_quantity, parse_event_context_quantity, parse_for_each_clause, parse_quantity_ref,
@@ -138,8 +139,9 @@ mod support {
 }
 
 pub(crate) use cost_mod::{
-    parse_alternative_keyword_cost, parse_cast_spells_alternative_cost_multi,
-    parse_collect_evidence_alt_cost, parse_spells_alternative_cost,
+    parse_activated_ability_cost_head, parse_alternative_keyword_cost,
+    parse_cast_spells_alternative_cost_multi, parse_collect_evidence_alt_cost,
+    parse_spells_alternative_cost,
 };
 pub(crate) use evasion::{
     classify_block_exception, is_extra_blockers_static_candidate, is_forced_block_static_candidate,

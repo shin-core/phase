@@ -23,13 +23,14 @@ use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, CastingPermission, ChoiceType, Chooser,
     ContinuousModification, ControllerRef, CopyRetargetPermission, CounterSourceRider, DigSource,
     Duration, Effect, EffectScope, ExcessRecipient, FaceDownBody, FaceDownProfile, FilterProp,
-    LibraryPosition, MultiTargetSpec, ObjectScope, PermissionGrantee, PlayerFilter, PtValue,
-    QuantityExpr, QuantityRef, RevealUntilDisposition, SpellStackToGraveyardReplacement,
-    StaticDefinition, TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
+    ForEachCategoryAction, LibraryPosition, MultiTargetSpec, ObjectScope, PermissionGrantee,
+    PlayerFilter, PtValue, QuantityExpr, QuantityRef, RevealUntilDisposition,
+    SpellStackToGraveyardReplacement, StaticDefinition, TargetChoiceTiming, TargetFilter,
+    TypeFilter, TypedFilter,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
-use crate::types::keywords::Keyword;
+use crate::types::keywords::{Keyword, KeywordKind};
 use crate::types::mana::ManaCost;
 use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
@@ -482,8 +483,12 @@ pub(super) fn patch_reveal_until_for_library_category_exile(def: &mut AbilityDef
                 rest_destination,
                 ..
             },
-            Effect::ForEachCategoryExile {
-                zone: Zone::Library,
+            Effect::ForEachCategory {
+                action:
+                    ForEachCategoryAction::ExileFromPool {
+                        zone: Zone::Library,
+                        ..
+                    },
                 ..
             },
         ) = (&mut *def.effect, &*sub.effect)
@@ -657,7 +662,7 @@ fn target_filter_uses_chosen_card_predicate(filter: &TargetFilter) -> bool {
     }
 }
 
-fn deepest_effect(ability: &AbilityDefinition) -> &Effect {
+pub(super) fn deepest_effect(ability: &AbilityDefinition) -> &Effect {
     let mut cursor = ability;
     while let Some(sub) = cursor.sub_ability.as_deref() {
         cursor = sub;
@@ -806,7 +811,7 @@ fn parse_exile_rest_after_dig(lower: &str) -> bool {
         .is_ok()
 }
 
-/// CR 406.3 + CR 701.16a: Recognize the "[then] exile it/them/that card/those
+/// CR 406.3 + CR 701.20e: Recognize the "[then] exile it/them/that card/those
 /// cards/the card [face down]" clause that follows a private `Dig` look step —
 /// the Gonti, Canny Acquisitor impulse idiom. Returns `Some(face_down)` when the
 /// whole clause matches (`face_down = true` only for the explicit hidden-
@@ -2245,13 +2250,29 @@ fn starts_they_continuous_clause_lower(input: &str) -> OracleResult<'_, ()> {
 /// ("creature you control", "creature an opponent controls") up to the verb.
 fn starts_target_continuous_clause_lower(s: &str) -> OracleResult<'_, ()> {
     let (rest, _) = tag("target ").parse(s)?;
-    alt((
+    // CR 601.2c: the continuous-modification verb must live in the SAME sentence
+    // as this "target <noun>" subject. Bound the verb scan to before the first
+    // sentence-ending period so a "gets/gains/has/loses" in a LATER sentence is
+    // not pulled back onto this subject. Otherwise the second target of a
+    // two-target DECLARATION — "Choose target creature you control and target
+    // creature you don't control. The creature you control gets +1/+1 ..."
+    // (Tail Swipe / Joust / Blizzard Brawl, #4751) — is mis-read as a
+    // "target <noun> gets +1/+1" continuous clause and the declaration is split,
+    // dropping the second target slot. The verb scan runs on the bounded
+    // segment but the arm still returns `rest` (standard nom discipline; the
+    // boolean caller ignores the remainder).
+    let segment = match take_until::<_, _, OracleError<'_>>(". ").parse(rest) {
+        Ok((_, seg)) => seg,
+        Err(_) => rest,
+    };
+    let _ = alt((
         value((), (take_until(" gets "), tag(" gets "))),
         value((), (take_until(" gains "), tag(" gains "))),
         value((), (take_until(" has "), tag(" has "))),
         value((), (take_until(" loses "), tag(" loses "))),
     ))
-    .parse(rest)
+    .parse(segment)?;
+    Ok((rest, ()))
 }
 
 /// CR 102.2 + CR 119.3 + CR 121.1 + CR 608.2c: a second "each opponent"/"each
@@ -3341,6 +3362,42 @@ fn set_copy_retarget_in_ability(
     patched_here || patched_sub
 }
 
+/// Membership mirror for `AntecedentRole::CopySpellBearer` (CR 707.10c) — does this
+/// def's effect TREE bear a `CopySpell` that `set_copy_retarget_in_ability` can reach?
+///
+/// A STRUCTURAL MIRROR of that mutator's descent, and it lives beside it so the two
+/// cannot drift apart: the def's own effect, through a `CreateDelayedTrigger` wrapper's
+/// inner ability, and down the `sub_ability` chain. It deliberately does NOT descend
+/// `else_ability` — the mutator does not either. A predicate WIDER than its mutator is
+/// the dangerous direction here: `LastWithRole` stops the walk at the node it binds, so
+/// claiming membership for a def the mutator cannot patch would swallow the retarget
+/// instead of reaching the real copy further back.
+///
+/// Independent of the mutator's `all` flag BY CONSTRUCTION, so one predicate mirrors
+/// both the singular ("the copy") and plural ("the copies") clause: `all` decides how
+/// MANY copies get patched, never WHETHER one is found. Every return path of
+/// `set_copy_retarget_in_ability` reduces to "a reachable `CopySpell` exists" — the
+/// `!all` early return is taken only when `patched_here` is already true.
+///
+/// Membership therefore holds exactly when the mutator would return true, which is why
+/// the binding site can `debug_assert!` the mutation lands.
+pub(super) fn def_bears_retargetable_copy(def: &AbilityDefinition) -> bool {
+    effect_bears_retargetable_copy(&def.effect)
+        || def
+            .sub_ability
+            .as_deref()
+            .is_some_and(def_bears_retargetable_copy)
+}
+
+/// The effect half of `def_bears_retargetable_copy` — mirrors `set_copy_retarget`.
+fn effect_bears_retargetable_copy(effect: &Effect) -> bool {
+    match effect {
+        Effect::CopySpell { .. } => true,
+        Effect::CreateDelayedTrigger { effect: inner, .. } => def_bears_retargetable_copy(inner),
+        _ => false,
+    }
+}
+
 pub(super) fn apply_clause_continuation(
     defs: &mut Vec<AbilityDefinition>,
     continuation: ContinuationAst,
@@ -3506,32 +3563,46 @@ pub(super) fn apply_clause_continuation(
             }
         }
         ContinuationAst::CopyMayRetarget { all_copies } => {
-            // CR 707.10c: patch the nearest preceding CopySpell — descending
-            // through a CreateDelayedTrigger wrapper ("When you next cast ...,
-            // copy that spell" — Galvanic Iteration) and through the sub-ability
-            // chain ("That player may copy this spell ..." — the Chain cycle,
-            // where the optional CopySpell is nested under the parent discard).
-            // The copy is usually the last def, but a clause that resolves
-            // between the copy and the retarget sentence (Narset's Reversal's
-            // bounce, Increasing Vengeance's conditional "copy that spell twice",
-            // Spinerock Tyrant's "those spells gain wither" rider) can sit in
-            // between — so walk the defs backward to the first ability whose
-            // effect-tree contains a CopySpell. Recognition already confirmed a
-            // preceding copy exists (parse_followup_continuation_ast), so this
-            // binds it; if somehow none is found, the loop is a no-op.
+            // CR 707.10c: bind the most recent copy-bearing ability and grant its
+            // CopySpell(s) the retarget permission. The copy is usually the last def,
+            // but a clause that resolves between the copy and the retarget sentence can
+            // sit in between (Narset's Reversal's bounce, Spinerock Tyrant's "those
+            // spells gain wither" rider) — so this is a ROLE, not `LastEmitted`.
             //
-            // `all_copies` (the plural "the copies" clause) patches every copy in
-            // that copy-bearing ability — Increasing Vengeance's primary copy and
-            // its nested conditional "copy that spell twice" copy both live in one
-            // ability — while the singular clause keeps nearest-only binding.
-            for previous in defs.iter_mut().rev() {
-                if set_copy_retarget_in_ability(
-                    previous,
+            // `CopySpellBearer` is a LIVE predicate (`def_bears_retargetable_copy`), so
+            // `LastWithRole` resolves to `(0..defs.len()).rev().find(|i|
+            // bears_copy(&defs[i]))` — the backward scan this replaces, over the same
+            // `defs` at the same moment, with the SAME tree descent (own effect →
+            // CreateDelayedTrigger wrapper → sub-ability chain). Recognition already
+            // confirmed a preceding copy exists (parse_followup_continuation_ast); if
+            // somehow none does, `OnMiss::Ignore` keeps it a silent no-op, as before.
+            //
+            // `all_copies` (the plural "the copies" clause) patches every copy in that
+            // copy-bearing ability — Increasing Vengeance's primary copy and its nested
+            // conditional "copy that spell twice" copy both live in one ability — while
+            // the singular clause keeps nearest-only binding. The flag steers the
+            // MUTATION only; it is not part of the role (see the predicate's doc).
+            let bound = env.resolve(
+                defs,
+                super::assembly::AntecedentSelector::LastWithRole(
+                    super::assembly::AntecedentRole::CopySpellBearer,
+                ),
+                None,
+                super::assembly::OnMiss::Ignore,
+            );
+            if let Some(bound_index) = bound {
+                // `CopySpellBearer` membership is the structural mirror of this
+                // mutator's own success condition (`def_bears_retargetable_copy`), so a
+                // bound node ALWAYS patches — the role and the mutator cannot disagree.
+                let patched = set_copy_retarget_in_ability(
+                    &mut defs[bound_index],
                     &CopyRetargetPermission::MayChooseNewTargets,
                     all_copies,
-                ) {
-                    break;
-                }
+                );
+                debug_assert!(
+                    patched,
+                    "CopySpellBearer membership must imply the mutator patches"
+                );
             }
         }
         ContinuationAst::SuspectLastCreated => {
@@ -3566,12 +3637,16 @@ pub(super) fn apply_clause_continuation(
             // adjacent — e.g. Kirtar's Wrath threshold has a Token creation
             // between the DestroyAll and "Creatures destroyed this way can't
             // be regenerated."
-            if let Some(def) = defs.iter_mut().rev().find(|d| {
-                matches!(
-                    &*d.effect,
-                    Effect::Destroy { .. } | Effect::DestroyAll { .. }
-                )
-            }) {
+            let bound = env.resolve(
+                defs,
+                super::assembly::AntecedentSelector::LastWithRole(
+                    super::assembly::AntecedentRole::DestroyLike,
+                ),
+                None,
+                super::assembly::OnMiss::Ignore,
+            );
+            if let Some(bound_index) = bound {
+                let def = &mut defs[bound_index];
                 match &mut *def.effect {
                     Effect::Destroy {
                         cant_regenerate, ..
@@ -3585,17 +3660,40 @@ pub(super) fn apply_clause_continuation(
                 }
             }
         }
-        ContinuationAst::ExcessDamageToController => {
-            // CR 120.4a + CR 608.2c: walk backward to the nearest DealDamage and
-            // attach the excess-redirect rider. The clause may not be adjacent to
-            // the DealDamage effect, mirroring the CantRegenerate walk above.
-            if let Some(def) = defs
-                .iter_mut()
-                .rev()
-                .find(|d| matches!(&*d.effect, Effect::DealDamage { .. }))
-            {
-                if let Effect::DealDamage { excess, .. } = &mut *def.effect {
-                    *excess = Some(ExcessRecipient::TargetController);
+        ContinuationAst::ExcessDamageToController {
+            source_keyword_condition,
+        } => {
+            // CR 120.4a + CR 608.2c: bind the nearest DealDamage and attach the
+            // excess-redirect rider. The clause may not be adjacent to the DealDamage
+            // effect, mirroring the CantRegenerate walk above — so this is a role, not
+            // `LastEmitted`.
+            //
+            // `DamageDealer` is a LIVE predicate (`def_is_damage_dealer`), so
+            // `LastWithRole` resolves to `(0..defs.len()).rev().find(|i|
+            // is_damage_dealer(&defs[i]))` — the scan this replaces, over the same
+            // `defs` at the same moment.
+            let bound = env.resolve(
+                defs,
+                super::assembly::AntecedentSelector::LastWithRole(
+                    super::assembly::AntecedentRole::DamageDealer,
+                ),
+                None,
+                super::assembly::OnMiss::Ignore,
+            );
+            if let Some(bound_index) = bound {
+                let def = &mut defs[bound_index];
+                // CR 608.2c: `def` itself may be the `TargetOnly` head of a
+                // Ram Through-class "Target creature you control deals
+                // damage..." clause, with `DealDamage` nested as its
+                // `sub_ability` — unwrap the same way `def_is_damage_dealer`
+                // detected membership.
+                match super::damage_dealer_effect_mut(def) {
+                    Effect::DealDamage { excess, .. } => {
+                        *excess = Some(ExcessRecipient::TargetController {
+                            source_keyword: source_keyword_condition,
+                        });
+                    }
+                    _ => unreachable!(),
                 }
             }
         }
@@ -3615,14 +3713,18 @@ pub(super) fn apply_clause_continuation(
             // clause, `defs.last()` is the intervening clause. Search back for
             // the nearest rest-patchable def (`Dig`/`RevealUntil` — what
             // `patch_rest_destination_recursively` handles).
-            let Some(previous) = defs
-                .iter_mut()
-                .rev()
-                .find(|d| matches!(&*d.effect, Effect::Dig { .. } | Effect::RevealUntil { .. }))
-            else {
+            let bound = env.resolve(
+                defs,
+                super::assembly::AntecedentSelector::LastWithRole(
+                    super::assembly::AntecedentRole::DigOrRevealUntil,
+                ),
+                None,
+                super::assembly::OnMiss::Ignore,
+            );
+            let Some(bound_index) = bound else {
                 return;
             };
-            patch_rest_destination_recursively(previous, destination, reorder_all);
+            patch_rest_destination_recursively(&mut defs[bound_index], destination, reorder_all);
         }
         ContinuationAst::DigFromAmong {
             quantity,
@@ -3761,13 +3863,24 @@ pub(super) fn apply_clause_continuation(
                 }
             }
 
-            let Some(previous) = defs
-                .iter_mut()
-                .rev()
-                .find(|d| matches!(&*d.effect, Effect::Dig { .. } | Effect::Mill { .. }))
-            else {
+            // U6-C3 (corrected): CONSUME the anchor bound by role above. This used to
+            // re-derive it with a raw backward scan, which made the role binding
+            // output-inert on every path except the intervening-sacrifice one — the
+            // only path that consumed `dig_pos` before returning. A probe that forced
+            // `dig_pos` wrong therefore could not change the export: this fallthrough
+            // silently recomputed the right answer. That is why the old "427 binds"
+            // figure measured CALL-SITE REACHABILITY rather than output divergence.
+            //
+            // Equivalent by construction, not by inspection: `DigOrMill` is now a LIVE
+            // predicate (`def_is_dig_or_mill`), so `LastWithRole(DigOrMill)` resolves
+            // to `(0..defs.len()).rev().find(|i| is_dig_or_mill(&defs[i]))` — which is
+            // this scan, evaluated over the same `defs` at the same moment. Nothing
+            // between the bind and here mutates `defs`: every mutation in the branch
+            // above is inside the `sac_pos` arm, which returns.
+            let Some(dig_pos) = dig_pos else {
                 return;
             };
+            let previous = &mut defs[dig_pos];
             if let Effect::Dig {
                 keep_count,
                 keep_count_expr,
@@ -3931,7 +4044,18 @@ pub(super) fn apply_clause_continuation(
             // `face_down_profile` (set by the "... face down ..." put-clause) and
             // overwrite it with the specified profile. Mirror the DigFromAmong /
             // PutRest backward-walk idiom.
-            for def in defs.iter_mut().rev() {
+            // U6-C2b: bind the profile-holder by ROLE. "Already carries a profile"
+            // is the binding condition itself — a node without one is not this
+            // antecedent at all — so it lives in the registry, not in a guard.
+            let bound = env.resolve(
+                defs,
+                super::assembly::AntecedentSelector::LastWithRole(
+                    super::assembly::AntecedentRole::FaceDownProfileHolder,
+                ),
+                None,
+                super::assembly::OnMiss::Ignore,
+            );
+            for def in bound.map(|i| &mut defs[i]).into_iter() {
                 match &mut *def.effect {
                     Effect::ChangeZoneAll {
                         face_down_profile: fdp @ Some(_),
@@ -4326,7 +4450,7 @@ pub(super) fn apply_clause_continuation(
                 *rest_destination = destination;
             }
         }
-        // CR 406.3 + CR 701.16a: Rewrite the preceding private `Dig` (the
+        // CR 406.3 + CR 701.20e: Rewrite the preceding private `Dig` (the
         // "look at the top N cards of <player>'s library" look step) into an
         // `Effect::ExileTop` so the looked-at card(s) actually leave the
         // library — the Gonti, Canny Acquisitor impulse idiom. `player`/`count`
@@ -4340,14 +4464,22 @@ pub(super) fn apply_clause_continuation(
             count,
             face_down,
         } => {
-            let Some(previous) = defs
-                .iter_mut()
-                .rev()
-                .find(|d| matches!(&*d.effect, Effect::Dig { .. }))
-            else {
+            // `DigLook` is a LIVE predicate (`def_is_dig_look`) — it MUST be, and this
+            // is the site that forces it: the rewrite below replaces the bound def's
+            // effect IN PLACE, turning a `Dig` into an `ExileTop` with no change to
+            // `defs.len()`. `observe`/`refresh` only run where the length changes, so a
+            // cached registry would go on naming a def that is no longer a `Dig`.
+            let Some(bound_index) = env.resolve(
+                defs,
+                super::assembly::AntecedentSelector::LastWithRole(
+                    super::assembly::AntecedentRole::DigLook,
+                ),
+                None,
+                super::assembly::OnMiss::Ignore,
+            ) else {
                 return;
             };
-            *previous.effect = Effect::ExileTop {
+            *defs[bound_index].effect = Effect::ExileTop {
                 player,
                 count,
                 face_down,
@@ -4365,23 +4497,33 @@ pub(super) fn apply_clause_continuation(
         // a keep_count:0 pure-peek and a sibling `ChangeZone { ParentTarget }`
         // exiled the trigger source itself (#1146).
         ContinuationAst::ExileOneOfThemFaceDown => {
-            let Some(previous) = defs
-                .iter_mut()
-                .rev()
-                .find(|d| matches!(&*d.effect, Effect::Dig { .. }))
-            else {
+            // Same `DigLook` antecedent as `ExileLookedAtCard` above — the two scans
+            // this replaces had byte-identical predicates, so they name ONE role, not
+            // two. LIVE, not cached: `append_conceal_sub_ability` nests a `sub_ability`
+            // in place, which preserves `defs.len()` and so is invisible to `refresh`.
+            let Some(bound_index) = env.resolve(
+                defs,
+                super::assembly::AntecedentSelector::LastWithRole(
+                    super::assembly::AntecedentRole::DigLook,
+                ),
+                None,
+                super::assembly::OnMiss::Ignore,
+            ) else {
                 return;
             };
-            if let Effect::Dig {
-                keep_count,
-                up_to,
-                destination,
-                ..
-            } = &mut *previous.effect
-            {
-                *keep_count = Some(1);
-                *up_to = false;
-                *destination = Some(Zone::Exile);
+            let previous = &mut defs[bound_index];
+            match &mut *previous.effect {
+                Effect::Dig {
+                    keep_count,
+                    up_to,
+                    destination,
+                    ..
+                } => {
+                    *keep_count = Some(1);
+                    *up_to = false;
+                    *destination = Some(Zone::Exile);
+                }
+                _ => unreachable!(),
             }
             // CR 608.2c: chain the conceal continuation onto the Dig. The
             // `DigChoice` resolution binds the chosen (exiled) card onto this
@@ -4517,7 +4659,7 @@ pub(super) fn continuation_absorbs_current(
         ContinuationAst::CantRegenerate => true,
         // CR 120.4a: recognition was gated on a preceding DealDamage, so the
         // rider is always absorbed into that effect (never a standalone effect).
-        ContinuationAst::ExcessDamageToController => true,
+        ContinuationAst::ExcessDamageToController { .. } => true,
         ContinuationAst::PutRest { .. } => true,
         ContinuationAst::ChooseFromExile { .. } => true,
         ContinuationAst::SearchRevealResult => true,
@@ -5567,7 +5709,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
         | Effect::RememberCard { .. }
-        | Effect::ForEachCategoryExile { .. }
+        | Effect::ForEachCategory { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::EachPlayerCopyChosen { .. }
@@ -5788,6 +5930,34 @@ pub(crate) fn is_moved_object_put_onto_battlefield_counters_clause(sentence: &st
         return false;
     };
     nom_primitives::scan_contains(body, "counter")
+}
+
+/// CR 120.4a + CR 608.2c + CR 702: Parse an excess-damage redirect rider,
+/// with an optional source-keyword condition such as Ram Through's "If the
+/// creature you control has trample" prefix. The body remains the same
+/// CR 120.4a redirect; only the source-keyword gate is optional.
+fn parse_excess_damage_to_controller_rider(input: &str) -> OracleResult<'_, Option<KeywordKind>> {
+    /// CR 608.2c + CR 702: Parse the source-referential keyword gate.
+    fn parse_source_keyword_condition(input: &str) -> OracleResult<'_, KeywordKind> {
+        // This is not parse_inner_condition: Ram Through's definite phrase
+        // refers to the damage source target selected by the preceding sentence,
+        // not to any matching creature on the battlefield.
+        let (input, _) = tag("if ").parse(input)?;
+        let (input, _) = tag("the creature you control has ").parse(input)?;
+        let (input, keyword_name) = parse_keyword_name(input)?;
+        let keyword: Keyword = keyword_name
+            .parse()
+            .map_err(|_| nom::Err::Error(OracleError::new(input, nom::error::ErrorKind::Fail)))?;
+        let (input, _) = tag(", ").parse(input)?;
+        Ok((input, keyword.kind()))
+    }
+
+    let (input, source_keyword_condition) = opt(parse_source_keyword_condition).parse(input)?;
+    let (input, _) =
+        tag("excess damage is dealt to that creature's controller instead").parse(input)?;
+    let (input, _) = opt(tag(".")).parse(input)?;
+    let (input, _) = eof(input)?;
+    Ok((input, source_keyword_condition))
 }
 
 pub(super) fn parse_followup_continuation_ast(
@@ -6035,12 +6205,12 @@ pub(super) fn parse_followup_continuation_ast(
                 reorder_all: false,
             })
         }
-        // CR 406.3 + CR 701.16a: "[then] exile it/them [face down]" after a
+        // CR 406.3 + CR 701.20e: "[then] exile it/them [face down]" after a
         // private `Dig` (the "look at the top N cards of <player>'s library"
         // look step). This is the Gonti, Canny Acquisitor impulse idiom —
         // "look at the top card of that player's library, then exile it face
         // down. You may play that card ...". Plain `Dig` only inspects the top
-        // cards (CR 701.16a); without a destination they stay in the library,
+        // cards (CR 701.20e); without a destination they stay in the library,
         // so the exile clause must rewrite the `Dig` into an `Effect::ExileTop`
         // (the face-down impulse-exile primitive shared with Cunning Rhetoric /
         // Bomat Courier) for the looked-at card to actually leave the library.
@@ -6288,21 +6458,16 @@ pub(super) fn parse_followup_continuation_ast(
         {
             Some(ContinuationAst::CantRegenerate)
         }
-        // CR 120.4a: "Excess damage is dealt to that creature's controller
-        // instead." — trailing rider on a `DealDamage` (Flame Spill, Gandalf's
-        // Sanction, Ravenous Tyrannosaurus). The two negative guards defer the
-        // conditional / trample-gated form (Ram Through: "If the creature you
-        // control has trample, excess ...") to `Effect::Unimplemented` — that
-        // form requires a controlled-source trample check we do not model here.
-        Effect::DealDamage { .. }
-            if nom_primitives::scan_contains(&lower, "excess damage")
-                && nom_primitives::scan_contains(&lower, "that creature's controller")
-                && nom_primitives::scan_contains(&lower, "instead")
-                && !nom_primitives::scan_contains(&lower, "has trample")
-                && !nom_primitives::scan_contains(&lower, "if ") =>
-        {
-            Some(ContinuationAst::ExcessDamageToController)
-        }
+        // CR 120.4a + CR 608.2c + CR 702: excess-damage redirect rider on a
+        // `DealDamage` (Flame Spill, Gandalf's Sanction, Ravenous Tyrannosaurus),
+        // optionally source-keyword-gated (Ram Through's "If the creature you
+        // control has trample" prefix). The combinator owns the full rider shape
+        // so unrelated "if" clauses or partial excess-damage fragments fail closed.
+        Effect::DealDamage { .. } => parse_excess_damage_to_controller_rider(&lower)
+            .ok()
+            .map(|(_, source_keyword_condition)| ContinuationAst::ExcessDamageToController {
+                source_keyword_condition,
+            }),
         Effect::ChooseFromZone { .. } if parse_put_rest_on_bottom_line(&lower).is_ok() => {
             Some(ContinuationAst::PutChoiceRemainderOnBottom)
         }
@@ -6317,7 +6482,7 @@ pub(super) fn parse_followup_continuation_ast(
                 parse_put_chosen_cards_at_library_position(&lower)
                     .map(|position| ContinuationAst::PutChosenCardsAtLibraryPosition { position })
             }),
-        // CR 700.2: "Choose/You choose/An opponent chooses/Target opponent chooses one/two/N
+        // CR 608.2d: "Choose/You choose/An opponent chooses/Target opponent chooses one/two/N
         // of them/those" after ChangeZone, ExileTop, RevealTop, or RevealHand →
         // ChooseFromZone building block
         Effect::ChangeZone { .. }
@@ -6382,7 +6547,7 @@ pub(super) fn parse_followup_continuation_ast(
         // explicit "put it onto the battlefield" chunk in the same sentence is
         // a paraphrase and must be absorbed to avoid a duplicate ChangeZone.
         //
-        // CR 701.23i + CR 609.3: Iterated-search variants (Winds of Abandon class)
+        // CR 701.23i + CR 608.2c: Iterated-search variants (Winds of Abandon class)
         // surface a plural subject ("those players put those cards onto the
         // battlefield tapped") because the search step has `repeat_for:
         // TrackedSetSize`. The compound has already been folded by the
@@ -7512,8 +7677,7 @@ mod tests {
         // Field-Tested Frying Pan (#835): "create a 1/1 white Halfling creature
         // token and attach this Equipment to it" — "attach " is an imperative game
         // action, so the conjunct must peel into its own clause and lower to a
-        // Token -> Attach sibling (rewire_token_attach_sibling rebinds onto
-        // LastCreated). Without the split the attach is silently dropped.
+        // Token -> Attach sibling. Without the split the attach is silently dropped.
         let chunks = clause_texts(
             "create a 1/1 white Halfling creature token and attach this Equipment to it",
         );
@@ -9090,6 +9254,166 @@ mod tests {
         assert!(*up_to);
         assert_eq!(*destination, Some(Zone::Hand));
         assert_eq!(*rest_destination, Some(Zone::Library));
+    }
+
+    // ---- U20: the walk-back's ONLY witnesses -------------------------------
+    //
+    // `DamageDealer` and `DigLook` bind the nearest def OF THEIR ROLE, walking
+    // PAST an intervening def that is not a member. That walk-back is the entire
+    // reason they are roles and not `AntecedentSelector::LastEmitted`.
+    //
+    // The card pool cannot prove it. All 19 fires across the full pool (4 + 11 + 4,
+    // measured) land at depth 0 with exactly one candidate, so `LastEmitted` would
+    // be output-identical on every printed card TODAY. That makes the walk-back a
+    // capability with no witness — and the first card to print an intervening
+    // clause between the anchor and its rider would be its first-ever exercise, in
+    // production, silently. These tests are that witness, synthetically: each
+    // asserts the binding lands on index 0, which is the answer `LastEmitted` gets
+    // WRONG. If someone later "simplifies" either role to `LastEmitted`, these go
+    // red instead of a card going quietly wrong.
+
+    /// The intervening def a lookback must see straight past: not a `DealDamage`,
+    /// not a `Dig`, so a member of NEITHER role.
+    fn non_member_def() -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Shuffle {
+                target: TargetFilter::Controller,
+            },
+        )
+    }
+
+    fn env_for(defs: &[AbilityDefinition]) -> crate::parser::oracle_effect::assembly::AssemblyEnv {
+        let mut env = crate::parser::oracle_effect::assembly::AssemblyEnv::default();
+        env.observe(
+            defs,
+            None,
+            crate::parser::oracle_effect::assembly::NodeRole::Primary,
+        );
+        env
+    }
+
+    /// CR 120.4a: the excess rider binds the `DealDamage`, not whatever happens to
+    /// be the last def emitted.
+    #[test]
+    fn excess_damage_rider_binds_the_damage_dealer_past_an_intervening_def() {
+        let mut defs = vec![
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 3 },
+                    target: TargetFilter::Any,
+                    damage_source: None,
+                    excess: None,
+                },
+            ),
+            non_member_def(),
+        ];
+        let env = env_for(&defs);
+        apply_clause_continuation(
+            &mut defs,
+            ContinuationAst::ExcessDamageToController {
+                source_keyword_condition: None,
+            },
+            AbilityKind::Spell,
+            &env,
+        );
+
+        let Effect::DealDamage { excess, .. } = &*defs[0].effect else {
+            panic!("expected DealDamage at index 0, got {:?}", defs[0].effect);
+        };
+        assert_eq!(
+            *excess,
+            Some(ExcessRecipient::TargetController {
+                source_keyword: None
+            }),
+            "the rider must walk back to the DealDamage at index 0 — `LastEmitted` \
+             would have bound the intervening def at index 1"
+        );
+        assert!(
+            matches!(&*defs[1].effect, Effect::Shuffle { .. }),
+            "the intervening def must be left untouched, got {:?}",
+            defs[1].effect
+        );
+    }
+
+    /// CR 702.75a: Hideaway's "exile one of them face down" binds the `Dig`, not
+    /// the last def emitted. Exercises `DigLook` through its FIRST consumer.
+    #[test]
+    fn exile_one_of_them_face_down_binds_the_dig_past_an_intervening_def() {
+        let mut defs = vec![
+            AbilityDefinition::new(AbilityKind::Spell, make_dig_effect()),
+            non_member_def(),
+        ];
+        let env = env_for(&defs);
+        apply_clause_continuation(
+            &mut defs,
+            ContinuationAst::ExileOneOfThemFaceDown,
+            AbilityKind::Spell,
+            &env,
+        );
+
+        let Effect::Dig {
+            keep_count,
+            up_to,
+            destination,
+            ..
+        } = &*defs[0].effect
+        else {
+            panic!("expected patched Dig at index 0, got {:?}", defs[0].effect);
+        };
+        assert_eq!(*keep_count, Some(1));
+        assert!(!*up_to);
+        assert_eq!(
+            *destination,
+            Some(Zone::Exile),
+            "the Hideaway patch must walk back to the Dig at index 0 — `LastEmitted` \
+             would have bound the intervening def at index 1"
+        );
+        assert!(
+            defs[0].sub_ability.is_some(),
+            "the conceal sub-ability must be chained onto the bound Dig"
+        );
+        assert!(
+            matches!(&*defs[1].effect, Effect::Shuffle { .. }),
+            "the intervening def must be left untouched, got {:?}",
+            defs[1].effect
+        );
+    }
+
+    /// CR 406.3 + CR 701.20e: the Gonti impulse rewrite binds the same `Dig`.
+    /// Exercises `DigLook` through its SECOND consumer — the two continuations
+    /// share ONE role because their scan predicates were byte-identical, and this
+    /// is what makes that shared binding empirical rather than asserted.
+    #[test]
+    fn exile_looked_at_card_binds_the_dig_past_an_intervening_def() {
+        let mut defs = vec![
+            AbilityDefinition::new(AbilityKind::Spell, make_dig_effect()),
+            non_member_def(),
+        ];
+        let env = env_for(&defs);
+        apply_clause_continuation(
+            &mut defs,
+            ContinuationAst::ExileLookedAtCard {
+                player: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 1 },
+                face_down: true,
+            },
+            AbilityKind::Spell,
+            &env,
+        );
+
+        assert!(
+            matches!(&*defs[0].effect, Effect::ExileTop { .. }),
+            "the Dig at index 0 must be rewritten into an ExileTop — `LastEmitted` \
+             would have bound the intervening def at index 1; got {:?}",
+            defs[0].effect
+        );
+        assert!(
+            matches!(&*defs[1].effect, Effect::Shuffle { .. }),
+            "the intervening def must be left untouched, got {:?}",
+            defs[1].effect
+        );
     }
 
     #[test]

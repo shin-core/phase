@@ -276,12 +276,13 @@ pub(crate) enum ContinuationAst {
     /// CR 701.19c: "It can't be regenerated" / "They can't be regenerated" — sets
     /// `cant_regenerate: true` on the preceding Destroy/DestroyAll effect.
     CantRegenerate,
-    /// CR 120.4a: "Excess damage is dealt to that creature's controller instead."
-    /// — sets `excess = Some(ExcessRecipient::TargetController)` on the preceding
-    /// `Effect::DealDamage` (Flame Spill, Gandalf's Sanction, Ravenous
-    /// Tyrannosaurus). The conditional / trample-gated form (Ram Through) is NOT
-    /// recognized and lowers to `Effect::Unimplemented` instead.
-    ExcessDamageToController,
+    /// CR 120.4a + CR 608.2c + CR 702: "Excess damage is dealt to that
+    /// creature's controller instead" patches the preceding `DealDamage`; an
+    /// optional source-keyword gate covers Ram Through's "If the creature you
+    /// control has trample" prefix without making the damage itself conditional.
+    ExcessDamageToController {
+        source_keyword_condition: Option<crate::types::keywords::KeywordKind>,
+    },
     /// "Choose one/N of them" / "An opponent chooses one/N of those cards" after a ChangeZone
     /// to exile → ChooseFromZone { count, zone: Exile, chooser }.
     ChooseFromExile {
@@ -424,7 +425,7 @@ pub(crate) enum ContinuationAst {
     /// and Destroy the Evidence where "those cards" refers to all cards revealed
     /// during the RevealUntil resolution, not only the non-matching ones.
     RevealUntilAllToZone { destination: Zone },
-    /// CR 406.3 + CR 701.16a: "[then] exile it/them [face down]" after a private
+    /// CR 406.3 + CR 701.20e: "[then] exile it/them [face down]" after a private
     /// `Dig` (the "look at the top N cards of <player>'s library" look step).
     /// Rewrites the preceding `Dig` into an `Effect::ExileTop` so the looked-at
     /// card(s) actually leave the library — the Gonti, Canny Acquisitor impulse
@@ -888,7 +889,7 @@ pub(crate) enum TargetedImperativeAst {
     },
     Sacrifice {
         target: TargetFilter,
-        /// CR 701.16a: Number of permanents to sacrifice. Defaults to
+        /// CR 701.21a: Number of permanents to sacrifice. Defaults to
         /// `QuantityExpr::Fixed { value: 1 }` for the common "sacrifice a X"
         /// case; "sacrifice N X" / "sacrifice half the permanents they
         /// control" carry the parsed dynamic count.
@@ -1072,7 +1073,7 @@ pub(crate) enum SearchCreationImperativeAst {
     },
     Dig {
         count: QuantityExpr,
-        /// CR 701.20a vs CR 701.16a: True = revealed (public), false = looked at (private).
+        /// CR 701.20a vs CR 701.20e: True = revealed (public), false = looked at (private).
         reveal: bool,
         player: TargetFilter,
     },
@@ -1342,6 +1343,15 @@ pub(crate) enum PutImperativeAst {
         /// the rest zone. `None` for non-partition forms.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rest_destination: Option<Zone>,
+        /// CR 401.4: Library placement for the "rest" pile when the complement
+        /// returns to the library ("… and the rest on the bottom of your
+        /// library in a random order" — The Fourteenth Doctor — or "… in any
+        /// order" — Garruk, Caller of Beasts / Goblin Ringleader et al.).
+        /// Independent of `library_position` (which governs the PRIMARY move)
+        /// because the two piles may target different positions. `None` when the
+        /// rest does not go to a specific library position.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest_library_position: Option<LibraryPosition>,
     },
     TopOfLibrary,
     BottomOfLibrary,
@@ -1488,6 +1498,13 @@ pub(crate) enum ZoneCounterImperativeAst {
         /// ("exile a card … with N <type> counters on it"). Empty for the
         /// common no-counter case. Mirrors `Effect::ChangeZone.enter_with_counters`.
         enter_with_counters: Vec<(CounterType, QuantityExpr)>,
+        /// CR 700.4 (#5649): a counted graveyard exile — "exile <N> cards from
+        /// your graveyard" (Nefarious Lich: "exile that many cards … instead").
+        /// `Effect::ChangeZone` carries no count, so the quantity rides the
+        /// clause's `MultiTargetSpec` (mirroring Forage), threaded at lowering by
+        /// `lower_imperative_family_ast`. `None` for the ordinary single-object
+        /// exile.
+        multi_target: Option<MultiTargetSpec>,
     },
     ExileTop {
         player: TargetFilter,

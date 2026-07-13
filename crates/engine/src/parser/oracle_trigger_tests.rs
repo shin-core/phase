@@ -2578,7 +2578,7 @@ fn zurgo_and_ojutai_one_or_more_player_or_battle_trigger() {
     }
 }
 
-/// CR 406.3 + CR 701.16a + CR 400.7i: Gonti, Canny Acquisitor. "look at the
+/// CR 406.3 + CR 701.20e + CR 400.7i: Gonti, Canny Acquisitor. "look at the
 /// top card of that player's library, then exile it face down" must rewrite
 /// the private `Dig` look step into a face-down `ExileTop` (issue #1316: the
 /// card was looked at but never left the library), and the follow-on "You may
@@ -4591,7 +4591,8 @@ fn parse_ezio_damage_trigger_full_structure() {
     // Outer execute is the "you may pay {WUBRG}" cost.
     let execute = def.execute.as_ref().expect("execute must be Some");
 
-    // (c) Optional flag — the "you may" prefix on the cost (CR 609.3).
+    // (c) Optional flag — the "you may" prefix on the cost (CR 603.5: a triggered
+    // ability's "may" effect is optional; the choice is made when it resolves).
     assert!(
         execute.optional,
         "execute.optional must be true (the 'you may pay' wording)",
@@ -4712,7 +4713,8 @@ fn parse_ezio_damage_trigger_verbatim_oracle_text() {
 
     let execute = def.execute.as_ref().expect("execute must be Some");
 
-    // (b) Optional flag — the "you may pay" wording (CR 609.3).
+    // (b) Optional flag — the "you may pay" wording (CR 603.5: a triggered
+    // ability's "may" effect is optional; the choice is made when it resolves).
     assert!(
         execute.optional,
         "execute.optional must be true (the 'you may pay' wording)",
@@ -12119,7 +12121,12 @@ fn trigger_planeswalk_away_from_mode() {
         "Whenever you planeswalk away from Test Plane, draw a card.",
         "Test Plane",
     );
-    assert_eq!(def.mode, TriggerMode::PlaneswalkedFrom);
+    assert_eq!(
+        def.mode,
+        TriggerMode::Planeswalked {
+            role: PlaneswalkRole::From
+        }
+    );
     assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
     assert_eq!(def.valid_target, Some(TargetFilter::Controller));
 }
@@ -12131,7 +12138,12 @@ fn trigger_planeswalk_to_mode() {
         "Whenever you planeswalk to Test Plane, draw a card.",
         "Test Plane",
     );
-    assert_eq!(def.mode, TriggerMode::PlaneswalkedTo);
+    assert_eq!(
+        def.mode,
+        TriggerMode::Planeswalked {
+            role: PlaneswalkRole::To
+        }
+    );
     assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
     assert_eq!(def.valid_target, Some(TargetFilter::Controller));
 }
@@ -12144,7 +12156,12 @@ fn trigger_encounter_maps_to_planeswalked_to() {
         "When you encounter Test Phenomenon, draw a card.",
         "Test Phenomenon",
     );
-    assert_eq!(def.mode, TriggerMode::PlaneswalkedTo);
+    assert_eq!(
+        def.mode,
+        TriggerMode::Planeswalked {
+            role: PlaneswalkRole::To
+        }
+    );
     assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
 }
 
@@ -12184,7 +12201,12 @@ fn caught_in_a_parallel_universe_per_player_left_neighbor_choose_is_deferred_gap
         "Caught in a Parallel Universe",
     );
     // CR 312.5: the encounter maps to the face-up (planeswalked-to) endpoint.
-    assert_eq!(def.mode, TriggerMode::PlaneswalkedTo);
+    assert_eq!(
+        def.mode,
+        TriggerMode::Planeswalked {
+            role: PlaneswalkRole::To
+        }
+    );
     let execute = def
         .execute
         .as_deref()
@@ -12219,7 +12241,12 @@ fn fixed_point_in_time_full_trigger_parses_replacement_with_duration() {
     let trigger = parsed
         .triggers
         .iter()
-        .find(|trigger| trigger.mode == TriggerMode::PlaneswalkedTo)
+        .find(|trigger| {
+            trigger.mode
+                == TriggerMode::Planeswalked {
+                    role: PlaneswalkRole::To,
+                }
+        })
         .expect("Fixed Point in Time encounter trigger must parse");
 
     assert_eq!(trigger.valid_card, Some(TargetFilter::SelfRef));
@@ -12244,8 +12271,8 @@ fn fixed_point_in_time_full_trigger_parses_replacement_with_duration() {
 #[test]
 fn trigger_arrival_phrase_axis_all_map_to_planeswalked_to() {
     // CR 312.5 / CR 701.31d: every arrival/encounter phrasing in the class
-    // maps to PlaneswalkedTo with the controller target filter — including
-    // the "here" and literal "this plane"/"this phenomenon" forms that do
+    // maps to Planeswalked { role: To } with the controller target filter —
+    // including the "here" and literal "this plane"/"this phenomenon" forms that do
     // NOT normalize to ~ (so they exercise the literal arms of the axis).
     for (oracle, name) in [
         // "planeswalk here" — Ghirapur Grand Prix's arrival trigger.
@@ -12268,8 +12295,10 @@ fn trigger_arrival_phrase_axis_all_map_to_planeswalked_to() {
         let def = parse_trigger_line(oracle, name);
         assert_eq!(
             def.mode,
-            TriggerMode::PlaneswalkedTo,
-            "`{oracle}` should map to PlaneswalkedTo",
+            TriggerMode::Planeswalked {
+                role: PlaneswalkRole::To
+            },
+            "`{oracle}` should map to Planeswalked {{ role: To }}",
         );
         assert_eq!(
             def.valid_card,
@@ -23453,5 +23482,170 @@ fn dance_of_the_dead_etb_lowers_to_reanimator_chain_tapped_4767() {
         DANCE_OF_THE_DEAD_ORACLE,
         "Dance of the Dead",
         /* expect_tapped */ true,
+    );
+}
+
+/// #5253 (Railway Brawler): "Whenever another creature you control enters, put
+/// X +1/+1 counters on it, where X is its power." The "its" in the count clause
+/// is the ENTERING creature (the counter recipient), not the ability carrier.
+/// The `parse_self_power_ref` combinator lowers "its power" to
+/// `Power { scope: Source }` (carrier), so an enters-trigger lift remaps the
+/// count to `EventSource` when the counter target is itself the event object.
+/// Reverting the lift leaves `scope: Source` — the count would read Railway
+/// Brawler's power instead of the entering creature's (the #5253 bug).
+#[test]
+fn railway_brawler_counter_count_reads_entering_creature_power() {
+    let parsed = parse_oracle_text(
+        "Reach, trample\n\
+         Whenever another creature you control enters, put X +1/+1 counters on it, \
+         where X is its power.",
+        "Railway Brawler",
+        &[],
+        &["Creature".to_string()],
+        &["Dinosaur".to_string()],
+    );
+
+    // Positive reach-guard: nothing lowered to Unimplemented.
+    assert!(
+        !parsed.triggers.iter().any(|t| {
+            t.execute
+                .as_ref()
+                .is_some_and(|e| matches!(&*e.effect, Effect::Unimplemented { .. }))
+        }),
+        "Railway Brawler trigger must not produce Unimplemented: {parsed:#?}"
+    );
+
+    let put = parsed
+        .triggers
+        .iter()
+        .find_map(|t| match t.execute.as_deref()?.effect.as_ref() {
+            Effect::PutCounter {
+                count,
+                target,
+                counter_type,
+            } => Some((count.clone(), target.clone(), counter_type.clone())),
+            _ => None,
+        })
+        .expect("Railway Brawler enters trigger must lower to PutCounter");
+
+    assert_eq!(put.2, CounterType::Plus1Plus1);
+    // "on it" — the entering creature.
+    assert_eq!(put.1, TargetFilter::TriggeringSource);
+    // "where X is its power" — the entering creature's power, i.e. the event
+    // object (EventSource), NOT the ability carrier (Source).
+    assert_eq!(
+        put.0,
+        QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: ObjectScope::EventSource,
+            },
+        },
+        "count must read the ENTERING creature's power (EventSource), not the carrier"
+    );
+}
+
+/// Negative reach-guard for the #5253 lift: a genuine self-power counter read —
+/// "Whenever ~ attacks, put a number of +1/+1 counters on ~ equal to its power"
+/// — must KEEP `scope: Source`. The lift only fires on a single-object
+/// zone-change trigger whose counter target is the event object; an attacks
+/// trigger putting counters on the source (`SelfRef`) is untouched, so the
+/// carrier's own power is preserved.
+#[test]
+fn self_power_counter_on_source_keeps_source_scope() {
+    let parsed = parse_oracle_text(
+        "Whenever this creature attacks, put a number of +1/+1 counters on it \
+         equal to its power.",
+        "Test Attacker",
+        &[],
+        &["Creature".to_string()],
+        &["Beast".to_string()],
+    );
+
+    let count = parsed
+        .triggers
+        .iter()
+        .find_map(|t| match t.execute.as_deref()?.effect.as_ref() {
+            Effect::PutCounter { count, .. } => Some(count.clone()),
+            _ => None,
+        });
+
+    // Whether or not this exact phrasing fully parses, if it DOES produce a
+    // PutCounter with a per-object power ref, that ref must stay Source-scoped
+    // (an attacks trigger is not a zone-change trigger, so the lift is inert).
+    if let Some(QuantityExpr::Ref {
+        qty: QuantityRef::Power { scope },
+    }) = count
+    {
+        assert_eq!(
+            scope,
+            ObjectScope::Source,
+            "an attacks-trigger self-power counter must not be remapped to EventSource"
+        );
+    }
+}
+
+/// #5576 (Saruman of Many Colors): the same-chain "exile target … card …
+/// **Copy the exiled card**" reference must bind the copy to
+/// `TargetFilter::ExiledBySource`, not the chain-local `TrackedSet(0)`
+/// sentinel. A plain-targeted `ChangeZone{Exile}` never publishes a tracked
+/// set, so `TrackedSet(0)` resolved to nothing and the copy fell back to a
+/// global scan (wrong card / no copy). Binding to `ExiledBySource` makes the
+/// exile a linked consumer that publishes an `ExileLink` the copy reads.
+///
+/// Discriminator: on `main` the recursively-found CopySpell target is
+/// `{"type":"TrackedSet","id":0}`, so the `ExiledBySource` assertion fails.
+#[test]
+fn saruman_copy_the_exiled_card_binds_exiled_by_source_not_tracked_set() {
+    fn find_copyspell_targets(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(|t| t.as_str()) == Some("CopySpell") {
+                    if let Some(target) = map.get("target") {
+                        out.push(target.clone());
+                    }
+                }
+                for val in map.values() {
+                    find_copyspell_targets(val, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for val in items {
+                    find_copyspell_targets(val, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let parsed = parse_oracle_text(
+        "Ward—Discard an enchantment, instant, or sorcery card.\nWhenever you cast your \
+         second spell each turn, each opponent mills two cards. When one or more cards are \
+         milled this way, exile target enchantment, instant, or sorcery card with equal or \
+         lesser mana value than that spell from an opponent's graveyard. Copy the exiled \
+         card. You may cast the copy without paying its mana cost.",
+        "Saruman of Many Colors",
+        &[],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &[],
+    );
+
+    let execute = parsed.triggers[0]
+        .execute
+        .as_ref()
+        .expect("Saruman's spell-cast trigger has an execute chain");
+    let json = serde_json::to_value(execute).expect("serialize the execute chain");
+
+    let mut targets = Vec::new();
+    find_copyspell_targets(&json, &mut targets);
+    assert_eq!(
+        targets.len(),
+        1,
+        "exactly one CopySpell in Saruman's chain, got {targets:?}"
+    );
+    assert_eq!(
+        targets[0],
+        serde_json::json!({ "type": "ExiledBySource" }),
+        "Saruman's copy must bind ExiledBySource (was TrackedSet(0)); got {:?}",
+        targets[0]
     );
 }
