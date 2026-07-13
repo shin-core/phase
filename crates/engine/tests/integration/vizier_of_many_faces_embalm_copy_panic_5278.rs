@@ -278,7 +278,7 @@ fn embalm_copy_declined_enters_as_zero_zero_and_dies() {
                 // surfaced (proving the token carried Vizier's replacement and
                 // we are on the entry-choice path, not a short-circuit).
                 assert!(
-                    !candidates.is_empty() || true,
+                    !candidates.is_empty(),
                     "the enter-as-copy replacement must be offered"
                 );
                 // Capture the entering token id before declining.
