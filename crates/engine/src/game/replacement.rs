@@ -7717,12 +7717,17 @@ fn candidate_materiality(
         return CandidateMateriality::Unconditional;
     }
 
-    // CR 616.1 + CR 614.1c: granted sunburst only APPENDS to `enter_with_counters`
-    // (like a printed `PutCounter` ETB replacement, which resolves to `Disjoint`
-    // below), so it is order-independent against every other candidate — no CR
-    // 616.1 ordering prompt is forced.
+    // CR 616.1 + CR 614.1c: granted sunburst APPENDS to the event's counter
+    // payload — an ADDITIVE Count write. Two appenders commute (append 2 +
+    // append 3 = 5 either way), but an appender does NOT commute with a
+    // counter doubler on the same event ((0+N)*2 vs 0*2+N), so classifying it
+    // `Disjoint` would silently suppress the CR 616.1e ordering choice against
+    // a Doubling Season-class Count writer (review on #5802).
     if is_granted_sunburst_replacement(rid) {
-        return CandidateMateriality::Disjoint;
+        return CandidateMateriality::Writes {
+            field: EventField::Count,
+            commute: CommuteClass::Additive,
+        };
     }
 
     // CR 614.10: the turn-scoped combat skip fully prevents the BeginPhase event,

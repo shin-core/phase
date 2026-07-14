@@ -478,3 +478,139 @@ fn granted_sunburst_participates_in_counter_doubling() {
         "granted sunburst (2 colors) under a counter doubler must enter with 4 +1/+1 counters (CR 616.1)"
     );
 }
+
+/// #5802 review (CR 616.1e): the granted-sunburst virtual candidate is a
+/// counter-payload WRITE (`Writes { Count, Additive }`), not `Disjoint` — when a
+/// same-event Count writer co-fires on the entering spell's ZoneChange, the
+/// affected controller's ordering choice MUST surface. Reverting the
+/// classification to `Disjoint` suppresses the prompt and this test fails.
+///
+/// Both legal orderings are driven end-to-end. NOTE on outcomes: in the current
+/// engine the two orders converge (2 counters each) because a bare
+/// `quantity_modification` on a `Moved`-keyed definition has no ZoneChange
+/// counter-payload applier yet — the functioning Doubling Season path scales the
+/// downstream AddCounter placement instead (covered by
+/// `granted_sunburst_participates_in_counter_doubling`, which asserts 4). The
+/// assertions below pin (a) the prompt surfacing with both candidates, (b) both
+/// orders being drivable to a clean entry, and (c) the granted payload surviving
+/// either order — so if a ZoneChange payload applier lands later, only the
+/// counter totals need updating (4 for sunburst-first, 2 for writer-first), not
+/// the ordering machinery.
+fn drive_sunburst_vs_count_writer_ordering(pick_sunburst_first: bool) -> u32 {
+    use engine::types::ability::QuantityModification;
+    use engine::types::actions::GameAction;
+    use engine::types::game_state::WaitingFor;
+    use engine::types::replacements::ReplacementEvent;
+    use engine::types::ReplacementDefinition;
+
+    let mut scenario = GameScenario::new_n_player(2, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    let solar = scenario
+        .add_creature_from_oracle(P0, "Solar Array", 0, 0, SOLAR_ARRAY_ORACLE)
+        .id();
+    let writer = scenario.add_creature(P0, "Entry Count Writer", 0, 3).id();
+    let spell = scenario
+        .add_creature_to_hand_from_oracle(P0, "Test Golem", 0, 0, "")
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red, ManaCostShard::Green],
+            generic: 0,
+        })
+        .id();
+    let mut runner = scenario.build();
+    make_artifact(&mut runner, solar);
+    {
+        let obj = runner.state_mut().objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types = vec![CoreType::Artifact, CoreType::Creature];
+        obj.base_card_types = obj.card_types.clone();
+    }
+    // A same-event Count writer on the entering spell's ZoneChange (the
+    // Moved-keyed quantity-modification shape from the reclassified pair).
+    {
+        let repl = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .quantity_modification(QuantityModification::DOUBLE);
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&writer)
+            .unwrap()
+            .replacement_definitions
+            .push(repl);
+    }
+    arm_solar_array(&mut runner, solar);
+    add_mana(&mut runner, ManaType::Red, 1);
+    add_mana(&mut runner, ManaType::Green, 1);
+
+    let commit = runner.cast(spell).commit();
+    let mut r2 = GameRunner::from_state(commit.state().clone());
+    let mut saw_ordering_prompt = false;
+    for _ in 0..30 {
+        match r2.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } => {
+                if r2.act(GameAction::PassPriority).is_err() {
+                    break;
+                }
+            }
+            WaitingFor::ReplacementChoice { candidates, .. } => {
+                // CR 616.1e revert-canary: BOTH candidates must be offered
+                // together — a `Disjoint` classification auto-applies the
+                // sunburst appender and never surfaces this prompt.
+                if candidates.len() == 2 {
+                    saw_ordering_prompt = true;
+                    let sunburst_idx = candidates
+                        .iter()
+                        .position(|c| c.description.contains("Sunburst"))
+                        .expect("sunburst candidate must be listed");
+                    let writer_idx = 1 - sunburst_idx;
+                    let idx = if pick_sunburst_first {
+                        sunburst_idx
+                    } else {
+                        writer_idx
+                    };
+                    r2.act(GameAction::ChooseReplacement { index: idx })
+                        .expect("ordering choice must be accepted");
+                } else {
+                    r2.act(GameAction::ChooseReplacement { index: 0 })
+                        .expect("remaining replacement choice must be accepted");
+                }
+            }
+            other => panic!("unexpected waiting state during entry: {other:?}"),
+        }
+        let done = {
+            let st = r2.state();
+            st.objects
+                .get(&spell)
+                .is_some_and(|o| o.zone == Zone::Battlefield)
+        };
+        if done {
+            break;
+        }
+    }
+    assert!(
+        saw_ordering_prompt,
+        "the CR 616.1e ordering prompt must surface for the co-firing counter-payload writers"
+    );
+    let o = r2.state().objects.get(&spell).unwrap();
+    assert_eq!(o.zone, Zone::Battlefield, "the spell must finish entering");
+    o.counters
+        .get(&CounterType::Plus1Plus1)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[test]
+fn granted_sunburst_ordering_choice_sunburst_first() {
+    let counters = drive_sunburst_vs_count_writer_ordering(true);
+    assert_eq!(
+        counters, 2,
+        "sunburst-first: the granted payload (2 colors) must survive the ordering pass"
+    );
+}
+
+#[test]
+fn granted_sunburst_ordering_choice_count_writer_first() {
+    let counters = drive_sunburst_vs_count_writer_ordering(false);
+    assert_eq!(
+        counters, 2,
+        "writer-first: the granted payload must still be appended after the writer applies"
+    );
+}
