@@ -1708,22 +1708,40 @@ impl Keyword {
         )
     }
 
-    /// CR 702.164b: Keywords whose multiple instances SUM their parameter values
-    /// into a single aggregate (e.g. a creature's total toxic value), rather than
-    /// collapsing identical instances. When such a keyword is granted on top of an
-    /// identical printed instance, BOTH must remain on the keyword list so the
-    /// aggregate reader counts every copy. Distinct from `instances_function_separately`
-    /// (which gates per-instance trigger installation — a different semantic axis).
-    /// Conservative/CR-driven: only Toxic sums today (CR 702.164b). Protection
-    /// (CR 702.16g), Ward, Annihilator, Afflict, Frenzy do NOT sum — they keep
-    /// deduping identical instances. Add any future "sum of all N" keyword here.
+    /// CR 702.164b + CR 702.44d: Keywords whose multiple instances must COEXIST on
+    /// the keyword list rather than collapse to one when an identical instance is
+    /// granted on top of a printed one. When such a keyword is granted on top of an
+    /// identical printed instance, BOTH must remain on the keyword list so each
+    /// instance's effect is realized separately. Two disjoint reasons a keyword
+    /// belongs here, both served by the same "don't dedup identical instances"
+    /// mechanic in the keyword-grant paths:
+    ///
+    /// - **Parameter-value summation** (CR 702.164b): the aggregate reader sums
+    ///   each instance's parameter (a creature's total toxic value). Only Toxic
+    ///   sums today. Protection (CR 702.16g), Ward, Annihilator, Afflict, Frenzy do
+    ///   NOT sum — they keep deduping identical instances.
+    /// - **Instance-count multiplicity** (CR 702.44d): a parameter-less as-enters
+    ///   static ability where "each instance works separately" — Sunburst places
+    ///   its as-enters counters once per instance (CR 702.44a). A GRANTED Sunburst
+    ///   ("that spell gains sunburst": Solar Array / Lux Artillery) on top of a
+    ///   printed one must coexist so both the printed object-carried replacement AND
+    ///   the granted virtual replacement (`granted_sunburst_instances` counts the
+    ///   base-subtracted surplus) fire. Without coexistence the layer-6 grant
+    ///   dedups against the identical printed instance and the granted instance is
+    ///   silently lost.
+    ///
+    /// Distinct from `instances_function_separately` (which gates per-instance
+    /// TRIGGER installation, and deliberately excludes Sunburst because its
+    /// multiplicity is realized by synthesis / the granted-replacement path, not by
+    /// the trigger installer — a different semantic axis). Add any future keyword
+    /// whose identical instances must coexist here.
     ///
     /// Out of scope (intentionally not gated by this predicate): cast-time spell
     /// keyword merge (`casting.rs` `upsert_keyword_by_kind`/`merge_spell_keyword` —
     /// Toxic is inert at cast time) and the layers `AddDynamicKeyword` arm
-    /// (`DynamicKeywordKind` is only Annihilator/Modular, never Toxic).
+    /// (`DynamicKeywordKind` is only Annihilator/Modular, never Toxic/Sunburst).
     pub fn sums_across_instances(&self) -> bool {
-        matches!(self, Keyword::Toxic(_))
+        matches!(self, Keyword::Toxic(_) | Keyword::Sunburst)
     }
 
     /// CR 613.7: When multiple effects grant the same single-authoritative-value

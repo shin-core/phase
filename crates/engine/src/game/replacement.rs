@@ -68,6 +68,18 @@ const FINALITY_COUNTER_INDEX: usize = usize::MAX - 5;
 /// card-granted `ReplacementDefinition`, so it uses the existing virtual-ID
 /// protocol shared by intrinsic shield, finality, and compleated effects.
 const COMMANDER_HAND_OR_LIBRARY_RETURN_INDEX: usize = usize::MAX - 6;
+/// CR 702.44a + CR 702.44d: Granted Sunburst — a virtual `Moved`→Battlefield
+/// ETB-counter replacement keyed on the entering spell that was GRANTED
+/// sunburst ("that spell gains sunburst": Solar Array / Lux Artillery). Printed
+/// sunburst is baked as an object-carried `ReplacementDefinition` at synthesis
+/// time (`synthesize_sunburst`); a runtime grant adds a keyword but no
+/// replacement definition, so this reserved candidate surfaces one virtual ETB
+/// replacement per GRANTED instance (base-subtracted, mirroring
+/// `synthesize_granted_keyword_triggers`). CR 702.44d — printed + granted
+/// instances each yield a distinct candidate and apply separately. Only the
+/// entering object's own granted sunburst is at issue, so the reserved index is
+/// keyed on the entering object.
+const GRANTED_SUNBURST_INDEX: usize = usize::MAX - 7;
 
 /// CR 109.4 + CR 108.4a: Cards outside the battlefield/stack have no
 /// controller; if an effect asks for a card's controller, use its owner
@@ -221,6 +233,50 @@ fn object_has_finality_counter(state: &GameState, object_id: ObjectId) -> bool {
         .is_some_and(|count| *count > 0)
 }
 
+fn granted_sunburst_replacement_id(object_id: ObjectId) -> ReplacementId {
+    ReplacementId {
+        source: object_id,
+        index: GRANTED_SUNBURST_INDEX,
+    }
+}
+
+fn is_granted_sunburst_replacement(rid: ReplacementId) -> bool {
+    rid.index == GRANTED_SUNBURST_INDEX
+}
+
+/// CR 702.44d + CR 604.1: The number of GRANTED sunburst instances on `object_id`
+/// — the object's EFFECTIVE sunburst count minus its printed (base) count.
+///
+/// Printed sunburst is realized through object-carried `ReplacementDefinition`s
+/// (`synthesize_sunburst`); only the granted instances need a virtual candidate,
+/// so subtract `base_keywords` (mirrors `synthesize_granted_keyword_triggers`).
+/// Printed-only sunburst returns 0 here — its counters come from the carried
+/// definitions, never this path — which keeps printed + granted double-applying
+/// per CR 702.44d.
+///
+/// CRITICAL: the entering spell is still on the STACK when its entry
+/// replacement pipeline runs, and a granted keyword exists only as a
+/// continuous effect at that moment — `obj.keywords` is NOT yet materialized
+/// for stack objects. `effective_off_zone_keywords` is the single authority
+/// that resolves the live keyword list for any zone (materialized list for
+/// battlefield objects; base + ordered continuous grants, including transient
+/// effects, for stack/off-zone objects — CR 613.1f recursion-guarded).
+fn granted_sunburst_instances(state: &GameState, object_id: ObjectId) -> usize {
+    let Some(obj) = state.objects.get(&object_id) else {
+        return 0;
+    };
+    let live = crate::game::off_zone_characteristics::effective_off_zone_keywords(state, object_id)
+        .iter()
+        .filter(|kw| matches!(kw, crate::types::keywords::Keyword::Sunburst))
+        .count();
+    let base = obj
+        .base_keywords
+        .iter()
+        .filter(|kw| matches!(kw, crate::types::keywords::Keyword::Sunburst))
+        .count();
+    live.saturating_sub(base)
+}
+
 fn compleated_life_paid(state: &GameState, object_id: ObjectId) -> Option<u32> {
     state.objects.get(&object_id).and_then(|obj| {
         (obj.phyrexian_life_paid > 0
@@ -325,6 +381,107 @@ fn apply_compleated_replacement(
             }
         }
         other => other,
+    }
+}
+
+/// CR 702.44a + CR 702.44d + CR 614.1c: Apply the granted-sunburst virtual ETB
+/// replacement — fold the as-enters counters onto the entering spell's
+/// `ZoneChange`, one placement per GRANTED sunburst instance.
+///
+/// The per-instance counter shape is the single shared authority
+/// (`sunburst_replacement_definition`) the printed-sunburst synthesizer also
+/// builds, so a granted spell places exactly the same as-enters counters a
+/// printed one would. The counter branch (+1/+1 vs charge) is chosen from the
+/// entering object's current core types (CR 702.44a), and the per-color count
+/// is resolved by `event_modifiers_for_ability` against the entering spell so
+/// `QuantityRef::ManaSpentToCast { DistinctColors }` reads its own
+/// `colors_spent_to_cast` (CR 601.2h) — identical to the printed path.
+///
+/// One `enter_with_counters` entry is pushed per granted instance (CR 702.44d:
+/// each instance works separately), so a counter-doubling replacement
+/// (Doubling Season) doubles each instance's placement independently, exactly
+/// as it would for multiple printed instances.
+fn apply_granted_sunburst_replacement(
+    state: &mut GameState,
+    event: ProposedEvent,
+    rid: ReplacementId,
+    events: &mut Vec<GameEvent>,
+) -> ProposedEvent {
+    let instances = granted_sunburst_instances(state, rid.source);
+    if instances == 0 {
+        return event;
+    }
+    // CR 702.44a: branch on the entering object's current core types.
+    let counter_type = state
+        .objects
+        .get(&rid.source)
+        .filter(|obj| obj.card_types.core_types.contains(&CoreType::Creature))
+        .map(|_| CounterType::Plus1Plus1)
+        .unwrap_or_else(|| CounterType::Generic("charge".to_string()));
+
+    let definition = crate::database::synthesis::sunburst_replacement_definition(&counter_type);
+    // Resolve the per-color count once via the shared ETB-modifier extractor,
+    // threading the entering object as the source so the self-scoped
+    // `ManaSpentToCast` ref reads its own cast tally (CR 601.2h).
+    let modifiers =
+        event_modifiers_for_ability(definition.execute.as_deref(), state, rid.source, &event);
+
+    let ProposedEvent::ZoneChange {
+        object_id,
+        from,
+        to,
+        cause,
+        attach_to,
+        enter_tapped,
+        mut enter_with_counters,
+        controller_override,
+        enter_transformed,
+        face_down_profile,
+        applied,
+    } = event
+    else {
+        return event;
+    };
+    if object_id != rid.source {
+        // Rebuild the event unchanged if the ids diverged (defensive; the
+        // candidate is keyed on the entering object so this never fires).
+        return ProposedEvent::ZoneChange {
+            object_id,
+            from,
+            to,
+            cause,
+            attach_to,
+            enter_tapped,
+            enter_with_counters,
+            controller_override,
+            enter_transformed,
+            face_down_profile,
+            applied,
+        };
+    }
+    // CR 702.44d: one placement per granted instance.
+    for _ in 0..instances {
+        enter_with_counters.extend(modifiers.etb_counters.iter().cloned());
+    }
+    // The candidate id is already recorded in `applied` by the pipeline's
+    // `mark_applied(rid)` before this applier runs (`for_event`-keyed), so the
+    // `applied` set is threaded through unchanged — no manual re-insert.
+    events.push(GameEvent::ReplacementApplied {
+        source_id: rid.source,
+        event_type: ReplacementEvent::Moved.to_string(),
+    });
+    ProposedEvent::ZoneChange {
+        object_id,
+        from,
+        to,
+        cause,
+        attach_to,
+        enter_tapped,
+        enter_with_counters,
+        controller_override,
+        enter_transformed,
+        face_down_profile,
+        applied,
     }
 }
 
@@ -850,6 +1007,11 @@ fn replacement_choice_label(repl: &ReplacementDefinition) -> String {
 fn replacement_choice_label_for_rid(state: &GameState, rid: ReplacementId) -> String {
     if is_compleated_replacement(rid) {
         return "Compleated: enter with fewer loyalty counters".to_string();
+    }
+    if is_granted_sunburst_replacement(rid) {
+        // CR 702.44a: mandatory ETB-counter replacement — only ever labeled in a
+        // CR 616.1 ordering prompt, never offered as an accept/decline choice.
+        return "Sunburst: enter with counters for colors of mana spent".to_string();
     }
     if is_finality_counter_replacement(rid) {
         return "Exile it instead".to_string();
@@ -6117,6 +6279,30 @@ pub fn find_applicable_replacements(
         }
     }
 
+    // CR 702.44a + CR 702.44d + CR 614.1c: Granted sunburst — a spell GRANTED
+    // sunburst as it was cast ("that spell gains sunburst": Solar Array / Lux
+    // Artillery) carries the keyword in its live keyword set but no object-carried
+    // ETB replacement (only printed sunburst is synthesized into
+    // `replacement_definitions`). Surface one virtual ETB-counter candidate here
+    // when the granted spell enters the battlefield so its as-enters counters are
+    // placed. Gated to `ZoneChange`→Battlefield exactly as the printed definition's
+    // `Moved`/destination gate. A single reserved candidate covers all granted
+    // instances — its applier emits one counter placement per granted instance
+    // (CR 702.44d), and printed instances still apply separately via their own
+    // carried definitions. Ordered against Doubling Season-class modifiers by the
+    // shared enter-with-counters pipeline, exactly like printed sunburst.
+    if let ProposedEvent::ZoneChange {
+        object_id,
+        to: Zone::Battlefield,
+        ..
+    } = event
+    {
+        let rid = granted_sunburst_replacement_id(*object_id);
+        if granted_sunburst_instances(state, *object_id) > 0 && !event.already_applied(&rid) {
+            candidates.push(rid);
+        }
+    }
+
     // CR 702.89a: Umbra armor — a destroy of a permanent enchanted by an Umbra is
     // a candidate for the virtual umbra-armor replacement. Offered independently of
     // the shield-counter match above so a permanent carrying both a shield counter
@@ -6823,6 +7009,12 @@ fn apply_single_replacement(
         return Ok(apply_compleated_replacement(state, proposed, rid, events));
     }
 
+    if is_granted_sunburst_replacement(rid) {
+        return Ok(apply_granted_sunburst_replacement(
+            state, proposed, rid, events,
+        ));
+    }
+
     if let Some(kind) = shield_counter_replacement_kind(rid) {
         return apply_shield_counter_replacement(state, proposed, rid, kind, events);
     }
@@ -7523,6 +7715,14 @@ fn candidate_materiality(
     // destination, so it is order-material with every competing replacement.
     if is_commander_hand_or_library_return_replacement(rid) {
         return CandidateMateriality::Unconditional;
+    }
+
+    // CR 616.1 + CR 614.1c: granted sunburst only APPENDS to `enter_with_counters`
+    // (like a printed `PutCounter` ETB replacement, which resolves to `Disjoint`
+    // below), so it is order-independent against every other candidate — no CR
+    // 616.1 ordering prompt is forced.
+    if is_granted_sunburst_replacement(rid) {
+        return CandidateMateriality::Disjoint;
     }
 
     // CR 614.10: the turn-scoped combat skip fully prevents the BeginPhase event,

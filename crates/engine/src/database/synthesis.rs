@@ -7211,44 +7211,64 @@ pub fn synthesize_sunburst(face: &mut CardFace) {
         .filter(|r| is_sunburst_etb_replacement(r, &counter_type))
         .count();
 
-    let counter_phrase = match &counter_type {
+    for _ in existing..instances {
+        face.replacements
+            .push(sunburst_replacement_definition(&counter_type));
+    }
+}
+
+/// CR 702.44a + CR 702.44d + CR 601.2h: the single per-instance Sunburst ETB
+/// replacement definition — one `Moved`→Battlefield replacement on `SelfRef`
+/// whose execute places one counter of `counter_type` per distinct color of
+/// mana spent to cast the object.
+///
+/// The single authority for building a Sunburst replacement, shared by:
+/// - build-time synthesis (`synthesize_sunburst`) for PRINTED Sunburst, and
+/// - the runtime granted-keyword replacement path
+///   (`granted_sunburst_replacements` → `find_applicable_replacements`), which
+///   surfaces one virtual candidate per *granted* Sunburst instance so a grant
+///   ("that spell gains sunburst": Solar Array / Lux Artillery) also places
+///   counters at entry (#5337).
+///
+/// Because both callers build identical definitions, printed + granted
+/// instances each yield a distinct candidate and apply separately, exactly as
+/// CR 702.44d ("If an object has multiple instances of sunburst, each one works
+/// separately") requires.
+pub(crate) fn sunburst_replacement_definition(counter_type: &CounterType) -> ReplacementDefinition {
+    let counter_phrase = match counter_type {
         CounterType::Plus1Plus1 => "+1/+1",
         _ => "charge",
     };
-
-    for _ in existing..instances {
-        let etb_counters = AbilityDefinition::new(
-            AbilityKind::Spell,
-            Effect::PutCounter {
-                counter_type: counter_type.clone(),
-                // CR 702.44a + CR 601.2h: one counter per *color* (max 5) of mana
-                // spent to cast this object — the distinct-colors metric, not the
-                // total amount.
-                count: QuantityExpr::Ref {
-                    qty: QuantityRef::ManaSpentToCast {
-                        scope: CastManaObjectScope::SelfObject,
-                        metric: CastManaSpentMetric::DistinctColors,
-                    },
+    let etb_counters = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PutCounter {
+            counter_type: counter_type.clone(),
+            // CR 702.44a + CR 601.2h: one counter per *color* (max 5) of mana
+            // spent to cast this object — the distinct-colors metric, not the
+            // total amount.
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::ManaSpentToCast {
+                    scope: CastManaObjectScope::SelfObject,
+                    metric: CastManaSpentMetric::DistinctColors,
                 },
-                target: TargetFilter::SelfRef,
             },
-        )
-        .description(format!(
-            "This permanent enters with a {counter_phrase} counter on it for each color of mana spent to cast it"
-        ));
+            target: TargetFilter::SelfRef,
+        },
+    )
+    .description(format!(
+        "This permanent enters with a {counter_phrase} counter on it for each color of mana spent to cast it"
+    ));
 
-        let replacement = ReplacementDefinition {
-            event: ReplacementEvent::Moved,
-            execute: Some(Box::new(etb_counters)),
-            valid_card: Some(TargetFilter::SelfRef),
-            // CR 614.1c: battlefield-entry-scoped (departure gate).
-            destination_zone: Some(Zone::Battlefield),
-            description: Some(format!(
-                "CR 702.44a: Sunburst — this permanent enters with a {counter_phrase} counter on it for each color of mana spent to cast it."
-            )),
-            ..ReplacementDefinition::new(ReplacementEvent::Moved)
-        };
-        face.replacements.push(replacement);
+    ReplacementDefinition {
+        event: ReplacementEvent::Moved,
+        execute: Some(Box::new(etb_counters)),
+        valid_card: Some(TargetFilter::SelfRef),
+        // CR 614.1c: battlefield-entry-scoped (departure gate).
+        destination_zone: Some(Zone::Battlefield),
+        description: Some(format!(
+            "CR 702.44a: Sunburst — this permanent enters with a {counter_phrase} counter on it for each color of mana spent to cast it."
+        )),
+        ..ReplacementDefinition::new(ReplacementEvent::Moved)
     }
 }
 
