@@ -36614,8 +36614,6 @@ fn when_next_cast_spell_with_x_in_cost_parses() {
     assert!(matches!(&*effect.effect, Effect::Draw { .. }));
 }
 
-/// CR 603.7 + CR 707.10: Magus Lucea Kane Psychic Stimulus delayed copy.
-
 /// #5337 gap 1 (CR 608.2k): in a "when you next cast <spell> this turn" delayed
 /// grant, the subject-position "that spell" anaphor names the newly-cast spell
 /// (the trigger's event source) — a `WhenNextEvent` delayed trigger has no
@@ -36658,6 +36656,7 @@ fn when_next_cast_that_spell_grant_binds_triggering_source() {
     );
 }
 
+/// CR 603.7 + CR 707.10: Magus Lucea Kane Psychic Stimulus delayed copy.
 #[test]
 fn magus_lucea_kane_psychic_stimulus_parses_delayed_copy() {
     use crate::types::ability::{
