@@ -30,11 +30,11 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction, AttackScope,
     AttackSubject, CastPermissionConstraint, CastingPermission, Comparator, ConjureSource,
     ContinuousModification, ControllerRef, DamageChannel, DamageSource, DelayedTriggerCondition,
-    Duration, Effect, EffectScope, FilterProp, GameRestriction, LibraryPosition,
-    ManaSpendPermission, MultiTargetSpec, ObjectScope, PlayerFilter, PreventionAmount,
-    PreventionScope, PtValue, QuantityExpr, QuantityRef, RestrictionPlayerScope, RoundingMode,
-    SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, SubAbilityLink,
-    TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
+    Duration, Effect, EffectScope, ExiledSpellRider, FilterProp, GameRestriction, LibraryPosition,
+    ManaSpendPermission, MultiTargetSpec, ObjectScope, PermissionGrantee, PlayerFilter,
+    PreventionAmount, PreventionScope, PtValue, QuantityExpr, QuantityRef, RestrictionPlayerScope,
+    RoundingMode, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition,
+    SubAbilityLink, TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::counter::CounterType;
 use crate::types::game_state::{DistributionUnit, TargetSelectionConstraint};
@@ -1879,6 +1879,164 @@ pub(super) fn fold_enters_this_way_counter_rider(def: &mut AbilityDefinition) {
     if let Some(sub) = def.sub_ability.as_mut() {
         fold_enters_this_way_counter_rider(sub);
     }
+}
+
+/// CR 603.7a + CR 608.2c + CR 702.170c: fold the "If you do, ..." continuation
+/// of an "exile [the resolving spell] instead of putting it into [a/your]
+/// graveyard as it resolves" clause into the carrier effect's typed `on_exile`
+/// rider (`ExiledSpellRider`). Two members:
+///   - Feather, the Redeemed: "return it to your hand at the beginning of the
+///     next end step" → `ReturnTo { Hand, AtNextPhase { End } }`.
+///   - Lilah, Undefeated Slickshot: "it becomes plotted" → `BecomePlotted`.
+///
+/// The generic at-trigger-resolution lowering is wrong for this class: per
+/// CR 603.7a a consequence created "as the result of a replacement effect being
+/// applied" exists only once the replacement is APPLIED — i.e. when the spell
+/// actually lands in exile during its own stack resolution — not when the
+/// trigger resolves. Leaving Feather's `CreateDelayedTrigger` (or Lilah's
+/// `GrantCastingPermission { Plotted }`) as an ordinary chained effect would
+/// apply it to a spell that was later countered in response (the replacement
+/// never applied). The rider routes through the per-object marker so the stack
+/// router applies the consequence at replacement-application time.
+///
+/// Deliberately conservative: any structural mismatch leaves the sub-ability
+/// unfolded, so `swallow_check` keeps flagging unrepresented text instead of
+/// silently dropping it.
+pub(super) fn fold_exile_resolving_rider(def: &mut AbilityDefinition) {
+    if matches!(
+        *def.effect,
+        Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+    ) {
+        if let Some(sub) = def.sub_ability.take() {
+            if let Some(rider) = detect_exile_resolving_rider(&sub) {
+                if let Effect::ExileResolvingSpellInsteadOfGraveyard { on_exile } = &mut *def.effect
+                {
+                    *on_exile = Some(rider);
+                }
+                // The continuation is fully represented by the typed rider —
+                // consume the sub.
+            } else {
+                def.sub_ability = Some(sub);
+            }
+        }
+    }
+    if let Some(sub) = def.sub_ability.as_mut() {
+        fold_exile_resolving_rider(sub);
+    }
+    if let Some(else_branch) = def.else_ability.as_mut() {
+        fold_exile_resolving_rider(else_branch);
+    }
+}
+
+/// CR 603.7a + CR 702.170c: classify the exile-instead continuation sub-ability
+/// into its typed rider, or `None` if it is not a recognized consequence. The
+/// per-member matchers stay conservative so unrecognized text is left unfolded
+/// for `swallow_check` to flag.
+fn detect_exile_resolving_rider(sub: &AbilityDefinition) -> Option<ExiledSpellRider> {
+    if is_exile_resolving_return_rider(sub) {
+        // CR 603.7a: Feather's return axes — owner's hand, at the beginning of
+        // the next end step.
+        return Some(ExiledSpellRider::ReturnTo {
+            destination: Zone::Hand,
+            timing: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+        });
+    }
+    if is_exile_resolving_plotted_rider(sub) {
+        // CR 702.170c: Lilah's "it becomes plotted".
+        return Some(ExiledSpellRider::BecomePlotted);
+    }
+    None
+}
+
+/// Structural match for Lilah's plotted rider: an optionally "if you do"-gated
+/// `GrantCastingPermission { Plotted }` on the resolving spell (the
+/// `ParentTarget`/`SelfRef` anaphor), granting to the card's owner.
+///
+/// CR 608.2c: the "if you do" back-reference is absorbed by the plotted-grant
+/// continuation grammar (see `parse_becomes_plotted_continuation`), so the
+/// grant may carry either no condition or a duplicate optional-effect-performed
+/// gate — but never an independent game-state condition, which would make the
+/// plot genuinely conditional and wrong to fold to an unconditional rider.
+fn is_exile_resolving_plotted_rider(sub: &AbilityDefinition) -> bool {
+    if !sub
+        .condition
+        .as_ref()
+        .is_none_or(AbilityCondition::is_optional_effect_performed)
+    {
+        return false;
+    }
+    if sub.sub_ability.is_some() || sub.else_ability.is_some() {
+        return false;
+    }
+    matches!(
+        &*sub.effect,
+        Effect::GrantCastingPermission {
+            permission: CastingPermission::Plotted { .. },
+            target: TargetFilter::ParentTarget | TargetFilter::SelfRef,
+            grantee: PermissionGrantee::ObjectOwner,
+        }
+    )
+}
+
+/// Structural match for the return rider: an "if you do"-gated
+/// `CreateDelayedTrigger` at the next end step whose sole body returns the
+/// resolving spell (the `ParentTarget`/`SelfRef` anaphor) to its owner's hand.
+fn is_exile_resolving_return_rider(sub: &AbilityDefinition) -> bool {
+    // CR 608.2c: "If you do" — the optional-effect-performed gate on the rider.
+    if !sub
+        .condition
+        .as_ref()
+        .is_some_and(AbilityCondition::is_optional_effect_performed)
+    {
+        return false;
+    }
+    if sub.sub_ability.is_some() || sub.else_ability.is_some() {
+        return false;
+    }
+    let Effect::CreateDelayedTrigger {
+        condition,
+        effect: inner,
+        uses_tracked_set,
+    } = &*sub.effect
+    else {
+        return false;
+    };
+    if *uses_tracked_set {
+        return false;
+    }
+    // CR 603.7a: "at the beginning of the next end step".
+    if !matches!(
+        condition,
+        DelayedTriggerCondition::AtNextPhase { phase: Phase::End }
+    ) {
+        return false;
+    }
+    // CR 603.7a: the fold produces an UNCONDITIONAL return — a delayed-trigger
+    // body carrying its own condition, else-branch, or continuation would be
+    // silently promoted to unconditional if folded, so bail. One tolerated
+    // exception: the assembly-pass wrapper lift CLONES (not moves) the outer
+    // "if you do" gate, so the inner body legitimately carries a duplicate
+    // `is_optional_effect_performed` condition — already enforced on the sub
+    // above, hence unconditional once folded.
+    if inner.sub_ability.is_some() || inner.else_ability.is_some() {
+        return false;
+    }
+    if !inner
+        .condition
+        .as_ref()
+        .is_none_or(AbilityCondition::is_optional_effect_performed)
+    {
+        return false;
+    }
+    // "return it to your hand" — the anaphoric return-to-hand of the spell.
+    matches!(
+        &*inner.effect,
+        Effect::Bounce {
+            target: TargetFilter::ParentTarget | TargetFilter::SelfRef,
+            destination: None | Some(Zone::Hand),
+            ..
+        }
+    )
 }
 
 pub(super) fn rewire_result_anchored_subchain(def: &mut AbilityDefinition) {
