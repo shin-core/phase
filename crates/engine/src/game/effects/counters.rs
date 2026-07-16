@@ -1488,6 +1488,38 @@ pub fn resolve_multiply(
     Ok(())
 }
 
+/// CR 118.12 + CR 601.2f (by analogy) + CR 122.1: True when a `RemoveCounter`
+/// effect used as an optional "you may" gate cannot be performed because none of
+/// its resolved target object(s) hold a matching counter — "you may remove a
+/// charge counter from this artifact" with zero charge counters (Sun Droplet).
+///
+/// Removing a counter that isn't there is doing nothing, so the up-front "you
+/// may" must not be offered (and its `EffectOutcome::OptionalEffectPerformed`
+/// rider — "If you do, gain 1 life" — must not fire). Delegates to the same
+/// `resolve_defined_or_targets` authority the resolver uses, so feasibility and
+/// resolution never diverge. Returns `false` (feasible) for any non-`RemoveCounter`
+/// effect so the caller's other arms are unaffected.
+pub(crate) fn remove_counter_optional_is_infeasible(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> bool {
+    let Effect::RemoveCounter { counter_type, .. } = &ability.effect else {
+        return false;
+    };
+    let targets = resolve_defined_or_targets(state, ability);
+    // Infeasible iff NO resolved target holds a matching counter. `counter_type`
+    // is `Option<CounterType>`: `Some(ct)` matches that specific kind ("a charge
+    // counter"), `None` means any kind ("a counter"). An empty target set is
+    // likewise infeasible (nothing to remove from).
+    !targets.iter().any(|obj_id| {
+        state.objects.get(obj_id).is_some_and(|obj| {
+            obj.counters.iter().any(|(ct, &n)| {
+                n > 0 && counter_type.as_ref().is_none_or(|expected| expected == ct)
+            })
+        })
+    })
+}
+
 /// Resolve targeting to object IDs using the typed TargetFilter.
 fn resolve_defined_or_targets(
     state: &GameState,
