@@ -1073,8 +1073,8 @@ pub(super) fn attach_graveyard_redirect_rider_to_prior_cast_from_zone(
     true
 }
 
-/// CR 601.2f: Detect the "each spell cast this way costs {N} more to cast"
-/// rider sentence (Lightstall Inquisitor) and return the cost increase. This is
+/// CR 601.2f: Detect an "each/a spell cast this way costs {N} more to cast"
+/// rider sentence (Lightstall Inquisitor, Invasion of Gobakhan) and return the cost increase. This is
 /// a cost-raise scoped to spells cast via the immediately-preceding
 /// `PlayFromExile` grant ("this way" = the just-granted exile play), not a
 /// global static cost increase — so it folds into the grant's `cast_cost_raise`
@@ -1091,7 +1091,11 @@ pub(super) fn cast_cost_raise_rider(clause: &ClauseIr) -> Option<ManaCost> {
         clause.source.fragment().unwrap_or_default().trim(),
         lower.trim(),
         |i| {
-            let (i, _) = tag("each spell cast this way costs ").parse(i)?;
+            let (i, _) = alt((
+                tag("each spell cast this way costs "),
+                tag("a spell cast this way costs "),
+            ))
+            .parse(i)?;
             let (i, cost) = nom_primitives::parse_mana_cost(i)?;
             let (i, _) = tag(" more to cast").parse(i)?;
             let (i, _) = opt(tag(".")).parse(i)?;
@@ -10601,7 +10605,9 @@ mod tests {
             collect(&def, &mut effects);
 
             assert!(
-                effects.iter().any(|e| matches!(e, Effect::ExtraTurn { .. })),
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ExtraTurn { .. })),
                 "expected an ExtraTurn effect in {text:?}, got {effects:?}"
             );
             let delayed_lose = effects.iter().any(|e| {
@@ -10620,7 +10626,7 @@ mod tests {
             assert!(
                 delayed_lose,
                 "expected a delayed LoseTheGame at the extra turn's end step in {text:?}, got {effects:?}"
-                        );
+            );
         }
     }
 

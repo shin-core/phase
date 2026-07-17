@@ -3992,6 +3992,24 @@ fn apply_action(
                     &chosen,
                     &mut events,
                 )?,
+                // CR 601.2h: A ChangeZone effect-as-cost carries the optional
+                // any-number exile selection and its cast-time reduction.
+                PayCostKind::ExileFromZone { zone }
+                    if paid_cost.as_ref().is_some_and(|payment| {
+                        casting_costs::is_exile_any_number_effect_cost(payment.cost)
+                    }) =>
+                {
+                    casting_costs::handle_exile_any_number_for_cost(
+                        state,
+                        *player,
+                        *zone,
+                        *pending_cast.clone(),
+                        *count,
+                        choices,
+                        &chosen,
+                        &mut events,
+                    )?
+                }
                 PayCostKind::ExileFromZone { zone } => engine_casting::handle_exile_for_cost(
                     state,
                     *player,
@@ -5002,25 +5020,25 @@ fn apply_action(
                     ));
                 }
                 for (choice, shard) in choices.iter().zip(current_shards.iter()) {
-                    match (choice, shard.options) {
-                        (
-                            crate::types::game_state::ShardChoice::PayLife,
-                            crate::types::game_state::ShardOptions::ManaOnly,
-                        ) => {
-                            return Err(EngineError::ActionNotAllowed(
-                                "Cannot pay life for shard — only mana available".to_string(),
-                            ));
-                        }
-                        (
-                            crate::types::game_state::ShardChoice::PayMana,
-                            crate::types::game_state::ShardOptions::LifeOnly,
-                        ) => {
-                            return Err(EngineError::ActionNotAllowed(
-                                "Cannot pay mana for shard — only life available".to_string(),
-                            ));
-                        }
-                        _ => {}
+                    if let (
+                        crate::types::game_state::ShardChoice::PayLife,
+                        crate::types::game_state::ShardOptions::ManaOnly,
+                    ) = (choice, shard.options)
+                    {
+                        return Err(EngineError::ActionNotAllowed(
+                            "Cannot pay life for shard — only mana available".to_string(),
+                        ));
                     }
+                }
+                if !casting::pending_phyrexian_route_is_payable(
+                    state,
+                    player,
+                    spell_object,
+                    &choices,
+                ) {
+                    return Err(EngineError::ActionNotAllowed(
+                        "Cannot pay mana cost with selected Phyrexian route".to_string(),
+                    ));
                 }
             }
             // CR 118.3a: `finalize_mana_payment_with_phyrexian_choices` clears

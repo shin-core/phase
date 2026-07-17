@@ -3565,6 +3565,10 @@ pub enum FilterProp {
     /// This is a status of the exiled card, not equivalent to having the
     /// Foretell keyword or a generic exile casting permission.
     Foretold,
+    /// CR 715.2: Matches a card that has an Adventure. Outside the stack, an
+    /// Adventure card has only the characteristics of its permanent half, so
+    /// this must inspect the stored alternate face rather than its card types.
+    HasAdventure,
     EnchantedBy,
     EquippedBy,
     /// CR 301.5 + CR 303.4: True when the matched object's `attached_to` field
@@ -8456,6 +8460,10 @@ pub enum AdditionalCostOrigin {
     Offspring,
     Squad,
     Replicate,
+    /// CR 702.166a: Bargain's optional sacrifice of an artifact, enchantment,
+    /// or token. A dedicated origin prevents an unrelated additional cost from
+    /// satisfying an "if it was bargained" rider.
+    Bargain,
     /// CR 601.2b/f: Teamwork's optional "tap any number of creatures with total
     /// power N or more" additional cost. A dedicated origin lets "this spell was
     /// cast using teamwork" riders test the Teamwork payment specifically (not

@@ -5202,6 +5202,35 @@ fn static_this_spell_cost_less_self_scoped_in_castable_zones() {
     );
 }
 
+/// CR 601.2f + CR 715.2: Hearth Elemental's variable reduction must retain the
+/// instant/sorcery/Adventure graveyard predicate and function from hand.
+#[test]
+fn static_hearth_elemental_cost_reduction_includes_adventures() {
+    let def = parse_static_line(
+        "This spell costs {X} less to cast, where X is the number of cards in your graveyard that are instant cards, sorcery cards, and/or have an Adventure.",
+    )
+    .expect("Hearth Elemental cost reduction should parse");
+    assert!(matches!(
+        def.mode,
+        StaticMode::ModifyCost {
+            mode: CostModifyMode::Reduce,
+            amount: ManaCost::Cost { generic: 1, .. },
+            dynamic_count: Some(QuantityRef::ZoneCardCount {
+                zone: ZoneRef::Graveyard,
+                ref card_types,
+                filter: Some(TargetFilter::Or { .. }),
+                scope: CountScope::Controller,
+            }),
+            ..
+        } if card_types.is_empty()
+    ));
+    assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+    assert_eq!(
+        def.active_zones,
+        crate::types::zones::self_spell_cost_mod_active_zones()
+    );
+}
+
 /// Issue #1372: Demilich's self-spell reduction must function from the graveyard
 /// during cast-time cost determination.
 #[test]
@@ -22084,6 +22113,34 @@ fn static_reduce_ability_cost_global_with_mana_exemption() {
         "expected Raise/activated/2 with ManaAbilities exemption, got {:?}",
         def.mode
     );
+}
+
+/// CR 601.2f + CR 605.1a: Anointed Peacekeeper's chosen-name tax is source-scoped,
+/// but its explicit mana-ability exception still applies to the named source.
+#[test]
+fn static_reduce_ability_cost_chosen_name_with_mana_exemption() {
+    for text in [
+        "Activated abilities of sources with the chosen name cost {2} more to activate unless they're mana abilities.",
+        "Activated abilities of sources with the chosen name cost {2} more to activate unless they\u{2019}re mana abilities.",
+    ] {
+        let def = parse_static_line(text)
+            .expect("Anointed Peacekeeper chosen-name activated-ability tax must parse");
+        assert!(matches!(def.affected, Some(TargetFilter::HasChosenName)));
+        assert!(
+            matches!(
+                &def.mode,
+                StaticMode::ReduceAbilityCost {
+                    mode: CostModifyMode::Raise,
+                    keyword,
+                    amount: 2,
+                    exemption: ActivationExemption::ManaAbilities,
+                    ..
+                } if keyword == "activated"
+            ),
+            "expected Raise/activated/2 with ManaAbilities exemption for {text:?}, got {:?}",
+            def.mode
+        );
+    }
 }
 
 /// CR 601.2f + CR 602.2 + CR 605.1a: The activator-scoped "Abilities you activate
