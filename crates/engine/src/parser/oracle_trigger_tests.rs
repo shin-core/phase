@@ -2998,6 +2998,66 @@ fn trigger_attacks_enchanted_player_scopes_to_attached_player() {
     );
 }
 
+/// Issue #5249 — The Spear of Bashenga: "Whenever equipped creature attacks
+/// the monarch, destroy target tapped nonland permanent that player controls."
+/// The " the monarch" defender scope must parse to
+/// `attack_target_filter = Monarch` so the trigger fires only when the equipped
+/// creature attacks whoever currently holds the monarch designation (CR 725.1).
+/// Before the fix there was no " the monarch" arm, so the trigger degraded to a
+/// bare `Attacks` with no attack-target scope and fired on every attack.
+/// Runtime firing / non-firing is covered by the discriminating integration test
+/// `spear_of_bashenga_attacks_monarch_5249`.
+#[test]
+fn trigger_attacks_the_monarch_scopes_to_monarch_filter() {
+    let def = parse_trigger_line(
+        "Whenever equipped creature attacks the monarch, destroy target tapped nonland permanent that player controls.",
+        "The Spear of Bashenga",
+    );
+    assert_eq!(def.mode, TriggerMode::Attacks);
+    assert_eq!(
+        def.attack_target_filter,
+        Some(AttackTargetFilter::Monarch),
+        "'attacks the monarch' must scope the attack target to the Monarch filter"
+    );
+    // The subject "equipped creature" scopes the attacker via `valid_card`
+    // (a creature filter), NOT `valid_source`/`valid_target`. The monarch
+    // identity is carried by the Monarch attack-target filter itself.
+    assert!(
+        def.valid_card.is_some(),
+        "equipped-creature subject must populate valid_card, got {:?}",
+        def.valid_card
+    );
+    assert_eq!(
+        def.valid_source, None,
+        "monarch attack subject is an object (equipped creature), not a player"
+    );
+    assert_eq!(
+        def.valid_target, None,
+        "monarch identity is checked by the Monarch filter, not via valid_target"
+    );
+    // The destroy target is a tapped nonland permanent controlled by the
+    // defending (monarch) player — resolved via `ControllerRef::DefendingPlayer`.
+    let effect = def
+        .execute
+        .as_ref()
+        .map(|e| e.effect.as_ref())
+        .expect("trigger must have an execute effect");
+    assert!(
+        !matches!(effect, Effect::Unimplemented { .. }),
+        "destroy effect must not be Unimplemented: {effect:?}"
+    );
+    match effect {
+        Effect::Destroy { target, .. } => {
+            let json = format!("{target:?}");
+            assert!(
+                json.contains("DefendingPlayer"),
+                "destroy target must be controlled by DefendingPlayer, got {target:?}"
+            );
+        }
+        other => panic!("expected Effect::Destroy, got {other:?}"),
+    }
+}
+
 #[test]
 fn opponent_attacks_that_player_library_binds_to_triggering_player() {
     let def = parse_trigger_line(

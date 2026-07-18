@@ -931,6 +931,12 @@ fn parse_referenced_player_phrase(input: &str) -> OracleResult<'_, ()> {
         value((), tag("another player")),
         value((), tag("an opponent")),
         value((), tag("a player")),
+        // CR 508.1a + CR 725.1: "attacks the monarch ... that player controls" —
+        // the monarch is the attacked (defending) player chosen at attack
+        // declaration, so the trailing "that player" anaphor binds to
+        // `ControllerRef::DefendingPlayer` (The Spear of Bashenga: "destroy
+        // target tapped nonland permanent that player controls").
+        value((), tag("the monarch")),
     ))
     .parse(input)
 }
@@ -9938,6 +9944,12 @@ fn try_parse_event(
                 // `valid_target = AttachedTo` (Curse of Predation, Curse of Chaos,
                 // Curse of Inertia).
                 value(AttackTargetFilter::Player, tag(" enchanted player")),
+                // CR 508.1a + CR 725.1: "attacks the monarch" — a Player-type
+                // attack whose defending player must currently hold the monarch
+                // designation. The monarch-identity check is stateful and lives
+                // in `attack_target_matches`, not in this pure type parse (The
+                // Spear of Bashenga).
+                value(AttackTargetFilter::Monarch, tag(" the monarch")),
                 value(AttackTargetFilter::Battle, tag(" a battle")),
             ))
             .parse(input)
