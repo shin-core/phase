@@ -877,63 +877,8 @@ pub(crate) fn parse_cda_quantity_with_context(
         }
     }
 
-    // CR 208.1: "the difference between its power and toughness" — the
-    // unsigned gap between an object's two current post-layer characteristics.
-    // ("The difference between A and B" being unsigned is an Oracle templating
-    // convention with no dedicated CR number; the resolver takes `.abs()`.)
-    // Composed from `tag`s by axis (subject form ×
-    // power/toughness ordering), emitting a general `QuantityExpr::Difference`
-    // over existing `QuantityRef::Power`/`Toughness` leaves. Placed before the
-    // generic `parse_quantity_ref` arm so the whole difference phrase is
-    // recognized as a unit. Operand order is irrelevant — `Difference`
-    // resolves to an absolute value — but both orderings are parsed so the
-    // remainder is fully consumed.
-    //
-    // CR 115.10: the P/T refs are scoped to `ObjectScope::Recipient`. On a
-    // trigger pump like Doran's ("Whenever a creature you control attacks or
-    // blocks, it gets +X/+X … where X is the difference between its power and
-    // toughness"), "its" anaphors back to the *affected* creature, not the
-    // ability's own source — `Recipient` resolves to the first object target
-    // (the pumped creature) and only falls back to the source when no target
-    // is present (the CDA case), so a single scope is correct for every
-    // parse path that lands a difference phrase.
-    if let Ok((rest, (left_ref, right_ref))) = (
-        tag::<_, _, OracleError<'_>>("the difference between "),
-        alt((tag("its "), tag("~'s "), tag("this creature's "))),
-        alt((
-            value(
-                (
-                    QuantityRef::Power {
-                        scope: ObjectScope::Recipient,
-                    },
-                    QuantityRef::Toughness {
-                        scope: ObjectScope::Recipient,
-                    },
-                ),
-                pair(tag("power and "), tag("toughness")),
-            ),
-            value(
-                (
-                    QuantityRef::Toughness {
-                        scope: ObjectScope::Recipient,
-                    },
-                    QuantityRef::Power {
-                        scope: ObjectScope::Recipient,
-                    },
-                ),
-                pair(tag("toughness and "), tag("power")),
-            ),
-        )),
-    )
-        .parse(text)
-        .map(|(rest, (_, _, refs))| (rest, refs))
-    {
-        if rest.is_empty() {
-            return Some(QuantityExpr::Difference {
-                left: Box::new(QuantityExpr::Ref { qty: left_ref }),
-                right: Box::new(QuantityExpr::Ref { qty: right_ref }),
-            });
-        }
+    if let Ok((_, expr)) = all_consuming(nom_quantity::parse_recipient_pt_difference).parse(text) {
+        return Some(expr);
     }
 
     // CR 208.1 / CR 107.1: General "the difference between A and B" over any
@@ -1759,6 +1704,11 @@ fn parse_anaphoric_power_toughness_sum(
 pub(crate) fn parse_event_context_quantity(text: &str) -> Option<QuantityExpr> {
     let lower = text.to_lowercase();
     let lower = lower.trim();
+    if let Ok((_, expr)) =
+        all_consuming(nom_quantity::parse_demonstrative_pt_difference).parse(lower)
+    {
+        return Some(expr);
+    }
     // CR 608.2c + CR 608.2h: "the X <verb>ed/<verb> this way" — numeric result from the
     // preceding effect (or trigger event) in the same resolution. Must check
     // before "that much" to avoid false match on "this way" vs. "this turn".
@@ -3629,6 +3579,42 @@ mod tests {
             ),
             "reversed ordering should still parse to a Difference, got {expr:?}"
         );
+    }
+
+    #[test]
+    fn event_context_difference_between_trigger_creatures_power_and_toughness() {
+        let expr = parse_event_context_quantity(
+            "the difference between that creature's power and its toughness",
+        );
+        assert!(
+            matches!(
+                expr,
+                Some(QuantityExpr::Difference { ref left, ref right })
+                    if matches!(**left, QuantityExpr::Ref { qty: QuantityRef::Power { scope: ObjectScope::Demonstrative } })
+                    && matches!(**right, QuantityExpr::Ref { qty: QuantityRef::Toughness { scope: ObjectScope::Demonstrative } })
+            ),
+            "bare demonstrative referent must use Demonstrative, got {expr:?}"
+        );
+    }
+
+    #[test]
+    fn event_context_pt_difference_does_not_claim_recipient_surfaces() {
+        for phrase in [
+            "the difference between its power and toughness",
+            "the difference between ~'s power and its toughness",
+            "the difference between this creature's power and toughness",
+        ] {
+            assert_eq!(
+                parse_event_context_quantity(phrase),
+                None,
+                "recipient phrase must not bind to Demonstrative: {phrase:?}"
+            );
+            assert_eq!(
+                parse_cda_quantity(phrase),
+                Some(pt_difference()),
+                "recipient grammar must remain reachable for {phrase:?}"
+            );
+        }
     }
 
     /// CR 107.1a: a "where X is half …, rounded …" binding routes through

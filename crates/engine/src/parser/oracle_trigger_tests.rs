@@ -6334,6 +6334,55 @@ fn doran_attack_block_pump_resolves_pt_difference() {
 }
 
 #[test]
+fn jaws_of_defeat_binds_life_loss_to_entering_creature_pt_difference() {
+    let def = parse_trigger_line(
+        "Whenever a creature you control enters, target opponent loses life equal to the difference between that creature's power and its toughness.",
+        "Jaws of Defeat",
+    );
+
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.destination, Some(Zone::Battlefield));
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You)
+        ))
+    );
+    assert_eq!(def.valid_target, Some(TargetFilter::Player));
+
+    let execute = def.execute.as_ref().expect("Jaws trigger execute");
+    let Effect::LoseLife { amount, target } = execute.effect.as_ref() else {
+        panic!("expected typed LoseLife, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        target,
+        &Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        )),
+        "target opponent must remain a selectable opponent player filter"
+    );
+    assert_eq!(
+        amount,
+        &QuantityExpr::Difference {
+            left: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::Demonstrative,
+                },
+            }),
+            right: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::Toughness {
+                    scope: ObjectScope::Demonstrative,
+                },
+            }),
+        }
+    );
+    assert!(
+        !matches!(execute.effect.as_ref(), Effect::Unimplemented { .. }),
+        "Jaws must not hide the dynamic quantity behind Unimplemented"
+    );
+}
+
+#[test]
 fn trigger_execute_pump_all_creatures() {
     // Regression: trigger bodies with "creatures you control get +1/+1 until end of turn"
     // must produce a PumpAll execute effect, not null.

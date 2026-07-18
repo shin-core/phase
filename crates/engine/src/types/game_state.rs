@@ -10414,6 +10414,14 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub lki_cache: HashMap<ObjectId, LKISnapshot>,
 
+    /// CR 400.7 + CR 608.2h: LKI keyed by exact object incarnation. The legacy
+    /// `lki_cache` remains the broad ObjectId-only authority for existing callers;
+    /// resolution paths that carry an incarnation use this history so a later
+    /// departure of a re-entered object cannot overwrite the earlier object's LKI.
+    /// Cleared with `lki_cache` on phase/step transitions.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub lki_by_incarnation: HashMap<ObjectId, HashMap<u64, LKISnapshot>>,
+
     /// CR 607.2b + CR 603.10e: Last-known "cards exiled with [source]" linkage,
     /// captured when a source with `TrackedBySource` exile links leaves the
     /// battlefield. The live `exile_links` are pruned on battlefield exit
@@ -11833,6 +11841,7 @@ impl GameState {
             last_discover_value: None,
             stack_trigger_event_batches: HashMap::new(),
             lki_cache: HashMap::new(),
+            lki_by_incarnation: HashMap::new(),
             linked_exile_lki: HashMap::new(),
             cost_payment_failed_flag: false,
             pending_taps_for_mana_overrides: std::collections::HashMap::new(),
@@ -12416,6 +12425,112 @@ impl GameState {
         for epic in clone.epic_effects.iter_mut() {
             epic.spell.set_source_incarnation_recursive(None);
         }
+
+        // CR 104.4b + CR 732.2a: incarnation-versioned LKI is historical support
+        // state, not independently loop-material state. Retain only snapshots
+        // reachable from trigger-event carriers that can still resume or resolve:
+        // stack/resolving entries, pending/deferred/ordering triggers, current and
+        // batched trigger contexts, and continuation/optional-choice sidecars.
+        // WaitingFor copies are intentionally not a separate authority: every
+        // trigger-event-bearing prompt has one of those pending/continuation
+        // carriers, and loop samples are taken at the post-pipeline Priority frame.
+        let mut referenced_lki = HashSet::new();
+        let mut record_event = |event: &GameEvent| {
+            if let GameEvent::ZoneChanged {
+                object_id, record, ..
+            } = event
+            {
+                if let Some(incarnation) = record.entered_incarnation {
+                    referenced_lki.insert(ObjectIncarnationRef::of(*object_id, incarnation));
+                }
+            }
+        };
+
+        for entry in &clone.stack {
+            if let StackEntryKind::TriggeredAbility {
+                trigger_event: Some(event),
+                ..
+            } = &entry.kind
+            {
+                record_event(event);
+            }
+        }
+        if let Some(entry) = clone.resolving_stack_entry.as_ref() {
+            if let StackEntryKind::TriggeredAbility {
+                trigger_event: Some(event),
+                ..
+            } = &entry.kind
+            {
+                record_event(event);
+            }
+        }
+        if let Some(pending) = clone.pending_trigger.as_ref() {
+            if let Some(event) = pending.trigger_event.as_ref() {
+                record_event(event);
+            }
+        }
+        for event in &clone.pending_trigger_event_batch {
+            record_event(event);
+        }
+        for context in &clone.deferred_triggers {
+            if let Some(event) = context.pending.trigger_event.as_ref() {
+                record_event(event);
+            }
+            for event in &context.trigger_events {
+                record_event(event);
+            }
+        }
+        if let Some(order) = clone.pending_trigger_order.as_ref() {
+            for context in order.groups.iter().flat_map(|group| group.triggers.iter()) {
+                if let Some(event) = context.pending.trigger_event.as_ref() {
+                    record_event(event);
+                }
+                for event in &context.trigger_events {
+                    record_event(event);
+                }
+            }
+        }
+        if let Some(event) = clone.current_trigger_event.as_ref() {
+            record_event(event);
+        }
+        for event in &clone.current_trigger_events {
+            record_event(event);
+        }
+        for events in clone.stack_trigger_event_batches.values() {
+            for event in events {
+                record_event(event);
+            }
+        }
+        if let Some(event) = clone.pending_optional_trigger_event.as_ref() {
+            record_event(event);
+        }
+        if let Some(context) = clone.pending_choose_zone_trigger_context.as_ref() {
+            if let Some(event) = context.event.as_ref() {
+                record_event(event);
+            }
+            for event in &context.events {
+                record_event(event);
+            }
+        }
+        if let Some(context) = clone
+            .pending_continuation
+            .as_ref()
+            .and_then(|continuation| continuation.trigger_context.as_ref())
+        {
+            if let Some(event) = context.event.as_ref() {
+                record_event(event);
+            }
+            for event in &context.events {
+                record_event(event);
+            }
+        }
+
+        clone.lki_by_incarnation.retain(|object_id, history| {
+            history.retain(|incarnation, _| {
+                referenced_lki.contains(&ObjectIncarnationRef::of(*object_id, *incarnation))
+            });
+            !history.is_empty()
+        });
         clone
     }
 
@@ -12838,6 +12953,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         current_trigger_events: _,
         stack_trigger_event_batches: _,
         lki_cache: _,
+        lki_by_incarnation: _,
         linked_exile_lki: _,
         cost_payment_failed_flag: _,
         pending_taps_for_mana_overrides: _,
@@ -13144,6 +13260,7 @@ impl PartialEq for GameState {
             && self.optional_cost_payments_this_resolution
                 == other.optional_cost_payments_this_resolution
             && self.lki_cache == other.lki_cache
+            && self.lki_by_incarnation == other.lki_by_incarnation
             && self.city_blessing == other.city_blessing
             && self.planar_deck == other.planar_deck
             && self.planar_controller == other.planar_controller
@@ -14050,6 +14167,119 @@ mod tests {
         assert!(
             loop_states_equal(&a.normalize_for_loop(), &b.normalize_for_loop()),
             "normalize_for_loop must zero source_incarnation across delayed_triggers + stack"
+        );
+    }
+
+    /// CR 104.4b + CR 732.2a: repeated same-step zone cycles accumulate
+    /// incarnation-versioned LKI, but snapshots no pending trigger can consume
+    /// are history rather than a change to the recurring game state. A snapshot
+    /// still named by a trigger event remains rules-material and must distinguish
+    /// normalized states.
+    #[test]
+    fn normalize_for_loop_prunes_unreferenced_lki_incarnations_but_keeps_referenced_snapshot() {
+        use crate::types::ability::Effect;
+
+        fn snapshot(power: i32) -> LKISnapshot {
+            LKISnapshot {
+                name: "Loop Entrant".to_string(),
+                token_image_ref: None,
+                power: Some(power),
+                toughness: Some(2),
+                base_power: Some(2),
+                base_toughness: Some(2),
+                mana_value: 2,
+                controller: PlayerId(0),
+                owner: PlayerId(0),
+                card_types: vec![CoreType::Creature],
+                subtypes: Vec::new(),
+                supertypes: Vec::new(),
+                keywords: Vec::new(),
+                colors: Vec::new(),
+                chosen_attributes: Vec::new(),
+                counters: HashMap::new(),
+                tapped: false,
+                is_suspected: false,
+                attachments: Vec::new(),
+            }
+        }
+
+        let entrant = ObjectId(50);
+        let referenced_incarnation = 7;
+        let mut record =
+            ZoneChangeRecord::test_minimal(entrant, Some(Zone::Exile), Zone::Battlefield);
+        record.entered_incarnation = Some(referenced_incarnation);
+        let trigger_event = GameEvent::ZoneChanged {
+            object_id: entrant,
+            from: Some(Zone::Exile),
+            to: Zone::Battlefield,
+            record: Box::new(record),
+        };
+        let ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(5),
+            PlayerId(0),
+        );
+
+        let mut a = GameState::new_two_player(7);
+        a.stack.push_back(StackEntry {
+            id: ObjectId(20),
+            source_id: ObjectId(5),
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: ObjectId(5),
+                ability: Box::new(ability),
+                condition: None,
+                trigger_event: Some(trigger_event),
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+            },
+        });
+        a.lki_by_incarnation
+            .entry(entrant)
+            .or_default()
+            .insert(referenced_incarnation, snapshot(5));
+        a.lki_by_incarnation
+            .entry(entrant)
+            .or_default()
+            .insert(8, snapshot(2));
+
+        let mut b = a.clone();
+        b.lki_by_incarnation
+            .entry(entrant)
+            .or_default()
+            .insert(9, snapshot(2));
+        assert_ne!(a, b, "fixture differs by irrelevant accumulated LKI");
+
+        let normalized_a = a.normalize_for_loop();
+        let normalized_b = b.normalize_for_loop();
+        assert!(
+            loop_states_equal(&normalized_a, &normalized_b),
+            "irrelevant incarnation history must not block loop recurrence"
+        );
+        assert_eq!(
+            normalized_a.lki_by_incarnation[&entrant]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![referenced_incarnation],
+            "the trigger-referenced incarnation remains available"
+        );
+
+        let mut changed_reference = a;
+        changed_reference
+            .lki_by_incarnation
+            .get_mut(&entrant)
+            .unwrap()
+            .insert(referenced_incarnation, snapshot(4));
+        assert!(
+            !loop_states_equal(&normalized_a, &changed_reference.normalize_for_loop()),
+            "different LKI for a still-referenced incarnation remains meaningful"
         );
     }
 
