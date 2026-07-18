@@ -10,7 +10,7 @@ use super::ability::{
     AdditionalCostInstance, AdditionalCostInstancePayment, AttackSubject, BeholdCostAction,
     CastVariantPaid, CategoryChooserScope, ChoiceType, ChoiceValue, ChooseFromZoneConstraint,
     ChosenAttribute, CoinFlipResult, Comparator, ContinuousModification, ControlWindow,
-    CopyChooseScope, CopyScale, CostPaidObjectSnapshot, CounterCostSelection,
+    CopiableValues, CopyChooseScope, CopyScale, CostPaidObjectSnapshot, CounterCostSelection,
     DelayedTriggerCondition, Duration, EffectKind, FaceDownProfile, GameRestriction, KeywordAction,
     KickerVariant, LibraryPosition, ModalChoice, PermanentEntryMode, PileSource, QuantityExpr,
     ResolvedAbility, SearchDestinationSplit, SearchSelectionConstraint, StaticCondition,
@@ -10500,6 +10500,12 @@ pub struct GameState {
     /// Cleared on phase/step transitions via `advance_phase()`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub lki_cache: HashMap<ObjectId, LKISnapshot>,
+    /// CR 608.2h + CR 707.2: Full copiable-values LKI for objects that leave a
+    /// public zone. Ordinary `LKISnapshot` is intentionally filter-shaped and
+    /// does not carry ability definitions; copy effects need the complete
+    /// copiable surface when the copy source later ceases to exist.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub lki_copiable_values: HashMap<ObjectId, CopiableValues>,
 
     /// CR 400.7 + CR 608.2h: LKI keyed by exact object incarnation. The legacy
     /// `lki_cache` remains the broad ObjectId-only authority for existing callers;
@@ -11928,6 +11934,7 @@ impl GameState {
             last_discover_value: None,
             stack_trigger_event_batches: HashMap::new(),
             lki_cache: HashMap::new(),
+            lki_copiable_values: HashMap::new(),
             lki_by_incarnation: HashMap::new(),
             linked_exile_lki: HashMap::new(),
             cost_payment_failed_flag: false,
@@ -13041,6 +13048,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         current_trigger_events: _,
         stack_trigger_event_batches: _,
         lki_cache: _,
+        lki_copiable_values: _,
         lki_by_incarnation: _,
         linked_exile_lki: _,
         cost_payment_failed_flag: _,
@@ -13348,6 +13356,7 @@ impl PartialEq for GameState {
             && self.optional_cost_payments_this_resolution
                 == other.optional_cost_payments_this_resolution
             && self.lki_cache == other.lki_cache
+            && self.lki_copiable_values == other.lki_copiable_values
             && self.lki_by_incarnation == other.lki_by_incarnation
             && self.city_blessing == other.city_blessing
             && self.planar_deck == other.planar_deck
