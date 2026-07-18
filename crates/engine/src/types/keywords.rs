@@ -1720,15 +1720,19 @@ impl Keyword {
     ///   each instance's parameter (a creature's total toxic value). Only Toxic
     ///   sums today. Protection (CR 702.16g), Ward, Annihilator, Afflict, Frenzy do
     ///   NOT sum — they keep deduping identical instances.
-    /// - **Instance-count multiplicity** (CR 702.44d): a parameter-less as-enters
+    /// - **Instance-count multiplicity** (CR 702.44d + CR 702.54c): an as-enters
     ///   static ability where "each instance works separately" — Sunburst places
-    ///   its as-enters counters once per instance (CR 702.44a). A GRANTED Sunburst
-    ///   ("that spell gains sunburst": Solar Array / Lux Artillery) on top of a
-    ///   printed one must coexist so both the printed object-carried replacement AND
-    ///   the granted virtual replacement (`granted_sunburst_instances` counts the
-    ///   base-subtracted surplus) fire. Without coexistence the layer-6 grant
+    ///   its as-enters counters once per instance (CR 702.44a), and Bloodthirst
+    ///   likewise places its counters once per instance (CR 702.54a). A GRANTED
+    ///   Sunburst ("that spell gains sunburst": Solar Array / Lux Artillery) or
+    ///   GRANTED Bloodthirst ("it gains bloodthirst 3": Bloodlord of Vaasgoth) on
+    ///   top of an identical printed one must coexist so both the printed
+    ///   object-carried replacement AND the granted virtual replacement (counting
+    ///   the base-subtracted surplus) fire. Without coexistence the layer-6 grant
     ///   dedups against the identical printed instance and the granted instance is
-    ///   silently lost.
+    ///   silently lost. (Bloodthirst carries a `BloodthirstValue`, so the
+    ///   granted-count is per DISTINCT value — a granted `bloodthirst 3` and a
+    ///   printed `bloodthirst 1` never dedup regardless.)
     ///
     /// Distinct from `instances_function_separately` (which gates per-instance
     /// TRIGGER installation, and deliberately excludes Sunburst because its
@@ -1741,7 +1745,10 @@ impl Keyword {
     /// Toxic is inert at cast time) and the layers `AddDynamicKeyword` arm
     /// (`DynamicKeywordKind` is only Annihilator/Modular, never Toxic/Sunburst).
     pub fn sums_across_instances(&self) -> bool {
-        matches!(self, Keyword::Toxic(_) | Keyword::Sunburst)
+        matches!(
+            self,
+            Keyword::Toxic(_) | Keyword::Sunburst | Keyword::Bloodthirst(_)
+        )
     }
 
     /// CR 613.7: When multiple effects grant the same single-authoritative-value

@@ -165,6 +165,7 @@ mod gollum_scheming_guide_card_predicate_guess;
 mod good_king_mog_xii_chapter_iv_588;
 mod gran_gran_integration;
 mod granted_alt_cost_hand_keyword;
+mod granted_bloodthirst_5802;
 mod granted_sunburst_5337;
 mod greater_good_activation;
 mod green_suns_zenith_regression;

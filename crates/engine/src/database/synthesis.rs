@@ -8129,27 +8129,51 @@ pub fn synthesize_bloodthirst(face: &mut CardFace) {
         if existing >= needed {
             continue;
         }
-        let etb_counters = AbilityDefinition::new(
-            AbilityKind::Spell,
-            Effect::PutCounter {
-                counter_type: CounterType::Plus1Plus1,
-                count: bloodthirst_counter_quantity(value),
-                target: TargetFilter::SelfRef,
-            },
-        )
-        .description(bloodthirst_execute_description(value));
+        face.replacements
+            .push(bloodthirst_replacement_definition(value));
+    }
+}
 
-        let replacement = ReplacementDefinition {
-            event: ReplacementEvent::Moved,
-            execute: Some(Box::new(etb_counters)),
-            valid_card: Some(TargetFilter::SelfRef),
-            condition: bloodthirst_condition(value),
-            // CR 614.1c: battlefield-entry-scoped (departure gate).
-            destination_zone: Some(Zone::Battlefield),
-            description: Some(bloodthirst_replacement_description(value)),
-            ..ReplacementDefinition::new(ReplacementEvent::Moved)
-        };
-        face.replacements.push(replacement);
+/// CR 702.54a + CR 702.54b + CR 702.54c: the single per-instance Bloodthirst ETB
+/// replacement definition — one `Moved`→Battlefield replacement on `SelfRef`
+/// whose execute places `bloodthirst_counter_quantity(value)` +1/+1 counters,
+/// gated by `bloodthirst_condition(value)` (the fixed-N form is conditional on an
+/// opponent having been dealt damage this turn; the X form is unconditional and
+/// its count reads the damage total directly).
+///
+/// The single authority for building a Bloodthirst replacement, shared by:
+/// - build-time synthesis (`synthesize_bloodthirst`) for PRINTED Bloodthirst, and
+/// - the runtime granted-keyword replacement path
+///   (`granted_bloodthirst_instances` → `find_applicable_replacements`), which
+///   surfaces one virtual candidate per *granted* Bloodthirst instance so a grant
+///   ("it gains bloodthirst 3": Bloodlord of Vaasgoth) also places counters at
+///   entry (mirrors `sunburst_replacement_definition`, #5802).
+///
+/// Because both callers build identical definitions, printed + granted instances
+/// each yield a distinct candidate and apply separately per CR 702.54c ("each
+/// instance works separately").
+pub(crate) fn bloodthirst_replacement_definition(
+    value: &BloodthirstValue,
+) -> ReplacementDefinition {
+    let etb_counters = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: bloodthirst_counter_quantity(value),
+            target: TargetFilter::SelfRef,
+        },
+    )
+    .description(bloodthirst_execute_description(value));
+
+    ReplacementDefinition {
+        event: ReplacementEvent::Moved,
+        execute: Some(Box::new(etb_counters)),
+        valid_card: Some(TargetFilter::SelfRef),
+        condition: bloodthirst_condition(value),
+        // CR 614.1c: battlefield-entry-scoped (departure gate).
+        destination_zone: Some(Zone::Battlefield),
+        description: Some(bloodthirst_replacement_description(value)),
+        ..ReplacementDefinition::new(ReplacementEvent::Moved)
     }
 }
 

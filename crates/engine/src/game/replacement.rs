@@ -79,7 +79,23 @@ const COMMANDER_HAND_OR_LIBRARY_RETURN_INDEX: usize = usize::MAX - 6;
 /// instances each yield a distinct candidate and apply separately. Only the
 /// entering object's own granted sunburst is at issue, so the reserved index is
 /// keyed on the entering object.
+///
+/// Sunburst and Bloodthirst share the SAME structural gap — a printed as-enters
+/// keyword synthesized into object-carried replacements, versus a runtime grant
+/// that adds only the keyword — so they share the count/apply core
+/// (`granted_keyword_etb_instances`, `apply_granted_keyword_etb_replacement`);
+/// only the reserved index and per-instance-definition builder differ. Any future
+/// granted as-enters keyword adds one more reserved index feeding the same core.
 const GRANTED_SUNBURST_INDEX: usize = usize::MAX - 7;
+/// CR 702.54a + CR 702.54c: Granted Bloodthirst — the Bloodthirst analogue of
+/// `GRANTED_SUNBURST_INDEX`. Bloodlord of Vaasgoth's "Whenever you cast a Vampire
+/// creature spell, it gains bloodthirst 3" adds only the keyword to the cast
+/// spell; printed Bloodthirst is synthesized into carried replacements by
+/// `synthesize_bloodthirst`, so this reserved candidate surfaces one virtual ETB
+/// replacement per GRANTED Bloodthirst instance. Unlike Sunburst, the fixed-N
+/// form is CONDITIONAL (an opponent must have been dealt damage this turn), so the
+/// shared applier honors each granted instance's carried `condition`.
+const GRANTED_BLOODTHIRST_INDEX: usize = usize::MAX - 8;
 
 /// CR 109.4 + CR 108.4a: Cards outside the battlefield/stack have no
 /// controller; if an effect asks for a card's controller, use its owner
@@ -233,48 +249,168 @@ fn object_has_finality_counter(state: &GameState, object_id: ObjectId) -> bool {
         .is_some_and(|count| *count > 0)
 }
 
-fn granted_sunburst_replacement_id(object_id: ObjectId) -> ReplacementId {
-    ReplacementId {
-        source: object_id,
-        index: GRANTED_SUNBURST_INDEX,
+/// The reserved virtual-candidate index for each granted as-enters keyword family
+/// (Sunburst, Bloodthirst). One reserved id per keyword feeds the shared
+/// count/apply core, so the applier recovers WHICH keyword's per-instance
+/// definitions to place from `rid.index` alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantedEtbKeyword {
+    Sunburst,
+    Bloodthirst,
+}
+
+impl GrantedEtbKeyword {
+    fn from_index(index: usize) -> Option<Self> {
+        match index {
+            GRANTED_SUNBURST_INDEX => Some(Self::Sunburst),
+            GRANTED_BLOODTHIRST_INDEX => Some(Self::Bloodthirst),
+            _ => None,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Sunburst => GRANTED_SUNBURST_INDEX,
+            Self::Bloodthirst => GRANTED_BLOODTHIRST_INDEX,
+        }
     }
 }
 
-fn is_granted_sunburst_replacement(rid: ReplacementId) -> bool {
-    rid.index == GRANTED_SUNBURST_INDEX
+fn granted_etb_keyword_replacement_id(object_id: ObjectId, kw: GrantedEtbKeyword) -> ReplacementId {
+    ReplacementId {
+        source: object_id,
+        index: kw.index(),
+    }
 }
 
-/// CR 702.44d + CR 604.1: The number of GRANTED sunburst instances on `object_id`
-/// — the object's EFFECTIVE sunburst count minus its printed (base) count.
+fn is_granted_etb_keyword_replacement(rid: ReplacementId) -> bool {
+    GrantedEtbKeyword::from_index(rid.index).is_some()
+}
+
+/// CR 604.1 + CR 613.1f: The count of GRANTED instances of `keyword` on
+/// `object_id` matching `predicate` — the object's EFFECTIVE matching-keyword
+/// count minus its printed (base) matching count.
 ///
-/// Printed sunburst is realized through object-carried `ReplacementDefinition`s
-/// (`synthesize_sunburst`); only the granted instances need a virtual candidate,
-/// so subtract `base_keywords` (mirrors `synthesize_granted_keyword_triggers`).
-/// Printed-only sunburst returns 0 here — its counters come from the carried
-/// definitions, never this path — which keeps printed + granted double-applying
-/// per CR 702.44d.
+/// Printed as-enters keywords (Sunburst, Bloodthirst) are realized through
+/// object-carried `ReplacementDefinition`s at synthesis time; only the granted
+/// instances need a virtual candidate, so subtract `base_keywords` (mirrors
+/// `synthesize_granted_keyword_triggers`). A printed-only keyword returns 0 here —
+/// its counters come from the carried definitions, never this path — which keeps
+/// printed + granted double-applying (CR 702.44d / CR 702.54c).
 ///
-/// CRITICAL: the entering spell is still on the STACK when its entry
-/// replacement pipeline runs, and a granted keyword exists only as a
-/// continuous effect at that moment — `obj.keywords` is NOT yet materialized
-/// for stack objects. `effective_off_zone_keywords` is the single authority
-/// that resolves the live keyword list for any zone (materialized list for
-/// battlefield objects; base + ordered continuous grants, including transient
-/// effects, for stack/off-zone objects — CR 613.1f recursion-guarded).
-fn granted_sunburst_instances(state: &GameState, object_id: ObjectId) -> usize {
+/// CRITICAL: the entering spell is still on the STACK when its entry replacement
+/// pipeline runs, and a granted keyword exists only as a continuous effect at that
+/// moment — `obj.keywords` is NOT yet materialized for stack objects.
+/// `effective_off_zone_keywords` is the single authority that resolves the live
+/// keyword list for any zone (materialized list for battlefield objects; base +
+/// ordered continuous grants, including transient effects, for stack/off-zone
+/// objects — CR 613.1f recursion-guarded).
+///
+/// `predicate` keys the count to a specific keyword identity: `Sunburst` is
+/// parameter-less (match the variant); `Bloodthirst(v)` must match a distinct
+/// value so a granted `bloodthirst 3` on top of a printed `bloodthirst 1` counts
+/// one granted 3 and one printed 1 separately (CR 702.54c).
+fn granted_keyword_etb_instances(
+    state: &GameState,
+    object_id: ObjectId,
+    predicate: impl Fn(&crate::types::keywords::Keyword) -> bool,
+) -> usize {
     let Some(obj) = state.objects.get(&object_id) else {
         return 0;
     };
     let live = crate::game::off_zone_characteristics::effective_off_zone_keywords(state, object_id)
         .iter()
-        .filter(|kw| matches!(kw, crate::types::keywords::Keyword::Sunburst))
+        .filter(|kw| predicate(kw))
         .count();
-    let base = obj
-        .base_keywords
-        .iter()
-        .filter(|kw| matches!(kw, crate::types::keywords::Keyword::Sunburst))
-        .count();
+    let base = obj.base_keywords.iter().filter(|kw| predicate(kw)).count();
     live.saturating_sub(base)
+}
+
+/// CR 702.44d: number of GRANTED sunburst instances (parameter-less).
+fn granted_sunburst_instances(state: &GameState, object_id: ObjectId) -> usize {
+    granted_keyword_etb_instances(state, object_id, |kw| {
+        matches!(kw, crate::types::keywords::Keyword::Sunburst)
+    })
+}
+
+/// CR 702.54c: The GRANTED Bloodthirst instances on `object_id`, one entry per
+/// granted instance carrying its `BloodthirstValue`. Counted per DISTINCT value
+/// (effective-minus-base per value) exactly as `synthesize_bloodthirst` emits one
+/// printed replacement per value, so a granted `bloodthirst 3` on a printed
+/// `bloodthirst 1` yields exactly one granted-3 entry here.
+fn granted_bloodthirst_instances(
+    state: &GameState,
+    object_id: ObjectId,
+) -> Vec<crate::types::keywords::BloodthirstValue> {
+    use crate::types::keywords::Keyword;
+    let Some(obj) = state.objects.get(&object_id) else {
+        return Vec::new();
+    };
+    let live = crate::game::off_zone_characteristics::effective_off_zone_keywords(state, object_id);
+    let distinct_values: Vec<_> = live
+        .iter()
+        .filter_map(|kw| match kw {
+            Keyword::Bloodthirst(v) => Some(v.clone()),
+            _ => None,
+        })
+        .fold(Vec::new(), |mut acc, v| {
+            if !acc.contains(&v) {
+                acc.push(v);
+            }
+            acc
+        });
+    let mut granted = Vec::new();
+    for value in distinct_values {
+        let live_n = live
+            .iter()
+            .filter(|kw| matches!(kw, Keyword::Bloodthirst(v) if *v == value))
+            .count();
+        let base_n = obj
+            .base_keywords
+            .iter()
+            .filter(|kw| matches!(kw, Keyword::Bloodthirst(v) if *v == value))
+            .count();
+        for _ in 0..live_n.saturating_sub(base_n) {
+            granted.push(value.clone());
+        }
+    }
+    granted
+}
+
+/// Whether the granted `kw` virtual candidate should surface for `object_id` at
+/// `event` — i.e. there is at least one granted instance whose carried condition
+/// (if any) holds. This mirrors the PRINTED replacement path, which evaluates a
+/// definition's `condition` at candidate-registration time and does not surface a
+/// candidate whose condition is unmet (so a condition-unmet granted Bloodthirst
+/// raises no spurious CR 616.1 ordering prompt). Sunburst definitions carry no
+/// condition, so this reduces to "has at least one granted instance."
+///
+/// The applier (`apply_granted_keyword_etb_replacement`) re-derives and re-checks
+/// the same per-instance definitions, so registration and application agree.
+fn granted_etb_keyword_candidate_applies(
+    state: &GameState,
+    object_id: ObjectId,
+    kw: GrantedEtbKeyword,
+    event: &ProposedEvent,
+) -> bool {
+    let controller = state
+        .objects
+        .get(&object_id)
+        .map(replacement_source_player)
+        .unwrap_or(state.active_player);
+    granted_etb_replacement_definitions(state, object_id, kw)
+        .iter()
+        .any(|definition| match &definition.condition {
+            Some(cond) => evaluate_replacement_condition(
+                cond,
+                controller,
+                object_id,
+                state,
+                event.affected_object_id(),
+                event,
+            ),
+            None => true,
+        })
 }
 
 fn compleated_life_paid(state: &GameState, object_id: ObjectId) -> Option<u32> {
@@ -384,84 +520,139 @@ fn apply_compleated_replacement(
     }
 }
 
-/// CR 702.44a + CR 702.44d + CR 614.1c: Apply the granted-sunburst virtual ETB
-/// replacement — fold the as-enters counters onto the entering spell's
-/// `ZoneChange`, one placement per GRANTED sunburst instance.
+/// Build the per-instance `ReplacementDefinition`s for each GRANTED as-enters
+/// keyword instance on `object_id`, using the same shared authority the printed
+/// synthesizer uses so a granted spell places exactly the counters a printed one
+/// would (CR 702.44d / CR 702.54c: each instance works separately).
 ///
-/// The per-instance counter shape is the single shared authority
-/// (`sunburst_replacement_definition`) the printed-sunburst synthesizer also
-/// builds, so a granted spell places exactly the same as-enters counters a
-/// printed one would. The counter branch (+1/+1 vs charge) is chosen from the
-/// entering object's current core types (CR 702.44a), and the per-color count
-/// is resolved by `event_modifiers_for_ability` against the entering spell so
-/// `QuantityRef::ManaSpentToCast { DistinctColors }` reads its own
-/// `colors_spent_to_cast` (CR 601.2h) — identical to the printed path.
+/// - Sunburst: N identical copies of `sunburst_replacement_definition`, branching
+///   the counter type on the entering object's CURRENT core types (CR 702.44a).
+/// - Bloodthirst: one `bloodthirst_replacement_definition(value)` per granted
+///   instance, each carrying its own `condition` (CR 702.54a fixed-N is gated on
+///   an opponent having been dealt damage this turn).
+fn granted_etb_replacement_definitions(
+    state: &GameState,
+    object_id: ObjectId,
+    kw: GrantedEtbKeyword,
+) -> Vec<ReplacementDefinition> {
+    match kw {
+        GrantedEtbKeyword::Sunburst => {
+            let instances = granted_sunburst_instances(state, object_id);
+            // CR 702.44a: branch on the entering object's current core types.
+            let counter_type = state
+                .objects
+                .get(&object_id)
+                .filter(|obj| obj.card_types.core_types.contains(&CoreType::Creature))
+                .map(|_| CounterType::Plus1Plus1)
+                .unwrap_or_else(|| CounterType::Generic("charge".to_string()));
+            let definition =
+                crate::database::synthesis::sunburst_replacement_definition(&counter_type);
+            std::iter::repeat_n(definition, instances).collect()
+        }
+        GrantedEtbKeyword::Bloodthirst => granted_bloodthirst_instances(state, object_id)
+            .iter()
+            .map(crate::database::synthesis::bloodthirst_replacement_definition)
+            .collect(),
+    }
+}
+
+/// CR 702.44a + CR 702.44d + CR 702.54a + CR 702.54c + CR 614.1c: Apply a granted
+/// as-enters-keyword virtual ETB replacement (Sunburst or Bloodthirst) — fold the
+/// as-enters counters onto the entering spell's `ZoneChange`, one placement group
+/// per GRANTED instance.
 ///
-/// One `enter_with_counters` entry is pushed per granted instance (CR 702.44d:
-/// each instance works separately), so a counter-doubling replacement
-/// (Doubling Season) doubles each instance's placement independently, exactly
-/// as it would for multiple printed instances.
-fn apply_granted_sunburst_replacement(
+/// Each per-instance `ReplacementDefinition` comes from the same shared authority
+/// the printed synthesizer uses (`granted_etb_replacement_definitions`), so a
+/// granted spell places exactly the counters a printed one would; the count is
+/// resolved by `event_modifiers_for_ability` against the entering spell so a
+/// self-scoped quantity ref (Sunburst's `ManaSpentToCast`, Bloodthirst X's damage
+/// total) reads its own cast/damage context (CR 601.2h).
+///
+/// CR 702.54a — Bloodthirst is CONDITIONAL: each granted instance whose carried
+/// `condition` is unmet (no opponent dealt damage this turn) contributes ZERO
+/// counters, routed through the SAME `evaluate_replacement_condition` seam the
+/// printed Bloodthirst path uses. Sunburst definitions carry `condition: None`
+/// and are always applied.
+///
+/// One `enter_with_counters` group is pushed per granted instance (CR 702.44d /
+/// CR 702.54c: each instance works separately), so a counter-doubling replacement
+/// (Doubling Season) doubles each instance's placement independently, exactly as
+/// it would for multiple printed instances.
+fn apply_granted_keyword_etb_replacement(
     state: &mut GameState,
-    event: ProposedEvent,
+    mut event: ProposedEvent,
     rid: ReplacementId,
     events: &mut Vec<GameEvent>,
 ) -> ProposedEvent {
-    let instances = granted_sunburst_instances(state, rid.source);
-    if instances == 0 {
-        return event;
-    }
-    // CR 702.44a: branch on the entering object's current core types.
-    let counter_type = state
-        .objects
-        .get(&rid.source)
-        .filter(|obj| obj.card_types.core_types.contains(&CoreType::Creature))
-        .map(|_| CounterType::Plus1Plus1)
-        .unwrap_or_else(|| CounterType::Generic("charge".to_string()));
-
-    let definition = crate::database::synthesis::sunburst_replacement_definition(&counter_type);
-    // Resolve the per-color count once via the shared ETB-modifier extractor,
-    // threading the entering object as the source so the self-scoped
-    // `ManaSpentToCast` ref reads its own cast tally (CR 601.2h).
-    let modifiers =
-        event_modifiers_for_ability(definition.execute.as_deref(), state, rid.source, &event);
-
-    let ProposedEvent::ZoneChange {
-        object_id,
-        from,
-        to,
-        cause,
-        attach_to,
-        enter_tapped,
-        mut enter_with_counters,
-        controller_override,
-        enter_transformed,
-        face_down_profile,
-        applied,
-    } = event
-    else {
+    let Some(kw) = GrantedEtbKeyword::from_index(rid.index) else {
         return event;
     };
-    if object_id != rid.source {
-        // Rebuild the event unchanged if the ids diverged (defensive; the
-        // candidate is keyed on the entering object so this never fires).
-        return ProposedEvent::ZoneChange {
-            object_id,
-            from,
-            to,
-            cause,
-            attach_to,
-            enter_tapped,
-            enter_with_counters,
-            controller_override,
-            enter_transformed,
-            face_down_profile,
-            applied,
-        };
+    // The candidate is keyed on the entering object; bail unchanged if the ids
+    // diverged (defensive) or the event is not the entering spell's ZoneChange.
+    let ProposedEvent::ZoneChange { object_id, .. } = &event else {
+        return event;
+    };
+    if *object_id != rid.source {
+        return event;
     }
-    // CR 702.44d: one placement per granted instance.
-    for _ in 0..instances {
-        enter_with_counters.extend(modifiers.etb_counters.iter().cloned());
+
+    let definitions = granted_etb_replacement_definitions(state, rid.source, kw);
+    if definitions.is_empty() {
+        return event;
+    }
+
+    // CR 110.2a: a battlefield-entry replacement's condition is evaluated relative
+    // to the entering object's controller (its owner while still on the stack).
+    let controller = state
+        .objects
+        .get(&rid.source)
+        .map(replacement_source_player)
+        .unwrap_or(state.active_player);
+
+    // Resolve each granted instance's counter group, honoring its carried
+    // condition (CR 702.54a Bloodthirst gate), then fold them onto the event.
+    let mut instance_counter_groups: Vec<Vec<_>> = Vec::new();
+    for definition in &definitions {
+        // CR 614.1d + CR 702.54a: skip a granted instance whose condition is unmet
+        // (Bloodthirst fixed-N: no opponent dealt damage this turn). Sunburst's
+        // definition has `condition: None`, so it is always applied.
+        if let Some(cond) = &definition.condition {
+            if !evaluate_replacement_condition(
+                cond,
+                controller,
+                rid.source,
+                state,
+                event.affected_object_id(),
+                &event,
+            ) {
+                continue;
+            }
+        }
+        let modifiers =
+            event_modifiers_for_ability(definition.execute.as_deref(), state, rid.source, &event);
+        if !modifiers.etb_counters.is_empty() {
+            instance_counter_groups.push(modifiers.etb_counters);
+        }
+    }
+    if instance_counter_groups.is_empty() {
+        // No instance placed counters (e.g. Bloodthirst condition unmet, or zero
+        // colors of mana spent): the event passes through unchanged. `rid` is
+        // already recorded in `applied` by the pipeline's `mark_applied`.
+        return event;
+    }
+
+    // Gemini nit (#5802 review): mutate `enter_with_counters` in place on the
+    // event rather than reconstructing every `ZoneChange` field — this survives
+    // new field additions to the variant (no field is manually re-listed).
+    if let ProposedEvent::ZoneChange {
+        enter_with_counters,
+        ..
+    } = &mut event
+    {
+        // CR 702.44d / CR 702.54c: one placement group per granted instance.
+        for group in instance_counter_groups {
+            enter_with_counters.extend(group);
+        }
     }
     // The candidate id is already recorded in `applied` by the pipeline's
     // `mark_applied(rid)` before this applier runs (`for_event`-keyed), so the
@@ -470,19 +661,7 @@ fn apply_granted_sunburst_replacement(
         source_id: rid.source,
         event_type: ReplacementEvent::Moved.to_string(),
     });
-    ProposedEvent::ZoneChange {
-        object_id,
-        from,
-        to,
-        cause,
-        attach_to,
-        enter_tapped,
-        enter_with_counters,
-        controller_override,
-        enter_transformed,
-        face_down_profile,
-        applied,
-    }
+    event
 }
 
 /// CR 614.1: Replacement effects modify events as they would occur.
@@ -1008,10 +1187,15 @@ fn replacement_choice_label_for_rid(state: &GameState, rid: ReplacementId) -> St
     if is_compleated_replacement(rid) {
         return "Compleated: enter with fewer loyalty counters".to_string();
     }
-    if is_granted_sunburst_replacement(rid) {
-        // CR 702.44a: mandatory ETB-counter replacement — only ever labeled in a
-        // CR 616.1 ordering prompt, never offered as an accept/decline choice.
-        return "Sunburst: enter with counters for colors of mana spent".to_string();
+    if let Some(kw) = GrantedEtbKeyword::from_index(rid.index) {
+        // CR 702.44a / CR 702.54a: mandatory ETB-counter replacement — only ever
+        // labeled in a CR 616.1 ordering prompt, never an accept/decline choice.
+        return match kw {
+            GrantedEtbKeyword::Sunburst => {
+                "Sunburst: enter with counters for colors of mana spent".to_string()
+            }
+            GrantedEtbKeyword::Bloodthirst => "Bloodthirst: enter with +1/+1 counters".to_string(),
+        };
     }
     if is_finality_counter_replacement(rid) {
         return "Exile it instead".to_string();
@@ -6279,27 +6463,34 @@ pub fn find_applicable_replacements(
         }
     }
 
-    // CR 702.44a + CR 702.44d + CR 614.1c: Granted sunburst — a spell GRANTED
-    // sunburst as it was cast ("that spell gains sunburst": Solar Array / Lux
-    // Artillery) carries the keyword in its live keyword set but no object-carried
-    // ETB replacement (only printed sunburst is synthesized into
-    // `replacement_definitions`). Surface one virtual ETB-counter candidate here
-    // when the granted spell enters the battlefield so its as-enters counters are
-    // placed. Gated to `ZoneChange`→Battlefield exactly as the printed definition's
-    // `Moved`/destination gate. A single reserved candidate covers all granted
-    // instances — its applier emits one counter placement per granted instance
-    // (CR 702.44d), and printed instances still apply separately via their own
-    // carried definitions. Ordered against Doubling Season-class modifiers by the
-    // shared enter-with-counters pipeline, exactly like printed sunburst.
+    // CR 702.44a + CR 702.44d + CR 702.54a + CR 702.54c + CR 614.1c: Granted
+    // as-enters keywords (Sunburst, Bloodthirst) — a spell GRANTED such a keyword
+    // as it was cast ("that spell gains sunburst": Solar Array / Lux Artillery;
+    // "it gains bloodthirst 3": Bloodlord of Vaasgoth) carries the keyword in its
+    // live keyword set but no object-carried ETB replacement (only printed keywords
+    // are synthesized into `replacement_definitions`). Surface one virtual
+    // ETB-counter candidate PER KEYWORD FAMILY here when the granted spell enters
+    // the battlefield so its as-enters counters are placed. Gated to
+    // `ZoneChange`→Battlefield exactly as the printed definition's `Moved`/
+    // destination gate. One reserved candidate per family covers all that family's
+    // granted instances — its applier emits one counter placement per granted
+    // instance (CR 702.44d / CR 702.54c), and printed instances still apply
+    // separately via their own carried definitions. Ordered against Doubling
+    // Season-class modifiers by the shared enter-with-counters pipeline, exactly
+    // like the printed keyword.
     if let ProposedEvent::ZoneChange {
         object_id,
         to: Zone::Battlefield,
         ..
     } = event
     {
-        let rid = granted_sunburst_replacement_id(*object_id);
-        if granted_sunburst_instances(state, *object_id) > 0 && !event.already_applied(&rid) {
-            candidates.push(rid);
+        for kw in [GrantedEtbKeyword::Sunburst, GrantedEtbKeyword::Bloodthirst] {
+            let rid = granted_etb_keyword_replacement_id(*object_id, kw);
+            if granted_etb_keyword_candidate_applies(state, *object_id, kw, event)
+                && !event.already_applied(&rid)
+            {
+                candidates.push(rid);
+            }
         }
     }
 
@@ -7009,8 +7200,8 @@ fn apply_single_replacement(
         return Ok(apply_compleated_replacement(state, proposed, rid, events));
     }
 
-    if is_granted_sunburst_replacement(rid) {
-        return Ok(apply_granted_sunburst_replacement(
+    if is_granted_etb_keyword_replacement(rid) {
+        return Ok(apply_granted_keyword_etb_replacement(
             state, proposed, rid, events,
         ));
     }
@@ -7717,13 +7908,13 @@ fn candidate_materiality(
         return CandidateMateriality::Unconditional;
     }
 
-    // CR 616.1 + CR 614.1c: granted sunburst APPENDS to the event's counter
-    // payload — an ADDITIVE Count write. Two appenders commute (append 2 +
-    // append 3 = 5 either way), but an appender does NOT commute with a
-    // counter doubler on the same event ((0+N)*2 vs 0*2+N), so classifying it
-    // `Disjoint` would silently suppress the CR 616.1e ordering choice against
-    // a Doubling Season-class Count writer (review on #5802).
-    if is_granted_sunburst_replacement(rid) {
+    // CR 616.1 + CR 614.1c: a granted as-enters keyword (Sunburst / Bloodthirst)
+    // APPENDS to the event's counter payload — an ADDITIVE Count write. Two
+    // appenders commute (append 2 + append 3 = 5 either way), but an appender does
+    // NOT commute with a counter doubler on the same event ((0+N)*2 vs 0*2+N), so
+    // classifying it `Disjoint` would silently suppress the CR 616.1e ordering
+    // choice against a Doubling Season-class Count writer (review on #5802).
+    if is_granted_etb_keyword_replacement(rid) {
         return CandidateMateriality::Writes {
             field: EventField::Count,
             commute: CommuteClass::Additive,
