@@ -532,6 +532,7 @@ mod issue_583_vivi_ornitier_mana_source;
 mod issue_5983_sothera_dies_edict;
 mod issue_5984_aloy_discover_on_attack;
 mod issue_5988_braids_arisen_nightmare;
+mod issue_5996_planetarium_look_cast;
 mod issue_5997_malcolm_treasure_trigger;
 mod issue_5999_aura_exile_host;
 mod issue_6002_neera_wild_mage_bottom_of_library;
