@@ -23058,6 +23058,62 @@ fn clause_ir_hand_reveal_target(clause: &ClauseIr) -> Option<TargetFilter> {
     }
 }
 
+/// The match arms naming every effect that establishes a NON-targeting
+/// object POPULATION — the `*All` / scope-`All` family whose `target` (or
+/// `filter`) is a population filter rather than a chosen target. This is why they
+/// are absent from `has_typed_target_widened`'s single-target whitelist:
+/// `ParentTarget` cannot bind to them because nothing was chosen.
+///
+/// The arms live in a macro so the SINGLE authoritative variant list generates
+/// both the shared `&` and `&mut` accessors below — two hand-written matches would
+/// be two lists that drift. Callers must go through those accessors rather than
+/// re-listing variants.
+macro_rules! mass_population_filter_arms {
+    ($effect:expr) => {
+        match $effect {
+            Effect::CounterAll { target } | Effect::GainControlAll { target } => Some(target),
+            Effect::PumpAll { target, .. }
+            | Effect::DamageAll { target, .. }
+            | Effect::DestroyAll { target, .. }
+            | Effect::BounceAll { target, .. }
+            | Effect::PutCounterAll { target, .. }
+            | Effect::DoublePTAll { target, .. } => Some(target),
+            Effect::ExploreAll { filter } => Some(filter),
+            Effect::SetTapState {
+                target,
+                scope: EffectScope::All,
+                ..
+            } => Some(target),
+            _ => None,
+        }
+    };
+}
+
+/// The NON-targeting mass population filter of an "each <type>"
+/// (`*All` / scope-`All`) effect — the single authority for "which effects
+/// establish an object population". Read-only dual of
+/// [`mass_population_filter_mut`]; both are generated from one variant list
+/// (`mass_population_filter_arms!`).
+pub(crate) fn mass_population_filter(effect: &Effect) -> Option<&TargetFilter> {
+    mass_population_filter_arms!(effect)
+}
+
+/// Mutable form of [`mass_population_filter`], for walkers that rewrite
+/// a mass population in place (e.g. `oracle_trigger`'s attached-host "each other"
+/// retarget). Shares the same authoritative variant list.
+pub(crate) fn mass_population_filter_mut(effect: &mut Effect) -> Option<&mut TargetFilter> {
+    mass_population_filter_arms!(effect)
+}
+
+/// CR 608.2c: If this clause is a mass ("each …") effect, return the object
+/// POPULATION filter it acted on. Feeds `ParseContext::chain_prior_mass_population`
+/// so a later same-chain anaphor ("They gain vigilance until end of turn") binds
+/// to that population. Delegates to the shared [`mass_population_filter`]
+/// authority rather than re-listing variants.
+fn clause_ir_mass_population(clause: &ClauseIr) -> Option<TargetFilter> {
+    mass_population_filter(&clause.parsed.effect).cloned()
+}
+
 /// CR 400.1/400.2 + CR 601.2a: Map a possessive-hand player reference (as
 /// produced by `parse_hand_possessive_target`) to the `ControllerRef` axis
 /// used to scope a card filter to that same player's hand. Exhaustive over
@@ -28235,6 +28291,16 @@ pub(crate) fn parse_effect_chain_ir(
                 .iter()
                 .rev()
                 .find_map(clause_ir_hand_reveal_target),
+            // CR 608.2c: the most-recent earlier same-chain mass ("each …")
+            // population, so a later "They <grant>" anaphor binds to it rather
+            // than reaching past it to the trigger's own subject (Ardbert,
+            // Warrior of Darkness). Mass effects choose nothing, so
+            // `parent_target_available` / `ParentTarget` cannot carry this.
+            chain_prior_mass_population: builder
+                .clauses()
+                .iter()
+                .rev()
+                .find_map(clause_ir_mass_population),
             // CR 608.2c: bind a bare "it" in this chunk's counter/anaphor to the
             // token created by an earlier clause when that token is the chain's
             // most-recent object referent (Esper Terra's "put up to three lore
