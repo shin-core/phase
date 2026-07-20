@@ -198,6 +198,7 @@ mod integration_adventure;
 mod integration_bending;
 mod integration_landfall;
 mod invoke_calamity_free_cast;
+mod iron_mastiff_roll_d20_attack_5928;
 mod issue_1005_suffer_the_past;
 mod issue_1007_fractal_harness_attach;
 mod issue_1008_korvold_sacrifice_triggers;

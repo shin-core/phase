@@ -5175,6 +5175,9 @@ fn rw_effect(
             sides: _,
             results,
             modifier: _,
+            // CR 706.6: keep-highest is a pure result-lookup aggregate with no
+            // read/write axis of its own — the branch effects already contribute.
+            keep: _,
         } => {
             let mut p = rw_quantity_expr(count);
             for r in results {

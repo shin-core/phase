@@ -1109,6 +1109,7 @@ mod tests {
                 sides: 4,
                 results: vec![],
                 modifier: None,
+                keep: crate::types::ability::DieRollAggregate::EachIndependently,
             },
             vec![],
             purse,

@@ -1,7 +1,10 @@
 use rand::Rng;
 
 use crate::game::quantity::resolve_quantity;
-use crate::types::ability::{DieRollModifier, Effect, EffectError, EffectKind, ResolvedAbility};
+use crate::types::ability::{
+    DieResultBranch, DieRollAggregate, DieRollModifier, Effect, EffectError, EffectKind,
+    ResolvedAbility,
+};
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
 
@@ -38,13 +41,14 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (count_expr, sides, results, modifier) = match &ability.effect {
+    let (count_expr, sides, results, modifier, keep) = match &ability.effect {
         Effect::RollDie {
             count,
             sides,
             results,
             modifier,
-        } => (count, *sides, results, modifier.as_ref()),
+            keep,
+        } => (count, *sides, results, modifier.as_ref(), *keep),
         _ => return Err(EffectError::MissingParam("RollDie".to_string())),
     };
 
@@ -55,6 +59,7 @@ pub fn resolve(
         resolve_quantity(state, count_expr, ability.controller, ability.source_id).max(0) as u32;
 
     let mut total_actual = 0_i32;
+    let mut highest_actual: Option<u8> = None;
     let mut rolled_any = false;
 
     for _ in 0..count {
@@ -91,35 +96,42 @@ pub fn resolve(
 
         let actual_amount = i32::from(actual);
         total_actual = total_actual.saturating_add(actual_amount);
+        highest_actual = Some(highest_actual.map_or(actual, |h| h.max(actual)));
         rolled_any = true;
 
-        // CR 706.2 + CR 706.3a: The stored value is this die's actual result
-        // while its results-table branch resolves.
-        state.die_result_this_resolution = Some(actual_amount);
+        // CR 706.3a: For per-die aggregation, each die independently consults
+        // the results table using its own actual result, right after it is
+        // rolled. For keep-highest (CR 706.6) the table is deferred to a single
+        // lookup after every die is rolled, so skip the per-die resolution here.
+        if matches!(keep, DieRollAggregate::EachIndependently) {
+            // CR 706.2 + CR 706.3a: The stored value is this die's actual result
+            // while its results-table branch resolves.
+            state.die_result_this_resolution = Some(actual_amount);
+            resolve_matching_branch(state, results, actual, ability, events)?;
+        }
+    }
 
-        // CR 706.3a: Find the matching result branch and resolve its effect.
-        // Each die consults the same table independently.
-        if let Some(branch) = results.iter().find(|b| actual >= b.min && actual <= b.max) {
-            // CR 608.2c: Branch bodies are full `AbilityDefinition`s (player_scope,
-            // sub_abilities, conditions, etc.). `ResolvedAbility::new` with only the
-            // effect drops `player_scope`, so "each opponent loses N life" on a d20
-            // table (Herald of Hadar) incorrectly hit the controller (#2026).
-            let sub = build_resolved_from_def_with_targets(
-                &branch.effect,
-                ability.source_id,
-                ability.controller,
-                ability.targets.clone(),
-            );
-            resolve_ability_chain(state, &sub, events, 0)?;
+    // CR 706.6: "ignore all but the highest roll" — the ignored rolls are
+    // treated as never having happened, so the results table is consulted
+    // exactly once against the single highest actual result. Every die still
+    // emitted its own `DieRolled` event above; only the table lookup collapses.
+    if matches!(keep, DieRollAggregate::Highest) {
+        if let Some(highest) = highest_actual {
+            state.die_result_this_resolution = Some(i32::from(highest));
+            resolve_matching_branch(state, results, highest, ability, events)?;
         }
     }
 
     if rolled_any {
         // CR 706.4: For no-table rolls, the outer sub_ability is resolved by
-        // the caller after this function returns. Leave the aggregate result
-        // available so "equal to the result(s)" reads all dice, not just the
-        // last one.
-        state.die_result_this_resolution = Some(total_actual);
+        // the caller after this function returns. Leave the result available so
+        // "equal to the result(s)" reads the correct value: the aggregate total
+        // for independent rolls, or the single kept result for keep-highest
+        // (CR 706.6 — the ignored rolls contribute nothing).
+        state.die_result_this_resolution = Some(match keep {
+            DieRollAggregate::EachIndependently => total_actual,
+            DieRollAggregate::Highest => highest_actual.map_or(0, i32::from),
+        });
     } else {
         state.die_result_this_resolution = None;
     }
@@ -130,6 +142,34 @@ pub fn resolve(
         subject: None,
     });
 
+    Ok(())
+}
+
+/// CR 706.3a: Find the results-table branch whose `min..=max` range contains
+/// `result` and resolve its effect. Shared by both aggregation modes so the
+/// per-die (each independently) and single keep-highest lookups build the
+/// branch ability identically — preserving branch `player_scope`/sub-abilities
+/// (CR 608.2c, issue #2026).
+fn resolve_matching_branch(
+    state: &mut GameState,
+    results: &[DieResultBranch],
+    result: u8,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    if let Some(branch) = results.iter().find(|b| result >= b.min && result <= b.max) {
+        // CR 608.2c: Branch bodies are full `AbilityDefinition`s (player_scope,
+        // sub_abilities, conditions, etc.). `ResolvedAbility::new` with only the
+        // effect drops `player_scope`, so "each opponent loses N life" on a d20
+        // table (Herald of Hadar) incorrectly hit the controller (#2026).
+        let sub = build_resolved_from_def_with_targets(
+            &branch.effect,
+            ability.source_id,
+            ability.controller,
+            ability.targets.clone(),
+        );
+        resolve_ability_chain(state, &sub, events, 0)?;
+    }
     Ok(())
 }
 
@@ -160,6 +200,7 @@ mod tests {
                 sides: 20,
                 results: vec![branch],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -207,6 +248,7 @@ mod tests {
                 sides: 20,
                 results: vec![branch],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -230,6 +272,7 @@ mod tests {
                 sides: 6,
                 results: vec![],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -288,6 +331,7 @@ mod tests {
                         },
                     },
                 }),
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -334,6 +378,7 @@ mod tests {
                         },
                     },
                 }),
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -365,6 +410,7 @@ mod tests {
                     sides: 20,
                     results: vec![],
                     modifier: None,
+                    keep: DieRollAggregate::EachIndependently,
                 },
                 vec![],
                 ObjectId(1),
@@ -406,6 +452,7 @@ mod tests {
                     sides,
                     results: vec![],
                     modifier: None,
+                    keep: DieRollAggregate::EachIndependently,
                 },
                 vec![],
                 ObjectId(1),
@@ -443,6 +490,7 @@ mod tests {
                 sides: 20,
                 results: vec![],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -539,6 +587,7 @@ mod tests {
                         },
                     },
                 }),
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -614,6 +663,7 @@ mod tests {
                         },
                     },
                 }),
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -644,6 +694,7 @@ mod tests {
                 sides: 20,
                 results: vec![],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -711,6 +762,7 @@ mod tests {
                 sides: 20,
                 results: vec![],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -777,6 +829,7 @@ mod tests {
                 sides: 6,
                 results: vec![],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -843,6 +896,7 @@ mod tests {
                 sides: 6,
                 results: vec![],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -892,6 +946,7 @@ mod tests {
                 sides: 20,
                 results: vec![branch],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -923,6 +978,7 @@ mod tests {
                 sides: 6,
                 results: vec![],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -982,6 +1038,7 @@ mod tests {
                 sides: 6,
                 results: vec![branch],
                 modifier: None,
+                keep: DieRollAggregate::EachIndependently,
             },
             vec![],
             ObjectId(1),
@@ -994,6 +1051,121 @@ mod tests {
             state.players[0].hand.len(),
             2,
             "each of the two dice must resolve the 1..=6 branch, drawing one card per die"
+        );
+    }
+
+    /// Roll both dice for a given seed, returning the two d6 results (in roll
+    /// order). Shared by the keep-highest tests to locate a seed whose two dice
+    /// differ so "highest" is unambiguous.
+    fn two_d6_rolls(seed: u64) -> (u8, u8) {
+        let mut state = GameState::new_two_player(seed);
+        let ability = ResolvedAbility::new(
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 2 },
+                sides: 6,
+                results: vec![],
+                modifier: None,
+                keep: DieRollAggregate::EachIndependently,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        let rolls: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::DieRolled {
+                    result: Some(result),
+                    sides: 6,
+                    ..
+                } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rolls.len(), 2, "count == 2 must emit two rolls");
+        (rolls[0], rolls[1])
+    }
+
+    /// CR 706.6: With `keep: Highest`, a count-2 roll consults the results table
+    /// exactly ONCE, against the single highest actual result. Constructed with a
+    /// branch that covers ONLY the higher of the two distinct dice and draws one
+    /// card: the draw happens iff the table was consulted for the MAX (not the
+    /// min, not both, not the last die). A per-die (`EachIndependently`)
+    /// resolution over the same branch would draw 0 or 1 depending on which die
+    /// matched — this asserts exactly 1, discriminating keep-highest.
+    #[test]
+    fn roll_die_keep_highest_consults_table_once_for_max() {
+        // Locate a seed whose two dice differ so "highest" is a strict maximum.
+        let seed = (0..10_000u64)
+            .find(|&s| {
+                let (a, b) = two_d6_rolls(s);
+                a != b
+            })
+            .expect("some seed in 0..10000 must roll two distinct d6 values");
+        let (a, b) = two_d6_rolls(seed);
+        let (lo, hi) = (a.min(b), a.max(b));
+
+        let mut state = GameState::new_two_player(seed);
+        // Branch covers ONLY the maximum face value.
+        let branch = DieResultBranch {
+            min: hi,
+            max: hi,
+            effect: Box::new(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: crate::types::ability::TargetFilter::Controller,
+                },
+            )),
+        };
+        for i in 0..5 {
+            crate::game::zones::create_object(
+                &mut state,
+                crate::types::identifiers::CardId(8000 + i as u64),
+                PlayerId(0),
+                format!("Card {i}"),
+                crate::types::zones::Zone::Library,
+            );
+        }
+        let ability = ResolvedAbility::new(
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 2 },
+                sides: 6,
+                results: vec![branch],
+                modifier: None,
+                keep: DieRollAggregate::Highest,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // Both dice were still physically rolled (CR 706.6: the ignored roll
+        // happened, it is only its result that is ignored for the table).
+        let rolls = events
+            .iter()
+            .filter(|e| matches!(e, GameEvent::DieRolled { sides: 6, .. }))
+            .count();
+        assert_eq!(rolls, 2, "keep-highest must still roll all {} dice", 2);
+
+        // The table fired exactly once, for the MAX: one card drawn. If the min
+        // die drove the table (lo != hi), zero cards would be drawn; if both dice
+        // consulted the table, we could not draw exactly one with a max-only
+        // branch — so exactly 1 discriminates keep-highest-for-max.
+        assert_eq!(
+            state.players[0].hand.len(),
+            1,
+            "keep-highest must consult the max-only branch exactly once (dice = {lo},{hi})"
+        );
+        // The stored resolution result is the max, not the total or the min.
+        assert_eq!(
+            state.die_result_this_resolution,
+            Some(i32::from(hi)),
+            "keep-highest must expose the max as the resolution result"
         );
     }
 }

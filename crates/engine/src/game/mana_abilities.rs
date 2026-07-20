@@ -4014,6 +4014,7 @@ mod tests {
                 sides: 20,
                 results: vec![],
                 modifier: None,
+                keep: crate::types::ability::DieRollAggregate::EachIndependently,
             },
         )));
         assert!(is_mana_ability(&def));
@@ -4041,6 +4042,7 @@ mod tests {
                 sides: 20,
                 results: vec![],
                 modifier: None,
+                keep: crate::types::ability::DieRollAggregate::EachIndependently,
             },
         )));
         let mut events = Vec::new();

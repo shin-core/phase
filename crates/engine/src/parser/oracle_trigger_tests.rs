@@ -659,6 +659,7 @@ fn trigger_conjunctive_battlefield_condition_does_not_corrupt_roll_die_effect() 
             sides: 20,
             results: vec![],
             modifier: None,
+            keep: crate::types::ability::DieRollAggregate::EachIndependently,
         },
         "the conjunctive condition's residual \"and you control...\" text must not \
          leak into the effect body and corrupt the RollDie parse"

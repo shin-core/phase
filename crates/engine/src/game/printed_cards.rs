@@ -3408,6 +3408,7 @@ mod tests {
                 effect: Box::new(conjure_ability("roll", Zone::Hand)),
             }],
             modifier: None,
+            keep: crate::types::ability::DieRollAggregate::EachIndependently,
         };
         walk_effect(&roll, &mut names);
 

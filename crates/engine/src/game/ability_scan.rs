@@ -4886,6 +4886,7 @@ mod tests {
             sides: 6,
             results: Vec::new(),
             modifier: None,
+            keep: crate::types::ability::DieRollAggregate::EachIndependently,
         }));
         assert!(effect_is_randomness_bearing(&Effect::FlipCoinUntilLose {
             win_effect: Box::new(AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp)),

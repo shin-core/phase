@@ -683,6 +683,9 @@ pub(crate) enum ImperativeFamilyAst {
         count: crate::types::ability::QuantityExpr,
         sides: u8,
         modifier: Option<crate::types::ability::DieRollModifier>,
+        /// CR 706.6: `Highest` for "roll a d{N} for each ... and ignore all but
+        /// the highest roll" (Iron Mastiff); `EachIndependently` otherwise.
+        keep: crate::types::ability::DieRollAggregate,
     },
     /// CR 705: Flip a coin.
     FlipCoin,

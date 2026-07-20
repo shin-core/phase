@@ -19,8 +19,8 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction,
     AdditionalCost, AggregateFunction, AttackScope, AttackSubject, CardTypeSetSource, ChoiceType,
     CoinFlipResult, Comparator, ContinuousModification, ControllerRef, CountScope,
-    CounterSourceRider, DelayedTriggerCondition, DieRollModifier, DoublePTMode, Duration,
-    EachDamageRecipient, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
+    CounterSourceRider, DelayedTriggerCondition, DieRollAggregate, DieRollModifier, DoublePTMode,
+    Duration, EachDamageRecipient, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
     ForEachCategoryAction, GameRestriction, LibraryPosition, ManaProduction, ObjectProperty,
     ObjectScope, PerpetualModification, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope,
     QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode,
@@ -3045,6 +3045,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             sides,
             results,
             modifier,
+            keep,
         } => {
             if !matches!(count, QuantityExpr::Fixed { value: 1 }) {
                 d.push(("count".into(), fmt_quantity(count)));
@@ -3059,6 +3060,12 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                     DieRollModifier::Subtract { .. } => "subtract",
                 };
                 d.push(("modifier".into(), label.into()));
+            }
+            // CR 706.6: surface keep-highest aggregation ("ignore all but the
+            // highest roll").
+            match keep {
+                DieRollAggregate::EachIndependently => {}
+                DieRollAggregate::Highest => d.push(("keep".into(), "highest".into())),
             }
         }
         Effect::FlipCoin {

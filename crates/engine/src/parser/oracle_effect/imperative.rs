@@ -9973,6 +9973,11 @@ pub(super) fn parse_imperative_family_ast(
             .is_some()
             {
                 Some(ImperativeFamilyAst::RollToVisitAttractions)
+            } else if let Some(ast) = try_parse_roll_keep_highest_for_each(lower) {
+                // CR 706.6: "roll a d{N} for each <players> and ignore all but
+                // the highest roll" (Iron Mastiff) — rolls one die per subject
+                // and consults the result table once against the highest.
+                Some(ast)
             } else if let Some(ast) = try_parse_roll_n_dice(lower) {
                 // CR 706.1: "roll two six-sided dice" / "roll X d12" — the
                 // multi-dice form. Tried before the single-die path; returns
@@ -9984,6 +9989,7 @@ pub(super) fn parse_imperative_family_ast(
                         count: QuantityExpr::Fixed { value: 1 },
                         sides,
                         modifier,
+                        keep: crate::types::ability::DieRollAggregate::EachIndependently,
                     }
                 })
             }
@@ -10733,7 +10739,63 @@ fn try_parse_roll_n_dice(lower: &str) -> Option<ImperativeFamilyAst> {
         // vanishingly rare and parsed via the table path; the bare form has
         // no modifier.
         modifier: None,
+        // CR 706.3a: "roll two six-sided dice" resolves each die's result
+        // against the table independently.
+        keep: crate::types::ability::DieRollAggregate::EachIndependently,
     })
+}
+
+/// CR 706.6: Parse "roll a d{N} for each <players> and ignore all but the
+/// highest roll" (Iron Mastiff: "roll a d20 for each player being attacked and
+/// ignore all but the highest roll"). One die is rolled per counted subject,
+/// but the results table is consulted exactly once against the single highest
+/// result (`DieRollAggregate::Highest`).
+///
+/// `count` is bound to the player-count the "for each" clause names; the only
+/// shape currently attested is "for each player being attacked" (the players
+/// this creature is attacking this combat, CR 508.6). Any other "for each ..."
+/// subject falls through so its own quantity parser can claim it later — this
+/// combinator returns `None` rather than guessing.
+fn try_parse_roll_keep_highest_for_each(lower: &str) -> Option<ImperativeFamilyAst> {
+    let (sides, rest) = try_parse_roll_die_sides_with_rest(lower)?;
+    let rest = rest.trim_start();
+    // "for each <players>" binds how many dice to roll (one per subject).
+    let (after_for_each, _) = tag::<_, _, OracleError<'_>>("for each ").parse(rest).ok()?;
+    let (after_subject, count) = parse_keep_highest_for_each_subject(after_for_each)?;
+    // The clause must close with "and ignore all but the highest roll" — this is
+    // the marker that collapses the table to a single highest-result lookup.
+    let after_subject = after_subject.trim_start();
+    let (tail, _) = tag::<_, _, OracleError<'_>>("and ignore all but the highest roll")
+        .parse(after_subject)
+        .ok()?;
+    if !tail.trim_end_matches(['.', ',', ';']).trim().is_empty() {
+        return None;
+    }
+    Some(ImperativeFamilyAst::RollDie {
+        count,
+        sides,
+        modifier: None,
+        keep: crate::types::ability::DieRollAggregate::Highest,
+    })
+}
+
+/// CR 508.6: Parse the "for each <players>" subject of a keep-highest roll,
+/// returning the remainder and the `QuantityExpr` counting those players.
+/// "player being attacked" → the players this creature is attacking this combat
+/// (`PlayerCount { OpponentAttacked { Source, ThisCombat } }`).
+fn parse_keep_highest_for_each_subject(input: &str) -> Option<(&str, QuantityExpr)> {
+    let (rest, qty) = value(
+        QuantityRef::PlayerCount {
+            filter: crate::types::ability::PlayerFilter::OpponentAttacked {
+                subject: crate::types::ability::AttackSubject::Source,
+                scope: crate::types::ability::AttackScope::ThisCombat,
+            },
+        },
+        tag::<_, _, OracleError<'_>>("player being attacked "),
+    )
+    .parse(input)
+    .ok()?;
+    Some((rest, QuantityExpr::Ref { qty }))
 }
 
 /// CR 706.1a: Returns `(sides, remainder)`. The remainder is the slice immediately after
@@ -11758,11 +11820,13 @@ fn lower_imperative_family_effect(ast: ImperativeFamilyAst) -> Effect {
             count,
             sides,
             modifier,
+            keep,
         } => Effect::RollDie {
             count,
             sides,
             results: vec![],
             modifier,
+            keep,
         },
         // CR 705.2: the bare imperative lowers with `flipper = Controller`; a
         // player subject ("that player flips a coin") is stamped onto `flipper`
@@ -19040,6 +19104,7 @@ mod tests {
                 sides,
                 modifier,
                 results,
+                keep: _,
             } => {
                 assert_eq!(*sides, 20);
                 assert_eq!(

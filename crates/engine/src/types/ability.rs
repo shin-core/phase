@@ -1103,6 +1103,26 @@ pub enum DieRollModifier {
     Subtract { value: QuantityExpr },
 }
 
+/// How a multi-die `RollDie`'s result table is consulted after all `count`
+/// dice are rolled. Leaf-level parameterization of `RollDie`'s result-lookup
+/// axis (not a sibling effect): every die is still rolled and emits its own
+/// `DieRolled` event; this only governs *which* result(s) drive the table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum DieRollAggregate {
+    /// CR 706.3a: Each die independently uses its own result to determine which
+    /// effect on the results table happens. A count-N roll consults the table N
+    /// times. This is the default and preserves the single-die behavior for
+    /// count == 1 (max of one roll is that roll).
+    #[default]
+    EachIndependently,
+    /// CR 706.6: "roll a d20 for each player being attacked and ignore all but
+    /// the highest roll" (Iron Mastiff). Ignored rolls are treated as never
+    /// having happened, so the results table is consulted exactly ONCE, against
+    /// the single highest actual result among all `count` dice.
+    Highest,
+}
+
 impl std::str::FromStr for Parity {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, ()> {
@@ -11848,6 +11868,16 @@ pub enum Effect {
         results: Vec<DieResultBranch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         modifier: Option<DieRollModifier>,
+        /// CR 706.6: For multi-die rolls, whether every die independently
+        /// consults the results table (`EachIndependently`, default) or only the
+        /// single highest actual result does (`Highest` — "ignore all but the
+        /// highest roll", Iron Mastiff). Skipped in serialization when the
+        /// default, so all existing single-die card-data stays byte-identical.
+        #[serde(
+            default = "default_die_roll_aggregate",
+            skip_serializing_if = "is_die_roll_aggregate_each_independently"
+        )]
+        keep: DieRollAggregate,
     },
     /// CR 705: Flip a coin. Optionally execute different effects on win/lose.
     ///
@@ -13008,6 +13038,17 @@ fn default_player_filter_controller() -> PlayerFilter {
 
 fn default_quantity_one() -> QuantityExpr {
     QuantityExpr::Fixed { value: 1 }
+}
+
+/// Serde default for `Effect::RollDie::keep` — data written before the
+/// keep-highest axis existed (and every single-die roll) keeps the per-die
+/// table behavior (CR 706.3a).
+fn default_die_roll_aggregate() -> DieRollAggregate {
+    DieRollAggregate::EachIndependently
+}
+
+fn is_die_roll_aggregate_each_independently(agg: &DieRollAggregate) -> bool {
+    matches!(agg, DieRollAggregate::EachIndependently)
 }
 
 fn default_duration_until_end_of_turn() -> Duration {

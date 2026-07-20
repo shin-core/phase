@@ -2965,6 +2965,7 @@ mod tests {
                 sides: 6,
                 results: vec![],
                 modifier: None,
+                keep: crate::types::ability::DieRollAggregate::EachIndependently,
             },
             vec![],
             creature,

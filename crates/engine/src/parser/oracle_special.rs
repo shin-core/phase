@@ -310,6 +310,9 @@ pub(super) fn try_parse_die_roll_table(
             sides,
             results: branches,
             modifier,
+            // CR 706.3a: a single-die table roll consults the table for that
+            // one result; the keep-highest axis only matters for multi-die rolls.
+            keep: crate::types::ability::DieRollAggregate::EachIndependently,
         },
     );
     def.description = Some(line.to_string());
