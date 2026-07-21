@@ -1833,6 +1833,55 @@ fn parse_wave_of_rats_dies_dealt_combat_damage_intervening_if() {
     );
 }
 
+/// CR 603.4 + CR 107.1: Shadowborn Demon — the hoisted intervening-"if"
+/// gate ("if there are fewer than six creature cards in your graveyard")
+/// must lift to a strict-inequality `QuantityComparison` on the controller's
+/// graveyard creature count (LT 6), the same seam Impending Disaster's
+/// "or more" suffix uses in the opposite comparator direction. Pre-fix the
+/// "fewer than" prefix was unrecognized and the condition silently swallowed,
+/// so the demon sacrificed a creature on every upkeep regardless of graveyard
+/// size.
+#[test]
+fn parse_shadowborn_demon_upkeep_fewer_than_creatures_intervening_if() {
+    let def = parse_trigger_line(
+        "At the beginning of your upkeep, if there are fewer than six creature cards in your \
+         graveyard, sacrifice a creature.",
+        "Shadowborn Demon",
+    );
+
+    // Revert-guard: pre-fix `def.condition` is None (swallowed).
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ZoneCardCount {
+                    zone: ZoneRef::Graveyard,
+                    card_types: vec![TypeFilter::Creature],
+                    filter: None,
+                    scope: CountScope::Controller,
+                },
+            },
+            comparator: Comparator::LT,
+            rhs: QuantityExpr::Fixed { value: 6 },
+        }),
+        "upkeep intervening-if must lift to ZoneCardCount(Graveyard, Creature, Controller) LT 6, got {:?}",
+        def.condition,
+    );
+
+    // Positive reach-guard: the sacrifice body still parses (not swallowed into
+    // the condition, not Unimplemented, no residual "if …" text).
+    let execute = def.execute.as_deref().expect("execute must be Some");
+    assert!(
+        matches!(*execute.effect, Effect::Sacrifice { .. }),
+        "execute must be Sacrifice, got {:?}",
+        execute.effect,
+    );
+    assert!(
+        !matches!(*execute.effect, Effect::Unimplemented { .. }),
+        "execute must not be Unimplemented",
+    );
+}
+
 #[test]
 fn parse_deathknell_berserker_dies_power_lki_intervening_if() {
     let def = parse_trigger_line(

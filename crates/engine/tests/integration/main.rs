@@ -150,6 +150,7 @@ mod eyetwitch_learn_decline_lesson;
 mod fact_or_fiction_pile_separation;
 mod fateful_handoff_target_mana_value_draw;
 mod festival_of_embers_graveyard_additional_cost;
+mod fewer_than_existential_threshold;
 mod field_marshal_soldier_anthem_first_strike;
 mod field_of_ruin_search;
 mod finality_counter_death_to_exile;
