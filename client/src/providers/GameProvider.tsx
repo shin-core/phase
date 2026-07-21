@@ -39,7 +39,6 @@ import { loadP2PSession } from "../services/p2pSession";
 import { expandParsedDeck, type ExpandedDeck, type ParsedDeck } from "../services/deckParser";
 import { formatSuppliesDeck } from "../data/formatRegistry";
 import { consumeRecentAutoUpdateMarker } from "../pwa/updateMarker";
-import { ensureCardDatabase } from "../services/cardData";
 import { loadDraftRun } from "../services/quickDraftPersistence";
 import { SPECTATOR_PLAYER_ID } from "../constants/game";
 import { clearWsSession, loadWsSession, saveWsSession } from "../services/multiplayerSession";
@@ -1156,10 +1155,10 @@ export function GameProvider({
 
       if (savedState) {
         try {
-          // Load card DB before restore so the engine can rehydrate objects
-          // and handle token creation / effects after resume.
-          await ensureCardDatabase().catch(() => {/* card DB is best-effort */});
-          if (cancelled) return;
+          // WasmAdapter.restoreState() loads the card DB into its shared worker
+          // before rehydrating. Do not also initialize the main-thread runtime:
+          // that duplicates both the WASM module and full card corpus, which can
+          // exceed the WebContent memory budget on iOS.
           await resumeGame(gameId, adapter, savedState);
           if (cancelled) return;
           // Derive player count from the restored state — the URL param may be
