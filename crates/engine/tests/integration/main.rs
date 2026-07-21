@@ -539,6 +539,7 @@ mod issue_583_vivi_ornitier_mana_source;
 mod issue_5910_kitchen_finks_persist;
 mod issue_5945_kellan_the_kid;
 mod issue_5946_pest_infestation_bogwater_softlock;
+mod issue_5963_scavengers_talent_food_sacrifice;
 mod issue_5972_tracked_set_token_cleanup;
 mod issue_5977_hunger_tide_chapter_iv;
 mod issue_5978_roar_chapter_ii_creature_mana;
