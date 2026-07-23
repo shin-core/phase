@@ -1373,8 +1373,10 @@ fn scope_of(target: &TargetFilter, chain_root: Option<WriteScope>) -> WriteScope
         | TargetFilter::SourceChosenPlayer
         | TargetFilter::OriginalController
         | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::DefendingPlayer
         | TargetFilter::HasChosenName
         | TargetFilter::ChosenDamageSource { .. }
@@ -1883,6 +1885,7 @@ fn legacy_ability_condition(x: &AbilityCondition) -> bool {
         AbilityCondition::ObjectsShareQuality { .. }
         | AbilityCondition::TargetMatchesFilter { .. }
         | AbilityCondition::SourceMatchesFilter { .. }
+        | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
         | AbilityCondition::SourceIsTapped
         | AbilityCondition::ControllerControlsMatching { .. }
         | AbilityCondition::TriggeringSpellTargetsFilter { .. }
@@ -2059,6 +2062,7 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::DistinctCounterKindsAmong { .. }
         | QuantityRef::Aggregate { .. }
         | QuantityRef::PlayerCount { .. }
+        | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::TargetObjectManaValue { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
@@ -2139,6 +2143,9 @@ fn legacy_object_scope(s: &ObjectScope) -> bool {
         // Per-resolution local surfaced by THIS ability's own reveal — not one of
         // the 12 retained legacy refs (mirrors the LastRevealed precedent).
         | ObjectScope::OtherRevealedCard
+        // Source-persistent exile-pile member read (not one of the retained
+        // legacy refs), mirroring the OtherRevealedCard precedent.
+        | ObjectScope::OwnedLinkedExileCard
         | ObjectScope::EventTarget => false,
     }
 }
@@ -2231,8 +2238,10 @@ fn legacy_target_filter(f: &TargetFilter) -> bool {
         | TargetFilter::EventTarget
         | TargetFilter::TriggeringSourceController
         | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::None
         | TargetFilter::Any
@@ -2363,6 +2372,9 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        // CR 701.15b/c: goad is a candidate-local designation, not a legacy
+        // event-context or per-source member-bound referent.
+        | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase
         | FilterProp::InAnyZone { .. }
@@ -2447,6 +2459,7 @@ fn member_bound_target_filter(f: &TargetFilter) -> bool {
         | TargetFilter::EventTarget
         | TargetFilter::TriggeringSourceController
         | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::ParentTargetSlot { .. }
@@ -2495,6 +2508,9 @@ fn member_bound_target_filter(f: &TargetFilter) -> bool {
         | TargetFilter::Any
         | TargetFilter::Player
         | TargetFilter::Controller
+        // CR 615: controller-relative compound recipient — uniformity-invariant
+        // (one shared controller `c0`), not per-member-bound.
+        | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
@@ -2624,6 +2640,9 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        // CR 701.15b/c: goad is a candidate-local designation, not a legacy
+        // event-context or per-source member-bound referent.
+        | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase
         | FilterProp::InAnyZone { .. }
@@ -2692,6 +2711,7 @@ fn legacy_continuous_modification(m: &ContinuousModification) -> bool {
         }
         ContinuousModification::CopyValues { .. }
         | ContinuousModification::SetName { .. }
+        | ContinuousModification::SetTextName { .. }
         | ContinuousModification::AddPower { .. }
         | ContinuousModification::AddToughness { .. }
         | ContinuousModification::SetPower { .. }
@@ -2879,7 +2899,13 @@ fn legacy_effect(x: &Effect) -> bool {
             target,
             count,
             object_source,
-        } => legacy_quantity_expr(count) || legacy_target_filter(target) || otf(object_source),
+            enters_under,
+        } => {
+            legacy_quantity_expr(count)
+                || legacy_target_filter(target)
+                || otf(object_source)
+                || ocr(enters_under)
+        }
         Effect::SetLifeTotal { target, amount } | Effect::DealDamage { amount, target, .. } => {
             legacy_quantity_expr(amount) || legacy_target_filter(target)
         }
@@ -3521,6 +3547,11 @@ fn read_object_scope(scope: &ObjectScope, kind: StateKind) -> RwProfile {
             reads_board_of(kind)
         }
         ObjectScope::AmassedArmy => member_bound_read(),
+        // CR 607.2a: a source-persistent exile-pile member read across resolutions
+        // (not a per-resolution reveal-local like `OtherRevealedCard`). It must be
+        // member-bound so same-event ability ordering (`profiles_conflict` via
+        // `reads_member_bound`) does not fail open. Mirrors `AmassedArmy`.
+        ObjectScope::OwnedLinkedExileCard => member_bound_read(),
         ObjectScope::EventSource | ObjectScope::EventTarget => reads_event_live(),
         // §L7 precedent (CR 608.2c): a per-resolution local surfaced by THIS
         // ability's own reveal within the same resolution — observed by no
@@ -3614,8 +3645,9 @@ fn walk_ability(
         mode_abilities,
         targets: _,
         source_id: _,
-        source_incarnation: _,
-        source_card_id: _, // latched card identity token (AllCopies yield), no read/write effect
+        source_incarnation: _, // self-transform epoch latch, no read/write effect
+        trigger_source: _,     // exact triggered-source authority, no read/write effect
+        trigger_definition_ref: _, // exact trigger occurrence, no read/write effect
         controller: _,
         original_controller: _,
         scoped_player: _,
@@ -4657,6 +4689,11 @@ fn rw_effect(
             target: _,
             count,
             object_source,
+            // CR 110.2a: controller-on-entry override — no extra RW axis, same
+            // as the `Manifest` arm above: the membership write is already
+            // maximal (Census::Any + ZoneSpan::Any); unlike `ChangeZone`, Cloak
+            // does not derive `writes_membership_external_ctrl`.
+            enters_under: _,
         } => {
             let mut p = ext_write(StateKind::SetMembership);
             p.writes_external.set(StateKind::HandLibrary);
@@ -5644,6 +5681,7 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
             property: _,
         } => board_value_aggregate_read(filter, StateKind::ObjectPt),
         QuantityRef::PlayerCount { filter: _ } => RwProfile::empty(),
+        QuantityRef::EventContextPlayerCount { filter: _ } => reads_event_live(),
         QuantityRef::CountersOn { scope, .. } | QuantityRef::Intensity { scope, .. } => {
             read_object_scope(scope, StateKind::ObjectCounters)
         }
@@ -5892,6 +5930,8 @@ fn rw_ability_condition(x: &AbilityCondition) -> RwProfile {
         AbilityCondition::TriggeringSpellTargetsFilter { filter: _ }
         | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
         | AbilityCondition::ZoneChangedThisWay { filter: _ }
+        // CR 615.5: reads the prevented event's live damage-source object.
+        | AbilityCondition::PostReplacementDamageSourceMatchesFilter { filter: _ }
         | AbilityCondition::CostPaidObjectMatchesFilter { filter: _ } => reads_event_live(),
         AbilityCondition::EventOutcomeWon => reads_event_live(),
         // CR 705.2: reads resolution-local `state.resolution_coin_flip` — a live
@@ -6206,6 +6246,7 @@ fn rw_target_filter(x: &TargetFilter) -> RwProfile {
         | TargetFilter::EventTarget
         | TargetFilter::TriggeringSourceController
         | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::ChosenDamageSource { .. } => reads_event_live(),
@@ -6236,6 +6277,8 @@ fn rw_target_filter(x: &TargetFilter) -> RwProfile {
         | TargetFilter::Any
         | TargetFilter::Player
         | TargetFilter::Controller
+        // CR 615: controller-relative compound recipient — a read-free selector.
+        | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
         | TargetFilter::SourceOrPaired

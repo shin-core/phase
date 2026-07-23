@@ -529,6 +529,8 @@ pub enum ProtectionTarget {
 pub enum WardCost {
     Mana(ManaCost),
     PayLife(i32),
+    /// CR 702.21a: Ward whose life payment is the warded creature's power at resolution.
+    PayLifeEqualToPower,
     DiscardCard,
     /// CR 702.21a: Sacrifice N permanents matching a filter as ward cost.
     Sacrifice {
@@ -1780,8 +1782,9 @@ impl Keyword {
     /// the parser must not emit a duplicate `CastWithKeyword` grant the merge would
     /// silently drop.
     ///
-    /// - Cascade (CR 702.85c): each granted instance triggers separately, counted
-    ///   via `effective_spell_keyword_instances` in `game/triggers.rs`.
+    /// - Cascade (CR 702.85c) and Ripple (CR 702.60b): each granted instance
+    ///   triggers separately, counted via `cast_spell_keywords` in
+    ///   `game/triggers.rs`.
     /// - Casualty (CR 702.153b) / Squad (CR 702.157b): each instance is paid and
     ///   triggers separately.
     ///
@@ -1797,7 +1800,10 @@ impl Keyword {
     pub fn cast_merge_preserves_instances(&self) -> bool {
         matches!(
             self,
-            Keyword::Cascade | Keyword::Casualty(_) | Keyword::Squad(_)
+            // CR 113.2c + CR 702.60b: multiple instances of Ripple function
+            // independently, so a spell's cast-time snapshot must retain each
+            // static grant for trigger synthesis.
+            Keyword::Cascade | Keyword::Ripple(_) | Keyword::Casualty(_) | Keyword::Squad(_)
         )
     }
 }
@@ -2759,7 +2765,11 @@ pub fn normalize_bands_with_other_quality(raw: &str) -> String {
         .collect();
     let joined = words.join(" ");
     let singular = match joined.to_ascii_lowercase().as_str() {
-        "legends" | "legendary creatures" | "legendary creature" => "Legend".to_string(),
+        "legends"
+        | "legendary creatures"
+        | "legendary creature"
+        | "legendarycreatures"
+        | "legendarycreature" => "Legend".to_string(),
         "wolves" => "Wolf".to_string(),
         "walls" => "Wall".to_string(),
         other if other.ends_with("ies") && other.len() > 3 => {

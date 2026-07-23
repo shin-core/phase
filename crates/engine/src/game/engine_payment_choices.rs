@@ -12,8 +12,10 @@ use crate::types::game_state::{
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
+use crate::types::mana::ManaSourceSelection;
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
+use crate::types::resolution::OptionalEffectFrame;
 use crate::types::zones::Zone;
 
 use super::costs::{self, PaymentOutcome};
@@ -43,13 +45,24 @@ pub(super) fn handle_optional_effect_choice(
         // CR 101.4 + CR 701.23i: This optional decision belongs to the
         // simultaneous scoped-library-search protocol. It owns the next APNAP
         // prompt / final delivery and must not be mistaken for a normal
-        // `pending_optional_effect` continuation.
+        // optional-effect frame continuation.
     } else {
         set_active_priority(state);
-        if state.pending_repeated_optional_payment.is_some() {
+        if state
+            .active_repeated_optional_payment_frame()
+            .is_some_and(|frame| frame.pending.is_some())
+        {
             effects::resolve_repeated_optional_payment_choice(state, accept, events)
                 .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
-        } else if let Some(ability) = state.pending_optional_effect.take() {
+        } else if let Some(frame) = state
+            .take_active_optional_effect_frame()
+            .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+        {
+            let OptionalEffectFrame {
+                ability,
+                trigger_event: pending_event,
+                trigger_match_count: pending_count,
+            } = frame;
             let choice = if accept {
                 AutoMayChoice::Accept
             } else {
@@ -59,14 +72,12 @@ pub(super) fn handle_optional_effect_choice(
             // ability suspended for its optional ("may") decision retains its
             // triggering event context. Restore it for the resumed resolution so
             // `TriggeringPlayer` and other event-context refs resolve correctly.
-            let pending_event = state.pending_optional_trigger_event.take();
             let previous_trigger_event = state.current_trigger_event.clone();
             state.current_trigger_event = pending_event;
             // CR 603.2c + CR 608.2: mirror restoration of the batched-trigger
             // subject count so a `QuantityRef::EventContextAmount` resolved during
             // the resumed sub-ability reads the same "that many" the pre-pause
             // resolution would have observed.
-            let pending_count = state.pending_optional_trigger_match_count.take();
             let previous_trigger_match_count = state.current_trigger_match_count;
             state.current_trigger_match_count = pending_count;
             let result =
@@ -158,7 +169,8 @@ pub(super) fn handle_opponent_may_choice(
     state.cost_payment_failed_flag = false;
 
     if accept {
-        if let Some(mut ability) = state.pending_optional_effect.take() {
+        if let Some(mut frame) = state.active_optional_effect_frame().cloned() {
+            let mut ability = frame.ability;
             ability.optional = false;
             ability.optional_for = None;
             ability.context.accepting_player = Some(promptee);
@@ -207,6 +219,12 @@ pub(super) fn handle_opponent_may_choice(
 
             if let Some(legal) = target_selection {
                 if !legal.is_empty() {
+                    state
+                        .take_active_optional_effect_frame()
+                        .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+                        .expect(
+                            "cloned optional-effect frame remains active until target selection",
+                        );
                     ability.context.optional_effect_performed = true;
                     state
                         .player_actions_this_way
@@ -223,7 +241,7 @@ pub(super) fn handle_opponent_may_choice(
                         // owner's library") is silently skipped.
                         sub.context = ability.context.clone();
                         sub.context.optional_effect_performed = true;
-                        state.pending_continuation = Some(PendingContinuation::new(sub, state));
+                        state.park_ability_continuation(PendingContinuation::new(sub, state));
                     }
                     state.waiting_for = WaitingFor::MultiTargetSelection {
                         player: promptee,
@@ -238,7 +256,10 @@ pub(super) fn handle_opponent_may_choice(
                 if !remaining.is_empty() {
                     let next = remaining[0];
                     let rest = remaining[1..].to_vec();
-                    state.pending_optional_effect = Some(ability);
+                    frame.ability = ability;
+                    state
+                        .replace_active_optional_effect_frame(frame)
+                        .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
                     state.waiting_for = WaitingFor::OpponentMayChoice {
                         player: next,
                         source_id,
@@ -248,9 +269,17 @@ pub(super) fn handle_opponent_may_choice(
                     return Ok(action_result(events, state.waiting_for.clone()));
                 }
 
+                state
+                    .take_active_optional_effect_frame()
+                    .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+                    .expect("cloned optional-effect frame remains active until final decision");
                 set_active_priority(state);
                 resolve_all_declined_opponent_may(state, &ability, events)?;
             } else {
+                state
+                    .take_active_optional_effect_frame()
+                    .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+                    .expect("cloned optional-effect frame remains active until final decision");
                 ability.context.optional_effect_performed = true;
                 state
                     .player_actions_this_way
@@ -275,8 +304,11 @@ pub(super) fn handle_opponent_may_choice(
         return Ok(action_result(events, state.waiting_for.clone()));
     } else {
         set_active_priority(state);
-        if let Some(ability) = state.pending_optional_effect.take() {
-            resolve_all_declined_opponent_may(state, &ability, events)?;
+        if let Some(frame) = state
+            .take_active_optional_effect_frame()
+            .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+        {
+            resolve_all_declined_opponent_may(state, &frame.ability, events)?;
         }
     }
 
@@ -968,7 +1000,7 @@ pub(super) fn handle_unless_payment(
             // redirects fire correctly. Partial mill (library has fewer than
             // N cards) is an unpayable cost per CR 118.3 — effect fires.
             // A CR 616.1 replacement ordering choice parks the batch in
-            // state.waiting_for + state.pending_batch_deliveries; callers
+            // state.waiting_for + the active BatchDelivery frame; callers
             // must early-return so they do not clobber the parked prompt
             // (mirrors apply_etb_counters early-return in handle_replacement_choice).
             AbilityCost::Mill { count } => {
@@ -995,7 +1027,7 @@ pub(super) fn handle_unless_payment(
                         true => {}
                         // CR 616.1: replacement ordering choice parked — the
                         // mill batch is in progress. Early-return to preserve
-                        // state.waiting_for + state.pending_batch_deliveries.
+                        // state.waiting_for + the active BatchDelivery frame.
                         false => {
                             return Ok(action_result(events, state.waiting_for.clone()));
                         }
@@ -1354,7 +1386,7 @@ fn clear_echo_due_for_echo_payment(
 pub(super) fn handle_unless_payment_tap_land_for_mana(
     state: &mut GameState,
     waiting_for: WaitingFor,
-    object_id: ObjectId,
+    selection: &ManaSourceSelection,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     let WaitingFor::UnlessPayment {
@@ -1371,21 +1403,25 @@ pub(super) fn handle_unless_payment_tap_land_for_mana(
         ));
     };
 
-    handle_tap_land_for_mana(state, player, object_id, events)?;
-    state
-        .lands_tapped_for_mana
-        .entry(player)
-        .or_default()
-        .push(object_id);
-
-    Ok(WaitingFor::UnlessPayment {
+    let events_before = events.len();
+    let waiting_for = handle_tap_land_for_mana(
+        state,
         player,
-        cost,
-        pending_effect,
-        trigger_event,
-        effect_description,
-        remaining,
-    })
+        selection,
+        crate::types::game_state::ManaAbilityResume::UnlessPayment {
+            outer_player: Some(player),
+            cost: Box::new(cost.clone()),
+            pending_effect: pending_effect.clone(),
+            trigger_event: trigger_event.clone(),
+            effect_description: effect_description.clone(),
+            remaining: remaining.clone(),
+        },
+        events,
+    )?;
+    // CR 605.4a: Triggered mana abilities coupled to a semantic land tap
+    // resolve inline even while an unless payment owns the waiting state.
+    super::triggers::resolve_tap_mana_triggers_inline(state, events, events_before);
+    Ok(waiting_for)
 }
 
 pub(super) fn handle_unless_payment_untap_land_for_mana(
@@ -1588,14 +1624,6 @@ fn sacrifice_pool_meets_aggregate_constraint(
     comparator.evaluate(total_positive_power, value)
 }
 
-fn selected_sacrifice_total_power(state: &GameState, chosen: &[ObjectId]) -> i32 {
-    chosen
-        .iter()
-        .filter_map(|id| state.objects.get(id))
-        .map(|obj| obj.power.unwrap_or(0))
-        .sum()
-}
-
 /// CR 702.21a + CR 701.21 + CR 616.1: Persist the exact unpaid ward payment
 /// work while the current sacrifice waits for a replacement choice. Preserve a
 /// delivery-tail prompt when it owns the action; otherwise expose the live
@@ -1735,7 +1763,7 @@ pub(super) fn handle_ward_sacrifice_choice(
                 "Duplicate selections are not allowed".to_string(),
             ));
         }
-        if selected_sacrifice_total_power(state, &chosen) < threshold {
+        if crate::game::sacrifice::selected_total_power(state, &chosen) < threshold {
             return Err(EngineError::InvalidAction(format!(
                 "Selected permanents' total power must be at least {threshold}"
             )));
@@ -1973,7 +2001,11 @@ mod tests {
             condition: Box::new(AbilityCondition::effect_performed()),
         });
         optional.sub_ability = Some(Box::new(decline_branch));
-        state.pending_optional_effect = Some(Box::new(optional));
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(optional),
+            trigger_event: None,
+            trigger_match_count: None,
+        });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: ObjectId(100),
@@ -1999,7 +2031,11 @@ mod tests {
             condition: Box::new(AbilityCondition::effect_performed()),
         });
         optional.sub_ability = Some(Box::new(decline_branch));
-        state.pending_optional_effect = Some(Box::new(optional));
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(optional),
+            trigger_event: None,
+            trigger_match_count: None,
+        });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: ObjectId(100),
@@ -2031,7 +2067,11 @@ mod tests {
             condition: Box::new(AbilityCondition::effect_performed()),
         });
         optional.sub_ability = Some(Box::new(decline_branch));
-        state.pending_optional_effect = Some(Box::new(optional));
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(optional),
+            trigger_event: None,
+            trigger_match_count: None,
+        });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: ObjectId(100),
@@ -2060,7 +2100,11 @@ mod tests {
             PlayerId(0),
         )));
         optional.sub_ability = Some(Box::new(if_you_do));
-        state.pending_optional_effect = Some(Box::new(optional));
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(optional),
+            trigger_event: None,
+            trigger_match_count: None,
+        });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: ObjectId(100),
@@ -2087,7 +2131,11 @@ mod tests {
         // so the case under test is unambiguous to a future reader.
         continuation_sub.sub_link = SubAbilityLink::ContinuationStep;
         optional.sub_ability = Some(Box::new(continuation_sub));
-        state.pending_optional_effect = Some(Box::new(optional));
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(optional),
+            trigger_event: None,
+            trigger_match_count: None,
+        });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: ObjectId(100),
@@ -2113,7 +2161,11 @@ mod tests {
             condition: Box::new(AbilityCondition::effect_performed()),
         });
         optional.sub_ability = Some(Box::new(decline_branch));
-        state.pending_optional_effect = Some(Box::new(optional));
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(optional),
+            trigger_event: None,
+            trigger_match_count: None,
+        });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: ObjectId(100),
@@ -2139,12 +2191,16 @@ mod tests {
         };
         let mut optional = ResolvedAbility::new(gain_life(2), vec![], source_id, PlayerId(0));
         optional.optional = true;
-        state.pending_optional_effect = Some(Box::new(optional));
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(optional),
+            trigger_event: None,
+            trigger_match_count: None,
+        });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id,
             description: None,
-            may_trigger_key: Some(key),
+            may_trigger_key: Some(key.clone()),
         };
 
         let mut events = Vec::new();
@@ -2154,7 +2210,7 @@ mod tests {
                 player: PlayerId(0),
                 source_id,
                 description: None,
-                may_trigger_key: Some(key),
+                may_trigger_key: Some(key.clone()),
             },
             AutoMayChoice::Accept,
             &mut events,

@@ -1866,7 +1866,7 @@ fn fused_split_spell_blocked_by_combined_mana_value_per_turn_limit_enumeration()
     // Sanity: marker must NOT be set — this exercises the pre-payment path.
     assert!(!sc.state.objects.get(&breaking).unwrap().fused_split_spell);
 
-    let set = casting_variant_choice_set(&sc.state, P0, breaking);
+    let set = casting_variant_choice_set(&sc.state, P0, breaking, None);
     assert!(
         !fuse_option_offered(&set),
         "a fused Breaking // Entering (combined MV 8) must be BLOCKED by a \
@@ -1896,7 +1896,7 @@ fn fused_split_spell_blocked_by_combined_mana_value_per_turn_limit_enumeration()
             spell_filter: Some(cmc_ge(9)),
         }),
     );
-    let set9 = casting_variant_choice_set(&sc9.state, P0, breaking9);
+    let set9 = casting_variant_choice_set(&sc9.state, P0, breaking9, None);
     assert!(
         fuse_option_offered(&set9),
         "under Cmc >= 9 the fused cast (combined MV 8 < 9) is NOT blocked and must be \
@@ -1943,7 +1943,7 @@ fn non_fuse_alt_cost_candidate_uses_front_half_not_combined() {
             .affected(filter),
         );
         assert!(!sc.state.objects.get(&breaking).unwrap().fused_split_spell);
-        casting_variant_choice_set(&sc.state, P0, breaking)
+        casting_variant_choice_set(&sc.state, P0, breaking, None)
             .options
             .iter()
             .any(|o| o.variant == CastingVariant::Dash)
@@ -1999,7 +1999,7 @@ fn fused_split_spell_assist_offer_uses_combined_projection() {
         // Marker must NOT be set — this exercises the pre-payment path.
         assert!(!sc.state.objects.get(&breaking).unwrap().fused_split_spell);
 
-        let set = casting_variant_choice_set(&sc.state, P0, breaking);
+        let set = casting_variant_choice_set(&sc.state, P0, breaking, None);
         let options: Vec<CastingVariantChoiceOption> = set.options.clone();
         let fuse_index = options
             .iter()
@@ -2102,7 +2102,7 @@ fn fused_split_spell_granted_flash_timing_uses_combined_projection() {
         // Marker must NOT be set — this exercises the pre-payment path.
         assert!(!sc.state.objects.get(&breaking).unwrap().fused_split_spell);
 
-        fuse_option_offered(&casting_variant_choice_set(&sc.state, P0, breaking))
+        fuse_option_offered(&casting_variant_choice_set(&sc.state, P0, breaking, None))
     };
 
     assert!(
@@ -2170,6 +2170,71 @@ fn non_fuse_alt_cost_candidate_enumeration_uses_front_half() {
         dash_candidate_present(cmc_le(2)),
         "a front-half `CastWithKeyword {{ Dash, Cmc <= 2 }}` grant (front MV 2) must still \
          enumerate the Dash candidate"
+    );
+}
+
+/// Regression: a fusable split card in hand under an ACTIVE Unlimited free-cast
+/// permission (Omniscience) must offer EXACTLY ONE `Normal` option. The Fuse
+/// block pushes `Normal` (front-half printed) and the Omniscience block also
+/// pushes `Normal`; those two pushes are NON-adjacent (Fuse + HandPermission sit
+/// between them), and `casting_variant_choice_set` dedups with consecutive-only
+/// `Vec::dedup` (no preceding sort), so before the guard both identical `Normal`
+/// options survived — a malformed "two Cast Normally buttons" menu. The
+/// `!has_fuse_candidate` guard on the Omniscience-block push suppresses the
+/// duplicate. This asserts `count() == 1` (not `>= 1`), so it fails on the
+/// unfixed code (count 2) and passes after the guard; the `HandPermission` and
+/// `Fuse` presence checks prove the guard didn't drop the free or fused options.
+#[test]
+fn fuse_split_under_unlimited_free_cast_offers_single_normal_option() {
+    use crate::game::scenario::{GameScenario, P0};
+    use crate::game::scenario_db::GameScenarioDbExt;
+
+    let db = crate::test_support::shared_card_db();
+
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    // Breaking // Entering: a real Fuse split card (front Breaking {U}{B}, back
+    // Entering Split half) — `has_fuse_candidate` fires for it.
+    let breaking = sc.add_real_card(P0, "Breaking", Zone::Hand, db);
+    // Enough mana that both the front-half Normal cast and the fused cast are
+    // affordable — so no option is dropped by `can_cast_prepared_now`; the free
+    // (NoCost) HandPermission option is always affordable.
+    fill_mana_for_fused_cast(&mut sc, P0);
+    // Install the real Omniscience static (Unlimited CastFromHandFree) via the
+    // same Oracle text the sibling omniscience menu tests use, so
+    // `unlimited_hand_cast_free_source` recognizes it identically.
+    add_static_permanent(
+        &mut sc,
+        P0,
+        parse_static_line("You may cast spells from your hand without paying their mana costs.")
+            .expect("Omniscience static should parse"),
+    );
+
+    let set = casting_variant_choice_set(&sc.state, P0, breaking, None);
+    let variants: Vec<CastingVariant> = set.options.iter().map(|o| o.variant).collect();
+
+    let normal_count = set
+        .options
+        .iter()
+        .filter(|o| o.variant == CastingVariant::Normal)
+        .count();
+    assert_eq!(
+        normal_count, 1,
+        "a fusable split card under an Unlimited free-cast permission must offer EXACTLY ONE \
+         Normal option; the non-adjacent Fuse-block + Omniscience-block Normal pushes survive \
+         consecutive-only dedup without the guard. Offered: {variants:?}"
+    );
+    assert!(
+        set.options
+            .iter()
+            .any(|o| matches!(o.variant, CastingVariant::HandPermission { .. })),
+        "the free HandPermission option must still be offered. Offered: {variants:?}"
+    );
+    assert!(
+        set.options
+            .iter()
+            .any(|o| o.variant == CastingVariant::Fuse),
+        "the Fuse option must still be offered — the guard must not drop it. Offered: {variants:?}"
     );
 }
 
@@ -3048,6 +3113,7 @@ fn record_one_spell_cast_this_turn(state: &mut GameState, player: PlayerId) {
             from_zone: Zone::Hand,
             cast_variant: CastingVariant::Normal,
             was_kicked: false,
+            spell_object_id: None,
         }]),
     );
 }
@@ -3399,6 +3465,7 @@ fn granted_freerunning_static_surfaces_freerunning_variant() {
             description: Some("Assassin spells you cast have freerunning {B}{B}.".to_string()),
             attack_defended: None,
             source_controller: None,
+            source_object: None,
             bypass_beneficiary: None,
         };
         obj.static_definitions = vec![def].into();
@@ -10634,6 +10701,7 @@ fn self_cost_reduction_applies_from_graveyard() {
                 from_zone: Zone::Hand,
                 cast_variant: CastingVariant::Normal,
                 was_kicked: false,
+                spell_object_id: None,
             },
             crate::types::SpellCastRecord {
                 name: "Opt".to_string(),
@@ -10647,6 +10715,7 @@ fn self_cost_reduction_applies_from_graveyard() {
                 from_zone: Zone::Hand,
                 cast_variant: CastingVariant::Normal,
                 was_kicked: false,
+                spell_object_id: None,
             },
         ]),
     );
@@ -11889,6 +11958,7 @@ fn x_cost_max_accounts_for_granted_affinity_exceeding_fixed_generic() {
                 description: None,
                 attack_defended: None,
                 source_controller: None,
+                source_object: None,
                 bypass_beneficiary: None,
             }]
             .into();
@@ -14024,11 +14094,12 @@ fn tamiyo_emblem_does_not_free_cast_commander_from_command_zone() {
 /// printed mana cost is unaffordable but whose alternative cost is payable.
 mod omniscience_alt_cost_2432 {
     use super::*;
-    use crate::types::game_state::AlternativeCastKeyword;
+    use crate::types::ability::TargetFilter;
     use crate::types::keywords::{EvokeCost, Keyword};
     use crate::types::mana::{ManaCost, ManaCostShard};
+    use crate::types::statics::{CastFreeOrigin, CastFrequency};
 
-    fn install_omniscience(state: &mut GameState) {
+    fn install_omniscience(state: &mut GameState) -> ObjectId {
         let id = create_object(
             state,
             CardId(2_432_001),
@@ -14042,6 +14113,31 @@ mod omniscience_alt_cost_2432 {
             )
             .expect("Omniscience static should parse"),
         );
+        id
+    }
+
+    /// A plain {1}{U} creature with no alternative-cost keyword.
+    fn create_plain_creature(state: &mut GameState) -> ObjectId {
+        let obj_id = create_object(
+            state,
+            CardId(2_432_010),
+            PlayerId(0),
+            "Plain Creature".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&obj_id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 1,
+        };
+        obj.base_mana_cost = obj.mana_cost.clone();
+        obj_id
+    }
+
+    fn ample_blue_mana(state: &mut GameState) {
+        add_mana(state, PlayerId(0), ManaType::Colorless, 6);
+        add_mana(state, PlayerId(0), ManaType::Blue, 2);
     }
 
     /// Quantum Riddler class: printed {3}{U}{U}, Warp {1}{U}.
@@ -14098,12 +14194,19 @@ mod omniscience_alt_cost_2432 {
         obj_id
     }
 
+    // Reconciliation (issue #2432, free-cast-election tranche): under an ACTIVE
+    // Unlimited CastFromHandFree permission the casting-method election is the
+    // single N-way `CastingVariantChoice` menu (CR 118.9a — one mutually-exclusive
+    // announcement), NOT the legacy two-slot `AlternativeCastChoice`. These tests
+    // assert the modernized menu shape; semantics (free vs keyword vs printed) are
+    // unchanged.
+
     #[test]
-    fn omniscience_offers_free_normal_when_warp_affordable_but_printed_is_not() {
+    fn omniscience_menu_offers_free_and_warp_when_printed_unaffordable() {
         let mut state = setup_game_at_main_phase();
         install_omniscience(&mut state);
         let riddler = create_quantum_riddler(&mut state);
-        // Enough for Warp {1}{U}, not for {3}{U}{U}.
+        // Enough for Warp {1}{U}, not for printed {3}{U}{U}.
         add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
         add_mana(&mut state, PlayerId(0), ManaType::Blue, 1);
 
@@ -14117,34 +14220,39 @@ mod omniscience_alt_cost_2432 {
         )
         .unwrap();
 
-        match wf {
-            WaitingFor::AlternativeCastChoice {
-                keyword: AlternativeCastKeyword::Warp,
-                normal_cost,
-                alternative_cost,
-                ..
-            } => {
-                assert_eq!(
-                    normal_cost,
-                    ManaCost::NoCost,
-                    "Omniscience must surface NoCost as the normal option"
-                );
-                assert_eq!(
-                    alternative_cost,
-                    Some(ManaCost::Cost {
-                        shards: vec![ManaCostShard::Blue],
-                        generic: 1,
-                    })
-                );
+        let WaitingFor::CastingVariantChoice { options, .. } = wf else {
+            panic!("expected N-way CastingVariantChoice under Omniscience, got {wf:?}");
+        };
+        // CR 118.9: the free option carries the printed-NoCost display and the
+        // Omniscience source id.
+        let free = options
+            .iter()
+            .find(|o| matches!(o.variant, CastingVariant::HandPermission { .. }))
+            .expect("free HandPermission option must be offered");
+        assert_eq!(free.mana_cost, ManaCost::NoCost);
+        // CR 601.2b: the Warp alternative cost path is offered at {1}{U}.
+        let warp = options
+            .iter()
+            .find(|o| o.variant == CastingVariant::Warp)
+            .expect("Warp option must be offered");
+        assert_eq!(
+            warp.mana_cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 1,
             }
-            other => {
-                panic!("expected Warp choice with free normal under Omniscience, got {other:?}")
-            }
-        }
+        );
+        // Single-method degrade: the printed {3}{U}{U} Normal cast is unaffordable
+        // and MUST be dropped (revert of the printed-cost prepare would surface a
+        // spurious free {0} Normal duplicate here).
+        assert!(
+            !options.iter().any(|o| o.variant == CastingVariant::Normal),
+            "unaffordable printed Normal must be dropped, got {options:?}"
+        );
     }
 
     #[test]
-    fn omniscience_offers_free_normal_when_evoke_affordable_but_printed_is_not() {
+    fn omniscience_menu_offers_free_and_evoke_when_printed_unaffordable() {
         let mut state = setup_game_at_main_phase();
         install_omniscience(&mut state);
         let mulldrifter = create_mulldrifter(&mut state);
@@ -14162,75 +14270,234 @@ mod omniscience_alt_cost_2432 {
         )
         .unwrap();
 
-        match wf {
-            WaitingFor::AlternativeCastChoice {
-                keyword: AlternativeCastKeyword::Evoke,
-                normal_cost,
-                alternative_cost,
-                ..
-            } => {
-                assert_eq!(
-                    normal_cost,
-                    ManaCost::NoCost,
-                    "Omniscience must surface NoCost as the normal option"
-                );
-                assert_eq!(
-                    alternative_cost,
-                    Some(ManaCost::Cost {
-                        shards: vec![ManaCostShard::Blue],
-                        generic: 2,
-                    })
-                );
+        let WaitingFor::CastingVariantChoice { options, .. } = wf else {
+            panic!("expected N-way CastingVariantChoice under Omniscience, got {wf:?}");
+        };
+        let free = options
+            .iter()
+            .find(|o| matches!(o.variant, CastingVariant::HandPermission { .. }))
+            .expect("free HandPermission option must be offered");
+        assert_eq!(free.mana_cost, ManaCost::NoCost);
+        let evoke = options
+            .iter()
+            .find(|o| o.variant == CastingVariant::Evoke)
+            .expect("Evoke option must be offered");
+        assert_eq!(
+            evoke.mana_cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 2,
             }
-            other => {
-                panic!("expected Evoke choice with free normal under Omniscience, got {other:?}")
-            }
-        }
+        );
+        assert!(
+            !options.iter().any(|o| o.variant == CastingVariant::Normal),
+            "unaffordable printed Normal must be dropped, got {options:?}"
+        );
     }
 
     #[test]
-    fn omniscience_warp_spell_normal_choice_proceeds_without_mana_payment() {
+    fn omniscience_free_election_proceeds_without_mana_payment() {
         let mut state = setup_game_at_main_phase();
         install_omniscience(&mut state);
         let riddler = create_quantum_riddler(&mut state);
         add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
         add_mana(&mut state, PlayerId(0), ManaType::Blue, 1);
+        let card_id = CardId(2_432_002);
 
         let mut events = Vec::new();
-        let wf = handle_cast_spell(
-            &mut state,
-            PlayerId(0),
-            riddler,
-            CardId(2_432_002),
-            &mut events,
-        )
-        .unwrap();
-        assert!(matches!(
-            wf,
-            WaitingFor::AlternativeCastChoice {
-                keyword: AlternativeCastKeyword::Warp,
-                ..
-            }
-        ));
+        let wf = handle_cast_spell(&mut state, PlayerId(0), riddler, card_id, &mut events).unwrap();
+        let WaitingFor::CastingVariantChoice { options, .. } = wf else {
+            panic!("expected N-way CastingVariantChoice under Omniscience, got {wf:?}");
+        };
+        // Reach-guard: the free option must be present so the election is real.
+        let free_index = options
+            .iter()
+            .position(|o| matches!(o.variant, CastingVariant::HandPermission { .. }))
+            .expect("free HandPermission option must be offered");
 
-        let wf = handle_warp_cost_choice(
+        let wf = handle_casting_variant_choice(
             &mut state,
             PlayerId(0),
             riddler,
-            CardId(2_432_002),
-            crate::types::actions::AlternativeCastDecision::Normal,
+            card_id,
+            &options,
+            free_index,
             &mut events,
         )
         .unwrap();
 
         assert!(
-            !matches!(wf, WaitingFor::AlternativeCastChoice { .. }),
-            "normal choice under Omniscience must not re-prompt; got {wf:?}"
+            !matches!(wf, WaitingFor::CastingVariantChoice { .. }),
+            "free election under Omniscience must not re-prompt; got {wf:?}"
         );
         assert!(
             !matches!(wf, WaitingFor::ManaPayment { .. }),
-            "Omniscience normal cast must skip mana payment; got {wf:?}"
+            "Omniscience free cast must skip mana payment; got {wf:?}"
         );
+    }
+
+    /// Test 1: when the printed cost is affordable the menu offers BOTH the free
+    /// option and the printed `Normal` option (at its printed cost, not a second
+    /// {0}). Reverting the printed-cost prepare would collapse `Normal` to {0} or
+    /// drop it — this option-set equality catches both.
+    #[test]
+    fn menu_offers_free_and_printed_when_affordable() {
+        let mut state = setup_game_at_main_phase();
+        install_omniscience(&mut state);
+        let spell = create_plain_creature(&mut state);
+        ample_blue_mana(&mut state);
+
+        let set = casting_variant_choice_set(&state, PlayerId(0), spell, None);
+        let free = set
+            .options
+            .iter()
+            .find(|o| matches!(o.variant, CastingVariant::HandPermission { .. }))
+            .expect("free HandPermission option must be offered");
+        assert_eq!(free.mana_cost, ManaCost::NoCost);
+        let normal = set
+            .options
+            .iter()
+            .find(|o| o.variant == CastingVariant::Normal)
+            .expect("printed Normal option must be offered when affordable");
+        assert_eq!(
+            normal.mana_cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 1,
+            },
+            "the Normal option must display the printed {{1}}{{U}}, not a duplicate {{0}}"
+        );
+        assert_eq!(
+            set.options.len(),
+            2,
+            "a plain creature under Omniscience offers exactly free + printed, got {:?}",
+            set.options
+        );
+    }
+
+    /// Test 7: Mulldrifter three-way — all three methods affordable produce three
+    /// options with DISTINCT costs (printed {4}{U}, evoke {2}{U}, free {0}).
+    #[test]
+    fn menu_offers_three_distinct_costs_for_mulldrifter_when_all_affordable() {
+        let mut state = setup_game_at_main_phase();
+        install_omniscience(&mut state);
+        let mulldrifter = create_mulldrifter(&mut state);
+        ample_blue_mana(&mut state);
+
+        let set = casting_variant_choice_set(&state, PlayerId(0), mulldrifter, None);
+        let cost_of = |variant: CastingVariant| {
+            set.options
+                .iter()
+                .find(|o| o.variant == variant)
+                .unwrap_or_else(|| {
+                    panic!("option {variant:?} must be present in {:?}", set.options)
+                })
+                .mana_cost
+                .clone()
+        };
+        let free = set
+            .options
+            .iter()
+            .find(|o| matches!(o.variant, CastingVariant::HandPermission { .. }))
+            .expect("free option must be present");
+        assert_eq!(free.mana_cost, ManaCost::NoCost);
+        assert_eq!(
+            cost_of(CastingVariant::Normal),
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 4,
+            }
+        );
+        assert_eq!(
+            cost_of(CastingVariant::Evoke),
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 2,
+            }
+        );
+    }
+
+    /// Test 8 (engine side): the newly menu-gated keyword variants surface as
+    /// options under Omniscience when affordable (Warp here). The FE label
+    /// coverage for these is gated by check-frontend.
+    #[test]
+    fn menu_offers_warp_keyword_option_under_omniscience() {
+        let mut state = setup_game_at_main_phase();
+        install_omniscience(&mut state);
+        let riddler = create_quantum_riddler(&mut state);
+        ample_blue_mana(&mut state);
+
+        let set = casting_variant_choice_set(&state, PlayerId(0), riddler, None);
+        assert!(
+            set.options
+                .iter()
+                .any(|o| matches!(o.variant, CastingVariant::HandPermission { .. })),
+            "free option must be present"
+        );
+        let warp = set
+            .options
+            .iter()
+            .find(|o| o.variant == CastingVariant::Warp)
+            .expect("Warp keyword option must join the menu under Omniscience");
+        assert_eq!(
+            warp.mana_cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 1,
+            }
+        );
+    }
+
+    /// Test 10: multi-authority order bug. A OncePerTurn (Zaffai-class) permission
+    /// created EARLIER in battlefield order than Omniscience must not hide the
+    /// Unlimited source — the free option must latch the Omniscience id and carry
+    /// `Unlimited` frequency (so electing it records no once-per-turn slot). The
+    /// pre-fix first-match scan would have returned the Zaffai id here.
+    #[test]
+    fn free_option_latches_unlimited_source_over_earlier_once_per_turn() {
+        let mut state = setup_game_at_main_phase();
+
+        // Earlier-in-battlefield OncePerTurn CastFromHandFree source (Zaffai-class).
+        let zaffai = create_object(
+            &mut state,
+            CardId(2_432_020),
+            PlayerId(0),
+            "Zaffai (test)".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&zaffai)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::new(StaticMode::CastFromHandFree {
+                    frequency: CastFrequency::OncePerTurn,
+                    origin: CastFreeOrigin::Hand,
+                })
+                .affected(TargetFilter::Any),
+            );
+
+        // Omniscience appended AFTER Zaffai (later in battlefield order).
+        let omniscience = install_omniscience(&mut state);
+        let spell = create_plain_creature(&mut state);
+        ample_blue_mana(&mut state);
+
+        let set = casting_variant_choice_set(&state, PlayerId(0), spell, None);
+        let free = set
+            .options
+            .iter()
+            .find(|o| matches!(o.variant, CastingVariant::HandPermission { .. }))
+            .expect("free option must be present");
+        let CastingVariant::HandPermission { source, frequency } = free.variant else {
+            unreachable!()
+        };
+        assert_eq!(
+            source, omniscience,
+            "the free option must latch the Unlimited (Omniscience) source, not the \
+             earlier OncePerTurn Zaffai source"
+        );
+        assert_eq!(frequency, CastFrequency::Unlimited);
     }
 }
 
@@ -14468,6 +14735,7 @@ fn witherbloom_grants_affinity_to_instant_and_sorcery_spells() {
             ),
             attack_defended: None,
             source_controller: None,
+            source_object: None,
             bypass_beneficiary: None,
         };
         obj.static_definitions = vec![def].into();
@@ -14584,6 +14852,7 @@ fn add_witherbloom_affinity_source(state: &mut GameState, player: PlayerId) -> O
             ),
             attack_defended: None,
             source_controller: None,
+            source_object: None,
             bypass_beneficiary: None,
         }]
         .into();
@@ -14821,7 +15090,7 @@ fn ashling_granted_evoke_offered_and_installs_etb_sac() {
         can_cast_object_now(&state, PlayerId(0), spell),
         "granted evoke {{4}} affordable ⇒ spell must be castable via the gate"
     );
-    let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+    let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
     assert!(
         choices
             .options
@@ -14879,7 +15148,7 @@ fn ashling_granted_evoke_offered_and_installs_etb_sac() {
         let trig = obj.trigger_definitions.get(0).unwrap();
         assert!(
             matches!(
-                trig.condition,
+                trig.definition.condition,
                 Some(crate::types::ability::TriggerCondition::CastVariantPaid {
                     variant: crate::types::ability::CastVariantPaid::Evoke,
                 })
@@ -14919,7 +15188,7 @@ fn blitz_creature_offers_blitz_variant() {
         can_cast_object_now(&state, PlayerId(0), spell),
         "a blitz creature with affordable cost must be castable"
     );
-    let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+    let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
     assert!(
         choices
             .options
@@ -14991,7 +15260,7 @@ fn granted_blitz_offers_blitz_variant() {
         "recipient must have no printed Blitz — the option must come from the grant"
     );
 
-    let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+    let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
     assert!(
         choices
             .options
@@ -15062,7 +15331,7 @@ fn granted_blitz_self_mana_cost_surfaces_self_referential_cost() {
         obj.base_mana_cost = spell_cost.clone();
     }
 
-    let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+    let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
     let blitz = choices
         .options
         .iter()
@@ -15724,7 +15993,7 @@ fn overload_castable_with_no_legal_printed_target() {
     );
 
     // (2) The choice set surfaces the Overload variant.
-    let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+    let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
     assert!(
         choices
             .options
@@ -15780,7 +16049,7 @@ fn dash_creature_offers_dash_variant() {
         can_cast_object_now(&state, PlayerId(0), spell),
         "a dash creature with affordable cost must be castable"
     );
-    let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+    let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
     assert!(
         choices
             .options
@@ -15955,7 +16224,7 @@ fn spectacle_offered_only_when_opponent_lost_life() {
     }
 
     // No opponent has lost life this turn ⇒ Spectacle is not offered.
-    let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+    let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
     assert!(
         !choices
             .options
@@ -15967,7 +16236,7 @@ fn spectacle_offered_only_when_opponent_lost_life() {
 
     // An opponent loses life this turn ⇒ Spectacle becomes available.
     state.players[1].life_lost_this_turn = 2;
-    let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+    let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
     assert!(
         choices
             .options
@@ -19064,6 +19333,76 @@ fn priority_activation_candidates_share_activation_restriction_static_gate() {
     assert_eq!(
         snapshot.restriction_static_exact_scans, 0,
         "absent ModifyActivationLimit statics must not fall through to exact static scans per candidate"
+    );
+}
+
+#[test]
+fn priority_spell_candidates_without_keyword_grants_skip_static_scans() {
+    let mut state = setup_game_at_main_phase();
+    let spells = [
+        create_generic_creature_in_hand(&mut state, 7_317, PlayerId(0), "Vanilla Spell A", 0),
+        create_generic_creature_in_hand(&mut state, 7_318, PlayerId(0), "Vanilla Spell B", 0),
+        create_generic_creature_in_hand(&mut state, 7_319, PlayerId(0), "Vanilla Spell C", 0),
+    ];
+
+    crate::game::perf_counters::reset();
+    let (actions, _, _) = crate::ai_support::legal_actions_full(&state);
+
+    for spell in spells {
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                GameAction::CastSpell { object_id, .. } if *object_id == spell
+            )),
+            "every castable hand spell must reach production candidate enumeration"
+        );
+    }
+    assert_eq!(
+        crate::game::perf_counters::snapshot().spell_keyword_grant_scans,
+        0,
+        "production spell candidate enumeration must skip CastWithKeyword static scans when none exist"
+    );
+}
+
+#[test]
+fn priority_spell_candidates_scan_and_merge_present_keyword_grants() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_generic_creature_in_hand(&mut state, 7_320, PlayerId(0), "Vanilla Spell", 0);
+    let grantor = create_object(
+        &mut state,
+        CardId(7_321),
+        PlayerId(0),
+        "Keyword Grantor".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&grantor)
+        .unwrap()
+        .static_definitions
+        .push(StaticDefinition::new(StaticMode::CastWithKeyword {
+            keyword: Keyword::Flash,
+        }));
+
+    crate::game::perf_counters::reset();
+    let (actions, _, _) = crate::ai_support::legal_actions_full(&state);
+
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            GameAction::CastSpell { object_id, .. } if *object_id == spell
+        )),
+        "the granted-keyword spell must remain a production cast candidate"
+    );
+    assert!(
+        crate::game::perf_counters::snapshot().spell_keyword_grant_scans > 0,
+        "present CastWithKeyword statics must fall through to the exact grant scan"
+    );
+    assert!(
+        effective_spell_keywords(&state, PlayerId(0), spell)
+            .iter()
+            .any(|keyword| matches!(keyword, Keyword::Flash)),
+        "the exact scan must still merge the granted keyword"
     );
 }
 
@@ -27238,6 +27577,7 @@ fn first_qualified_spell_reducer_only_applies_to_first_matching_spell() {
             from_zone: Zone::Hand,
             cast_variant: crate::types::game_state::CastingVariant::Normal,
             was_kicked: false,
+            spell_object_id: None,
         }]),
     );
 
@@ -27355,6 +27695,7 @@ fn first_x_spell_reducer_uses_x_filter_dynamic_counter_count_and_first_gate() {
             from_zone: Zone::Hand,
             cast_variant: crate::types::game_state::CastingVariant::Normal,
             was_kicked: false,
+            spell_object_id: None,
         }]),
     );
 
@@ -27432,6 +27773,7 @@ fn opponent_first_noncreature_tax_uses_caster_history() {
             from_zone: Zone::Hand,
             cast_variant: crate::types::game_state::CastingVariant::Normal,
             was_kicked: false,
+            spell_object_id: None,
         }]),
     );
 
@@ -27749,6 +28091,156 @@ fn graveyard_spell_with_flashback_and_retrace_prompts_for_cast_variant() {
             ..
         }
     ));
+}
+
+/// CR 601.2b + CR 110.4 + CR 702.138a: Electing a Muldrotha-class permission from a
+/// multi-variant cast menu must preserve the subsequent permanent-type slot
+/// choice. The selected slot, rather than another carried permanent type, is
+/// consumed when the spell is finalized.
+#[test]
+fn chosen_muldrotha_variant_requests_and_consumes_permanent_type_slot() {
+    let mut state = setup_game_at_main_phase();
+    let player = PlayerId(0);
+    let source = create_object(
+        &mut state,
+        CardId(28_100),
+        player,
+        "Muldrotha, the Gravetide".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&source)
+        .unwrap()
+        .static_definitions
+        .push(
+            StaticDefinition::new(StaticMode::GraveyardCastPermission {
+                frequency: CastFrequency::OncePerTurnPerPermanentType,
+                play_mode: CardPlayMode::Play,
+                graveyard_destination_replacement: None,
+                extra_cost: None,
+                enters_with_counter: None,
+            })
+            .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Permanent))),
+        );
+
+    let spell = create_object(
+        &mut state,
+        CardId(28_101),
+        player,
+        "Escaping Artifact Creature".to_string(),
+        Zone::Graveyard,
+    );
+    let card_id = state.objects[&spell].card_id;
+    {
+        let object = state.objects.get_mut(&spell).unwrap();
+        object.card_types.core_types = vec![CoreType::Artifact, CoreType::Creature];
+        object.base_card_types = object.card_types.clone();
+        object.mana_cost = ManaCost::generic(0);
+        object.base_mana_cost = object.mana_cost.clone();
+        let escape = Keyword::Escape(EscapeCost::NonMana(AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(0),
+                },
+                AbilityCost::Exile {
+                    count: 3,
+                    zone: Some(Zone::Graveyard),
+                    filter: None,
+                },
+            ],
+        }));
+        object.keywords.push(escape.clone());
+        object.base_keywords.push(escape);
+    }
+    for index in 0..3 {
+        create_object(
+            &mut state,
+            CardId(28_102 + index),
+            player,
+            format!("Escape Fodder {index}"),
+            Zone::Graveyard,
+        );
+    }
+
+    let result = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        },
+    )
+    .expect("multiple graveyard casting methods should be offered");
+    let permission_index = match &result.waiting_for {
+        WaitingFor::CastingVariantChoice { options, .. } => options
+            .iter()
+            .position(|option| {
+                matches!(
+                    option.variant,
+                    CastingVariant::GraveyardPermission { source: elected, .. }
+                        if elected == source
+                )
+            })
+            .expect("Muldrotha permission should be an offered variant"),
+        other => panic!("expected CastingVariantChoice, got {other:?}"),
+    };
+
+    let result = apply_as_current(
+        &mut state,
+        GameAction::ChooseCastingVariant {
+            index: permission_index,
+        },
+    )
+    .expect("choosing the Muldrotha permission should request its slot");
+    match &result.waiting_for {
+        WaitingFor::ChoosePermanentTypeSlot {
+            source: elected,
+            available_slots,
+            ..
+        } => {
+            assert_eq!(*elected, source);
+            assert_eq!(available_slots, &[CoreType::Artifact, CoreType::Creature]);
+        }
+        other => panic!("expected ChoosePermanentTypeSlot, got {other:?}"),
+    }
+
+    let error = apply_as_current(
+        &mut state,
+        GameAction::ChoosePermanentTypeSlot {
+            slot: CoreType::Enchantment,
+        },
+    )
+    .expect_err("a slot absent from the live prompt must be rejected");
+    assert!(matches!(error, EngineError::InvalidAction(_)));
+    assert!(
+        state.stack.is_empty(),
+        "a hostile slot must not cast the spell"
+    );
+    assert!(
+        state.graveyard_cast_permissions_used_per_type.is_empty(),
+        "a hostile slot must not consume any permission"
+    );
+
+    apply_as_current(
+        &mut state,
+        GameAction::ChoosePermanentTypeSlot {
+            slot: CoreType::Creature,
+        },
+    )
+    .expect("the selected Muldrotha slot should complete the cast");
+
+    assert!(state.stack.iter().any(|entry| entry.source_id == spell));
+    assert!(state
+        .graveyard_cast_permissions_used_per_type
+        .contains(&(source, CoreType::Creature)));
+    assert!(
+        !state
+            .graveyard_cast_permissions_used_per_type
+            .contains(&(source, CoreType::Artifact)),
+        "the unselected Artifact slot must remain available"
+    );
 }
 
 #[test]
@@ -29898,6 +30390,8 @@ fn add_cant_be_activated_source(
             // CR 605.1a: Existing test helpers cover the Karn/Clarion family which
             // has no exemption suffix.
             exemption: ActivationExemption::None,
+            // CR 606.2: Karn/Clarion family is not kind-narrowed.
+            kind: None,
         }));
     id
 }
@@ -30042,6 +30536,7 @@ fn cant_be_activated_selfref_blocks_only_this_permanent() {
                 who: ProhibitionScope::AllPlayers,
                 source_filter: TargetFilter::SelfRef,
                 exemption: ActivationExemption::None,
+                kind: None,
             }));
         Arc::make_mut(&mut obj.abilities).push(
             crate::types::ability::AbilityDefinition::new(
@@ -30200,6 +30695,7 @@ fn pithing_needle_blocks_named_non_mana_ability_but_not_mana_ability() {
                 who: ProhibitionScope::AllPlayers,
                 source_filter: TargetFilter::HasChosenName,
                 exemption: ActivationExemption::ManaAbilities,
+                kind: None,
             }));
     }
 
@@ -30251,6 +30747,208 @@ fn pithing_needle_blocks_named_non_mana_ability_but_not_mana_ability() {
         !is_blocked_by_cant_be_activated(&state, PlayerId(1), other, &other_ability),
         "Pithing Needle must NOT block sources whose name doesn't match the chosen name"
     );
+}
+
+/// F2.4 drift pin (CR 602.5): the bool enforcement shim and the source collector
+/// share one predicate, so `is_blocked_by_cant_be_activated` MUST agree with
+/// `!cant_be_activated_sources(..).is_empty()` for every input. Covers a blocked
+/// case, the CR 605.1a mana-exempt case, and an unmatched-name case; also pins the
+/// multi-source count (two Needles → both carriers). REVERT-FAIL: diverging either
+/// driver's predicate flips one side while the other stays.
+#[test]
+fn cant_be_activated_bool_and_sources_drivers_agree() {
+    use crate::types::ability::ChosenAttribute;
+    let mut state = setup_game_at_main_phase();
+
+    // Two Pithing Needles, both naming "Llanowar Elves".
+    let mut needles = Vec::new();
+    for card in [CardId(0x9EED1), CardId(0x9EED2)] {
+        let needle = create_object(
+            &mut state,
+            card,
+            PlayerId(0),
+            "Pithing Needle".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&needle).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.entered_battlefield_turn = Some(0);
+        obj.chosen_attributes
+            .push(ChosenAttribute::CardName("Llanowar Elves".to_string()));
+        obj.static_definitions
+            .push(StaticDefinition::new(StaticMode::CantBeActivated {
+                who: ProhibitionScope::AllPlayers,
+                source_filter: TargetFilter::HasChosenName,
+                exemption: ActivationExemption::ManaAbilities,
+                kind: None,
+            }));
+        needles.push(needle);
+    }
+
+    let elves = create_object(
+        &mut state,
+        CardId(0xE17E5),
+        PlayerId(1),
+        "Llanowar Elves".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let obj = state.objects.get_mut(&elves).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.entered_battlefield_turn = Some(0);
+        Arc::make_mut(&mut obj.abilities).push(make_tap_for_green_mana_ability());
+        Arc::make_mut(&mut obj.abilities).push(
+            AbilityDefinition::new(
+                crate::types::ability::AbilityKind::Activated,
+                crate::types::ability::Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: crate::types::ability::TargetFilter::Controller,
+                },
+            )
+            .cost(crate::types::ability::AbilityCost::Tap),
+        );
+    }
+    let mana_ability = state.objects[&elves].abilities[0].clone();
+    let non_mana_ability = state.objects[&elves].abilities[1].clone();
+
+    // Blocked case: bool true ⟺ sources non-empty; BOTH needles surface.
+    let bool_blocked =
+        is_blocked_by_cant_be_activated(&state, PlayerId(1), elves, &non_mana_ability);
+    let mut src_blocked = cant_be_activated_sources(&state, PlayerId(1), elves, &non_mana_ability);
+    assert!(bool_blocked);
+    assert_eq!(bool_blocked, !src_blocked.is_empty());
+    src_blocked.sort_unstable();
+    let mut want = needles.clone();
+    want.sort_unstable();
+    assert_eq!(
+        src_blocked, want,
+        "both Needles are recorded, sorted + deduped"
+    );
+
+    // CR 605.1a exempt case: bool false ⟺ sources empty.
+    let bool_exempt = is_blocked_by_cant_be_activated(&state, PlayerId(1), elves, &mana_ability);
+    let src_exempt = cant_be_activated_sources(&state, PlayerId(1), elves, &mana_ability);
+    assert!(!bool_exempt);
+    assert_eq!(bool_exempt, !src_exempt.is_empty());
+
+    // Unmatched-name case: bool false ⟺ sources empty.
+    let other = add_artifact_with_activated_ability(&mut state, PlayerId(1));
+    let other_ability = state.objects[&other].abilities[0].clone();
+    let bool_other = is_blocked_by_cant_be_activated(&state, PlayerId(1), other, &other_ability);
+    let src_other = cant_be_activated_sources(&state, PlayerId(1), other, &other_ability);
+    assert!(!bool_other);
+    assert_eq!(bool_other, !src_other.is_empty());
+}
+
+/// F2.4 drift pin (CR 602.5): the `ProhibitActivity::ActivateAbilities` bool shim
+/// and source collector share one per-restriction predicate. REVERT-FAIL: diverge
+/// either and one side flips.
+#[test]
+fn cant_activate_abilities_bool_and_sources_drivers_agree() {
+    let mut state = setup_game_at_main_phase();
+    let source = create_object(
+        &mut state,
+        CardId(0xA8E2),
+        PlayerId(1),
+        "Abeyance Source".to_string(),
+        Zone::Exile,
+    );
+    state.restrictions.push(GameRestriction::ProhibitActivity {
+        source,
+        affected_players: RestrictionPlayerScope::SpecificPlayer(PlayerId(0)),
+        expiry: RestrictionExpiry::EndOfTurn,
+        activity: ProhibitedActivity::ActivateAbilities {
+            exemption: ActivationExemption::ManaAbilities,
+            only_tag: None,
+        },
+    });
+
+    let non_mana = AbilityDefinition::new(
+        crate::types::ability::AbilityKind::Activated,
+        crate::types::ability::Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: crate::types::ability::TargetFilter::Controller,
+        },
+    )
+    .cost(crate::types::ability::AbilityCost::Tap);
+    let mana = make_tap_for_green_mana_ability();
+
+    // Affected player, non-mana ability: blocked; single source.
+    let bool_blocked = is_blocked_by_cant_activate_abilities(&state, PlayerId(0), &non_mana);
+    let src_blocked = cant_activate_abilities_sources(&state, PlayerId(0), &non_mana);
+    assert!(bool_blocked);
+    assert_eq!(bool_blocked, !src_blocked.is_empty());
+    assert_eq!(src_blocked, vec![source]);
+
+    // CR 605.1a exempt mana ability: not blocked.
+    let bool_exempt = is_blocked_by_cant_activate_abilities(&state, PlayerId(0), &mana);
+    let src_exempt = cant_activate_abilities_sources(&state, PlayerId(0), &mana);
+    assert!(!bool_exempt);
+    assert_eq!(bool_exempt, !src_exempt.is_empty());
+
+    // Unaffected player: not blocked.
+    let bool_other = is_blocked_by_cant_activate_abilities(&state, PlayerId(1), &non_mana);
+    let src_other = cant_activate_abilities_sources(&state, PlayerId(1), &non_mana);
+    assert!(!bool_other);
+    assert_eq!(bool_other, !src_other.is_empty());
+}
+
+/// F2.4 drift pin (CR 602.5 + CR 117.1b): the `CantActivateDuring` bool shim
+/// (`is_blocked_by_cant_activate_during`) and its source collector
+/// (`cant_activate_during_sources`) consult one shared predicate
+/// (`cant_activate_during_static_hits`), so they MUST agree for every input.
+/// Covers the three distinct predicate branches: (a) an affected opponent whose
+/// turn condition is satisfied (blocked, single carrier), (b) the timing/turn
+/// gate exempting an affected player on their own turn (CR 102.1), and (c) the
+/// scope gate exempting an unaffected player (the source controller, who is not
+/// among "opponents"). REVERT-FAIL: diverging either driver's predicate flips one
+/// side while the other stays.
+#[test]
+fn cant_activate_during_bool_and_sources_drivers_agree() {
+    let mut state = setup_game_at_main_phase();
+    let p0 = PlayerId(0);
+    let p1 = PlayerId(1);
+    // City-of-Solitude-class static on P0's battlefield, scoped to P0's opponents
+    // so the scope gate distinguishes affected (P1) from unaffected (P0) players.
+    let source = add_cant_activate_during_permanent(
+        &mut state,
+        p0,
+        ProhibitionScope::Opponents,
+        CastingProhibitionCondition::NotDuringAffectedPlayersTurn,
+        ActivationExemption::None,
+    );
+    let ability = AbilityDefinition::new(
+        crate::types::ability::AbilityKind::Activated,
+        crate::types::ability::Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    )
+    .cost(crate::types::ability::AbilityCost::Tap);
+
+    // (a) Affected opponent, not their turn: bool true ⟺ sources non-empty, and
+    // the single carrier surfaces. active=P0, activator=P1.
+    state.active_player = p0;
+    let bool_blocked = is_blocked_by_cant_activate_during(&state, p1, &ability);
+    let src_blocked = cant_activate_during_sources(&state, p1, &ability);
+    assert!(bool_blocked);
+    assert_eq!(bool_blocked, !src_blocked.is_empty());
+    assert_eq!(src_blocked, vec![source]);
+
+    // (b) CR 102.1 timing gate exempts: affected player on their own turn.
+    // active=P1, activator=P1 → bool false ⟺ sources empty.
+    state.active_player = p1;
+    let bool_own_turn = is_blocked_by_cant_activate_during(&state, p1, &ability);
+    let src_own_turn = cant_activate_during_sources(&state, p1, &ability);
+    assert!(!bool_own_turn);
+    assert_eq!(bool_own_turn, !src_own_turn.is_empty());
+
+    // (c) Scope gate exempts an unaffected player: the source controller (P0) is
+    // not among "opponents". active=P1, activator=P0 → bool false ⟺ sources empty.
+    let bool_unaffected = is_blocked_by_cant_activate_during(&state, p0, &ability);
+    let src_unaffected = cant_activate_during_sources(&state, p0, &ability);
+    assert!(!bool_unaffected);
+    assert_eq!(bool_unaffected, !src_unaffected.is_empty());
 }
 
 // === CR 119.8: pay-life cost under CantLoseLife ===
@@ -35048,7 +35746,7 @@ mod alt_cost_reduction_509 {
 
         // The Evoke hand candidate is the only non-Normal variant, so the
         // choice set carries exactly one option and is not flagged multiple.
-        let choices = casting_variant_choice_set(&state, PlayerId(0), obj);
+        let choices = casting_variant_choice_set(&state, PlayerId(0), obj, None);
         assert!(
             choices
                 .options
@@ -39227,7 +39925,8 @@ fn worldgorger_dragon_animate_dead_self_loop_single_cycle() {
     // (3) WGD entered → fire + resolve its ETB (exile all other permanents you
     // control). CR 400.7: the Aura, the plain land, and Piranha Marsh are exiled;
     // WGD itself is exempt ("all OTHER permanents").
-    crate::game::triggers::process_triggers(&mut state, &etb_ev);
+    let mut trigger_events = Vec::new();
+    let _ = crate::game::triggers::drain_deferred_trigger_queue(&mut state, &mut trigger_events);
     assert_eq!(
         state.stack.len(),
         1,
@@ -39354,7 +40053,6 @@ fn worldgorger_dragon_animate_dead_self_loop_single_cycle() {
     // return events INTO THE SAME vec (mirroring `engine_priority.rs:177-210`). It
     // must be passed the vec that actually contains WGD's leave event — a fresh vec
     // would silently no-op. CR 610.3: the exiled cards return.
-    let events_before_returns = sac_ev.len();
     crate::game::engine::check_exile_returns(&mut state, &mut sac_ev);
     crate::game::layers::evaluate_layers(&mut state);
 
@@ -39419,20 +40117,20 @@ fn worldgorger_dragon_animate_dead_self_loop_single_cycle() {
     );
 
     // (6) The returned permanents are new objects (CR 400.7) whose own ETBs re-fire
-    // on re-entry. Scan the return events that `check_exile_returns` appended into
-    // `sac_ev` (mirroring the second trigger-detection pass at
-    // engine_priority.rs:195-210). Now that the Aura re-enters too, TWO of P0's
+    // on re-entry. Their logical return owner has queued those events for the
+    // deferred-trigger drain. Now that the Aura re-enters too, TWO of P0's
     // permanents produce an ETB simultaneously — Piranha Marsh's "target player
     // loses 1 life" and the returned Aura's reanimation ETB — so P0 must order them
     // (CR 603.3b) before either reaches the stack.
-    let return_events: Vec<_> = sac_ev[events_before_returns..].to_vec();
     let p1_life_before = state
         .players
         .iter()
         .find(|p| p.id == PlayerId(1))
         .unwrap()
         .life;
-    crate::game::triggers::process_triggers(&mut state, &return_events);
+    let mut return_trigger_events = Vec::new();
+    let _ =
+        crate::game::triggers::drain_deferred_trigger_queue(&mut state, &mut return_trigger_events);
     // Reach-guard: the co-triggered ETBs surface as a CR 603.3b ordering prompt.
     // If PR #6072 were reverted, the Aura would stay in exile and only Piranha's
     // single ETB would fire — no ordering prompt, so this `matches!` would flip.
@@ -42823,6 +43521,7 @@ fn conditional_cost_reduction_applies_only_when_condition_met() {
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::identifiers::CardId;
     use crate::types::mana::ManaCost;
+    use crate::types::statics::CostModifyMode;
 
     let condition = parse_restriction_condition("you control a legendary creature")
         .expect("test condition must parse");
@@ -42842,6 +43541,7 @@ fn conditional_cost_reduction_applies_only_when_condition_met() {
             },
         });
         def.cost_reduction = Some(CostReduction {
+            mode: CostModifyMode::Reduce,
             amount_per: 3,
             count: QuantityExpr::Fixed { value: 1 },
             condition: Some(condition.clone()),
@@ -42973,6 +43673,110 @@ fn hyldas_crown_cost_reduction_applies_only_during_your_turn() {
         generic_of(&def_off),
         1,
         "on an opponent's turn the reduction does not apply"
+    );
+}
+
+/// CR 602.2b + CR 601.2f: Loreseeker's Stone —
+/// "{3}, {T}: Draw three cards. This ability costs {1} more to activate
+/// for each card in your hand." The {3} generic component is {3} with an
+/// empty hand and {8} with five cards in hand. Parsed from the real Oracle
+/// clause and applied through production `apply_cost_reduction` (the same
+/// seam `can_activate_ability_now` / activation cost determination use).
+///
+/// Discriminating assertion: `generic_of(&def)` scales 3 → 8 with hand size.
+/// Reverting the Raise apply arm leaves generic at {3} for every hand size
+/// (the Discord report: activating for {3} with five cards in hand).
+#[test]
+fn loreseekers_stone_raise_cost_scales_with_hand_size() {
+    use crate::parser::oracle_cost::try_parse_cost_reduction;
+    use crate::types::ability::{Effect, QuantityExpr, QuantityRef, ZoneRef};
+
+    let reduction = try_parse_cost_reduction(
+        "this ability costs {1} more to activate for each card in your hand",
+    )
+    .expect("Loreseeker's Stone cost-increase clause must parse");
+    assert_eq!(reduction.mode, CostModifyMode::Raise);
+    assert_eq!(reduction.amount_per, 1);
+    match &reduction.count {
+        QuantityExpr::Ref {
+            qty:
+                QuantityRef::ZoneCardCount {
+                    zone: ZoneRef::Hand,
+                    ..
+                },
+        }
+        | QuantityExpr::Ref {
+            qty: QuantityRef::HandSize { .. },
+        } => {}
+        other => panic!("expected hand-size count, got {other:?}"),
+    }
+
+    let make_def = || {
+        let mut def = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Unimplemented {
+                name: "draw".to_string(),
+                description: None,
+            },
+        );
+        def.cost = Some(AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                shards: vec![],
+                generic: 3,
+            },
+        });
+        def.cost_reduction = Some(reduction.clone());
+        def
+    };
+    let generic_of = |def: &AbilityDefinition| match def.cost.as_ref().unwrap() {
+        AbilityCost::Mana {
+            cost: ManaCost::Cost { generic, .. },
+        } => *generic,
+        other => panic!("expected Mana cost, got {other:?}"),
+    };
+
+    let build_state = |hand_cards: usize| -> (GameState, ObjectId) {
+        let mut state = GameState::new_two_player(6500);
+        let src = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Loreseeker's Stone".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let o = state.objects.get_mut(&src).unwrap();
+            o.card_types.core_types.push(CoreType::Artifact);
+        }
+        for i in 0..hand_cards {
+            create_object(
+                &mut state,
+                CardId(100 + i as u64),
+                PlayerId(0),
+                format!("Hand Card {i}"),
+                Zone::Hand,
+            );
+        }
+        (state, src)
+    };
+
+    let (state0, src0) = build_state(0);
+    let mut def0 = make_def();
+    apply_cost_reduction(&state0, &mut def0, PlayerId(0), src0);
+    assert_eq!(generic_of(&def0), 3, "empty hand: {{3}} + {{0}} = {{3}}");
+
+    let (state5, src5) = build_state(5);
+    let mut def5 = make_def();
+    apply_cost_reduction(&state5, &mut def5, PlayerId(0), src5);
+    assert_eq!(
+        generic_of(&def5),
+        8,
+        "five cards in hand: {{3}} + {{5}} = {{8}} (Discord report)"
+    );
+    assert_ne!(
+        generic_of(&def0),
+        generic_of(&def5),
+        "paid generic must differ across hand sizes (revert leaves both at {{3}})"
     );
 }
 
@@ -44269,6 +45073,7 @@ fn plot_special_action_bypasses_activated_ability_prohibitions() {
                     who: ProhibitionScope::AllPlayers,
                     source_filter: TargetFilter::HasChosenName,
                     exemption: ActivationExemption::ManaAbilities,
+                    kind: None,
                 }));
         }
         let plot_def = state.objects[&plot_card].abilities[0].clone();
@@ -44927,6 +45732,7 @@ fn convoke_query_before_record_unaffected_by_snapshot() {
             from_zone: Zone::Hand,
             cast_variant: crate::types::game_state::CastingVariant::Normal,
             was_kicked: false,
+            spell_object_id: None,
         }]
         .into(),
     );
@@ -44946,7 +45752,7 @@ use crate::types::mana::ManaPipId;
 /// `add_mana_to_pool` so every seeded unit is stamped distinctly (a direct
 /// `pool.add` would leave the sentinel `ManaPipId(0)` and pins would collide).
 fn seed_unit(state: &mut GameState, player: PlayerId, unit: ManaUnit) -> ManaPipId {
-    state.add_mana_to_pool(player, unit);
+    let _ = state.add_mana_to_pool(player, unit);
     state
         .players
         .iter()
@@ -47997,7 +48803,7 @@ fn push_cards_to_graveyard_this_turn(state: &mut GameState, owner: PlayerId, cou
     for i in 0..count {
         state
             .zone_changes_this_turn
-            .push(crate::types::game_state::ZoneChangeRecord {
+            .push_back(crate::types::game_state::ZoneChangeRecord {
                 name: format!("Milled Card {i}"),
                 core_types: vec![CoreType::Creature],
                 mana_value: 1,

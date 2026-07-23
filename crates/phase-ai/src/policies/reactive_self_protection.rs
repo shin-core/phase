@@ -167,6 +167,7 @@ mod tests {
                 description: None,
                 attack_defended: None,
                 source_controller: None,
+                source_object: None,
                 bypass_beneficiary: None,
             }],
             target,
@@ -202,10 +203,7 @@ mod tests {
                 source_id,
                 ability_index: 0,
             },
-            metadata: ActionMetadata {
-                actor: Some(AI),
-                tactical_class: TacticalClass::Ability,
-            },
+            metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Ability),
         };
         let decision = AiDecisionContext {
             waiting_for: WaitingFor::Priority { player: AI },
@@ -235,10 +233,7 @@ mod tests {
                 targets: Vec::new(),
                 payment_mode: Default::default(),
             },
-            metadata: ActionMetadata {
-                actor: Some(AI),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Spell),
         };
         let decision = AiDecisionContext {
             waiting_for: WaitingFor::Priority { player: AI },
@@ -278,6 +273,7 @@ mod tests {
                 description: None,
                 attack_defended: None,
                 source_controller: None,
+                source_object: None,
                 bypass_beneficiary: None,
             }],
             target: None,
@@ -427,6 +423,7 @@ mod tests {
                 description: None,
                 attack_defended: None,
                 source_controller: None,
+                source_object: None,
                 bypass_beneficiary: None,
             }],
             target: None,
@@ -511,6 +508,7 @@ mod tests {
                 description: None,
                 attack_defended: None,
                 source_controller: None,
+                source_object: None,
                 bypass_beneficiary: None,
             }],
             target: None,

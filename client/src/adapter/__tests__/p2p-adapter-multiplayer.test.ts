@@ -1087,7 +1087,8 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     );
   });
 
-  // Regression guard: the wire must carry legalActionsByObject + spellCosts
+  // Regression guard: the wire must carry legalActionsByObject, spellCosts,
+  // and engine-authored mana-payment shortcut actions
   // across game_setup, state_update, and reconnect_ack. Dropping these fields
   // — even though the flat `legalActions` array still arrives — leaves guests
   // unable to click cards in their hand, because the frontend card-click
@@ -1097,7 +1098,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
   // because those dispatch as plain GameActions, which is why the original
   // bug evaded detection for so long. This test locks in the fix at every
   // wire site so a future refactor cannot silently regress.
-  it("wire protocol round-trips legalActionsByObject + spellCosts on every send site", async () => {
+  it("wire protocol round-trips legal projections on every send site", async () => {
     // Seed the mocked engine's legal-actions response with non-empty
     // per-object grouping and spell costs. The host adapter is expected to
     // forward these verbatim to every guest via game_setup, state_update,
@@ -1109,6 +1110,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     const spellCosts = {
       "42": { generic: 1, colored: { R: 1 } },
     };
+    const manaPaymentShortcutActions: GameAction[] = [{ type: "PassPriority" }];
     // Cast via `unknown` because the hoisted mock's default return is inferred
     // as `{ actions: never[]; autoPassRecommended: boolean }`, which would
     // reject our richer payload. The adapter consumes the full
@@ -1128,6 +1130,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
         { type: "PassPriority" },
       ],
       autoPassRecommended: false,
+      manaPaymentShortcutActions,
       legalActionsByObject,
       spellCosts,
     }));
@@ -1148,12 +1151,14 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
         playerToken: string;
         legalActionsByObject?: Record<string, unknown>;
         spellCosts?: Record<string, unknown>;
+        manaPaymentShortcutActions?: GameAction[];
       } =>
         typeof m === "object" && m !== null && (m as { type: string }).type === "game_setup",
     );
     expect(setup).toBeDefined();
     expect(setup!.legalActionsByObject).toEqual(legalActionsByObject);
     expect(setup!.spellCosts).toEqual(spellCosts);
+    expect(setup!.manaPaymentShortcutActions).toEqual(manaPaymentShortcutActions);
     const playerToken = setup!.playerToken;
 
     // ── state_update ───────────────────────────────────────────────────────
@@ -1165,12 +1170,14 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
         type: "state_update";
         legalActionsByObject?: Record<string, unknown>;
         spellCosts?: Record<string, unknown>;
+        manaPaymentShortcutActions?: GameAction[];
       } =>
         typeof m === "object" && m !== null && (m as { type: string }).type === "state_update",
     );
     expect(stateUpdate).toBeDefined();
     expect(stateUpdate!.legalActionsByObject).toEqual(legalActionsByObject);
     expect(stateUpdate!.spellCosts).toEqual(spellCosts);
+    expect(stateUpdate!.manaPaymentShortcutActions).toEqual(manaPaymentShortcutActions);
 
     // ── reconnect_ack ──────────────────────────────────────────────────────
     g1.simulateClose();
@@ -1188,12 +1195,116 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
         type: "reconnect_ack";
         legalActionsByObject?: Record<string, unknown>;
         spellCosts?: Record<string, unknown>;
+        manaPaymentShortcutActions?: GameAction[];
       } =>
         typeof m === "object" && m !== null && (m as { type: string }).type === "reconnect_ack",
     );
     expect(ack).toBeDefined();
     expect(ack!.legalActionsByObject).toEqual(legalActionsByObject);
     expect(ack!.spellCosts).toEqual(spellCosts);
+    expect(ack!.manaPaymentShortcutActions).toEqual(manaPaymentShortcutActions);
+  });
+
+  it("keeps turn-controller auto-pass recommendations viewer-scoped on setup, update, and reconnect", async () => {
+    const viewerSnapshot = (pid: number) => ({
+      state: {
+        filteredFor: pid,
+        players: [],
+        active_player: 2,
+        priority_player: 1,
+        phase: "Upkeep",
+        waiting_for: { type: "Priority", data: { player: 2 } },
+        turn_decision_controller: 1,
+        priority_passing_modes: pid === 1 ? { "1": "SkipLowUseWindows" } : {},
+      },
+      actions: pid === 1 ? [{ type: "PassPriority" }] : [],
+      autoPassRecommended: pid === 1,
+    });
+    (mocks.getViewerSnapshot as unknown as {
+      mockImplementation: (fn: (pid: number) => Promise<unknown>) => void;
+    }).mockImplementation(async (pid: number) => viewerSnapshot(pid));
+
+    const messageOfType = async <T extends { type: string }>(
+      conn: FakeOpenableConnection,
+      type: T["type"],
+    ): Promise<T> => {
+      const message = (await conn.getSentMessages()).find(
+        (candidate) =>
+          typeof candidate === "object"
+          && candidate !== null
+          && (candidate as { type: string }).type === type,
+      );
+      expect(message).toBeDefined();
+      return message as T;
+    };
+    type ViewerMessage = {
+      type: "game_setup" | "state_update" | "reconnect_ack";
+      playerToken?: string;
+      state: { priority_passing_modes?: Record<string, string> };
+      legalActions: GameAction[];
+      autoPassRecommended: boolean;
+    };
+    const expectControllerView = (message: ViewerMessage) => {
+      expect(message.autoPassRecommended).toBe(true);
+      expect(message.legalActions).toEqual([{ type: "PassPriority" }]);
+      expect(message.state.priority_passing_modes).toEqual({
+        "1": "SkipLowUseWindows",
+      });
+    };
+    const expectControlledView = (message: ViewerMessage) => {
+      expect(message.autoPassRecommended).toBe(false);
+      expect(message.legalActions).toEqual([]);
+      expect(message.state.priority_passing_modes).toEqual({});
+    };
+
+    const { adapter, emitConnection } = makeHost(3, 5_000);
+    await adapter.initialize();
+    const controller = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: [], sideboard: [] } },
+    });
+    const controlled = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: [], sideboard: [] } },
+    });
+    await adapter.initializeGame();
+
+    const controllerSetup = await messageOfType<ViewerMessage & { playerToken: string }>(
+      controller,
+      "game_setup",
+    );
+    const controlledSetup = await messageOfType<ViewerMessage & { playerToken: string }>(
+      controlled,
+      "game_setup",
+    );
+    expectControllerView(controllerSetup);
+    expectControlledView(controlledSetup);
+
+    controller.sent.length = 0;
+    controlled.sent.length = 0;
+    await adapter.submitAction({ type: "PassPriority" }, 0);
+    expectControllerView(await messageOfType<ViewerMessage>(controller, "state_update"));
+    expectControlledView(await messageOfType<ViewerMessage>(controlled, "state_update"));
+
+    controller.simulateClose();
+    const reconnectedController = await joinGuest(emitConnection, {
+      type: "reconnect",
+      playerToken: controllerSetup.playerToken,
+    });
+    await flushPromises();
+    expectControllerView(
+      await messageOfType<ViewerMessage>(reconnectedController, "reconnect_ack"),
+    );
+
+    controlled.simulateClose();
+    const reconnectedControlled = await joinGuest(emitConnection, {
+      type: "reconnect",
+      playerToken: controlledSetup.playerToken,
+    });
+    await flushPromises();
+    expectControlledView(
+      await messageOfType<ViewerMessage>(reconnectedControlled, "reconnect_ack"),
+    );
   });
 
   it("state_update broadcasts engine log entries to guests", async () => {
@@ -1244,6 +1355,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       events: [],
       legalActions: [],
       autoPassRecommended: false,
+      manaPaymentShortcutActions: [],
     });
     await adapter.initializeGame();
 
@@ -1259,6 +1371,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       logEntries: pendingLogs,
       legalActions: [],
       autoPassRecommended: false,
+      manaPaymentShortcutActions: [],
     });
     await expect(pendingSubmit).resolves.toEqual({
       events: pendingEvents,
@@ -1277,6 +1390,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       logEntries: unsolicitedLogs,
       legalActions: [],
       autoPassRecommended: false,
+      manaPaymentShortcutActions: [],
     });
 
     // The engine pair now travels as one seq-stamped `EngineSnapshot`.
@@ -1291,6 +1405,59 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
         logEntries: unsolicitedLogs,
       }),
     );
+  });
+
+  // Issue #5913: the host relays the engine's verdict verbatim, so a guest must
+  // classify a stale ReorderHand exactly as the local-WASM seat does. Before the
+  // shared classifier this path built a generic ACTION_REJECTED, and
+  // `dispatchAction` — which suppresses only STALE_ACTION — still surfaced the
+  // red error to P2P guests.
+  it("guest classifies a stale ReorderHand rejection from the host as STALE_ACTION", async () => {
+    const { peer } = createFakePeer();
+    const conn = new FakeDataConnection();
+    const adapter = new P2PGuestAdapter(
+      { player: { main_deck: [], sideboard: [] } },
+      peer as unknown as Peer,
+      "host-peer",
+      conn as unknown as DataConnection,
+    );
+    await adapter.initialize();
+    await conn.simulateData({
+      type: "game_setup",
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
+      assignedPlayerId: 1,
+      playerToken: "seat-token",
+      state: remoteState("setup"),
+      events: [],
+      legalActions: [],
+      autoPassRecommended: false,
+      manaPaymentShortcutActions: [],
+    });
+    await adapter.initializeGame();
+
+    const stale = adapter.submitAction(
+      { type: "ReorderHand", data: { order: [1, 2, 3] } } as unknown as GameAction,
+      1,
+    );
+    await conn.simulateData({
+      type: "action_rejected",
+      reason: "Engine error: ReorderHand: expected 6 ids, got 5",
+    });
+    await expect(stale).rejects.toMatchObject({
+      code: "STALE_ACTION",
+      recoverable: false,
+    });
+
+    // A genuine rejection must still surface as a recoverable ACTION_REJECTED.
+    const real = adapter.submitAction({ type: "PassPriority" }, 1);
+    await conn.simulateData({
+      type: "action_rejected",
+      reason: "Engine error: Something genuinely wrong",
+    });
+    await expect(real).rejects.toMatchObject({
+      code: "ACTION_REJECTED",
+      recoverable: true,
+    });
   });
 
   it("guest snapshots stay coherent and strictly ordered across successive state updates", async () => {
@@ -1312,6 +1479,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
         events: [],
         legalActions: actions,
         autoPassRecommended: false,
+        manaPaymentShortcutActions: [],
       });
 
     const passPriority = [{ type: "PassPriority" }] as unknown as GameAction[];

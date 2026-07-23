@@ -1240,7 +1240,13 @@ pub(super) fn drain_deferred_triggers_after_stack_object_announcement(
     events: &mut Vec<GameEvent>,
     waiting_for: WaitingFor,
 ) -> WaitingFor {
-    if !matches!(waiting_for, WaitingFor::Priority { .. }) {
+    // CR 603.3b + CR 608.2g: a terminal Ripple completion waits for the
+    // *current* final cast's SpellCast event to join the earlier parked casts.
+    // The ordinary post-announcement helper would otherwise drain B here,
+    // before the reducer's priority pipeline has collected C.
+    if !matches!(waiting_for, WaitingFor::Priority { .. })
+        || state.pending_resolution_completion.is_some()
+    {
         return waiting_for;
     }
     crate::game::triggers::drain_deferred_triggers_after_stack_object_announcement(state, events)
@@ -2378,20 +2384,28 @@ fn settle_sacrifice_for_cost_events(
     if !deferred_cost_events.is_empty() {
         crate::game::triggers::collect_triggers_into_deferred(state, &deferred_cost_events);
     }
-    state.consumed_before_priority_trigger_events.extend(
-        events[current_start..current_end]
-            .iter()
-            .enumerate()
-            .map(|(offset, event)| {
-                let index = current_start + offset;
-                crate::game::triggers::ConsumedTriggerEventOccurrence {
-                    event: event.clone(),
-                    occurrence: events[..index]
-                        .iter()
-                        .filter(|prior| *prior == event)
-                        .count(),
-                }
-            }),
+    let occurrences = events[current_start..current_end]
+        .iter()
+        .enumerate()
+        .map(|(offset, event)| {
+            let index = current_start + offset;
+            crate::game::triggers::ConsumedTriggerEventOccurrence {
+                event: event.clone(),
+                occurrence: events[..index]
+                    .iter()
+                    .filter(|prior| *prior == event)
+                    .count(),
+            }
+        })
+        .collect();
+    crate::game::triggers::resolve_and_apply_trigger_collection(
+        state,
+        crate::types::resolved_commands::ResolvedTriggerCollection::ConsumeBeforePriority {
+            occurrences,
+        },
+    )
+    .expect(
+        "sacrifice-cost settlement consumed-before-priority trigger journal cause must be live",
     );
 }
 
@@ -2927,11 +2941,23 @@ pub(crate) fn handle_return_to_hand_for_cost(
     // Karoo lands, Cavern Harpy): `count` is almost always 1, so the stamp's
     // `len() < 2` guard would no-op. If a >=2-permanent return-to-hand cost ever
     // ships, mirror the A1 stamp from `handle_sacrifice_for_cost` here.
+    // A self-return component is paid by `pay_ability_cost` above. Moving
+    // that source a second time would emit a spurious Hand -> Hand event.
+    let to_return: Vec<_> = chosen
+        .iter()
+        .copied()
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|obj| obj.zone != Zone::Hand)
+        })
+        .collect();
     finish_cost_object_moves(
         state,
         player,
         pending,
-        chosen.to_vec(),
+        to_return,
         0,
         Zone::Hand,
         PendingCostMoveCompletion::FinishPending,
@@ -3367,18 +3393,15 @@ pub(crate) fn tap_creatures_total_power(state: &GameState, ids: &[ObjectId]) -> 
         .sum()
 }
 
-/// CR 702.34a: Tap creatures cost — complete the tap-creatures cost after player selection.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn handle_tap_creatures_for_spell_cost(
+/// CR 118.3 + CR 701.26a: Complete the tap-creatures cost after player selection.
+pub(crate) fn pay_tap_creatures_selection(
     state: &mut GameState,
-    player: PlayerId,
-    pending: PendingCast,
     count: usize,
     aggregate: Option<TapCreaturesAggregate>,
     legal_creatures: &[ObjectId],
     chosen: &[ObjectId],
     events: &mut Vec<GameEvent>,
-) -> Result<WaitingFor, EngineError> {
+) -> Result<(), EngineError> {
     // CR 601.2b: Validate the chosen set against the cost's requirement shape.
     // `aggregate == None` is fixed-count (tap exactly `count`); `Some(a)` is the
     // aggregate Crew/Saddle/Teamwork form (tap any number whose total positive
@@ -3418,6 +3441,22 @@ pub(crate) fn handle_tap_creatures_for_spell_cost(
         crate::game::restrictions::tap_permanent_for_cost(state, id, events)?;
     }
 
+    Ok(())
+}
+
+/// CR 118.3 + CR 701.26a: Complete the tap-creatures cost after player selection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_tap_creatures_for_spell_cost(
+    state: &mut GameState,
+    player: PlayerId,
+    pending: PendingCast,
+    count: usize,
+    aggregate: Option<TapCreaturesAggregate>,
+    legal_creatures: &[ObjectId],
+    chosen: &[ObjectId],
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    pay_tap_creatures_selection(state, count, aggregate, legal_creatures, chosen, events)?;
     finish_pending_cost_or_cast(state, player, pending, events)
 }
 
@@ -4730,43 +4769,64 @@ pub(super) fn begin_target_dependent_additional_cost_declaration(
         .objects
         .get(&object_id)
         .and_then(|obj| obj.additional_cost.clone());
-    let Some(AdditionalCost::Kicker {
-        costs,
-        repeatability,
-    }) = additional
-    else {
-        return pay_and_push(
-            state,
-            player,
-            object_id,
-            card_id,
-            ability,
-            &cost,
-            base_cost,
-            casting_variant,
-            casting_permission_index,
-            cast_timing_permission,
-            distribute,
-            origin_zone,
-            payment_mode,
-            events,
-        );
-    };
-
-    let mut pending = PendingCast::new(object_id, card_id, ability, cost);
-    pending.base_cost = base_cost;
-    pending.casting_variant = casting_variant;
-    pending.casting_permission_index = casting_permission_index;
-    pending.cast_timing_permission = cast_timing_permission;
-    pending.distribute = distribute;
-    pending.origin_zone = origin_zone;
-    pending.payment_mode = payment_mode;
-    pending.deferred_target_selection = true;
-    pending.additional_cost_flow = Some(AdditionalCost::Kicker {
-        costs,
-        repeatability,
-    });
-    finish_pending_cost_or_cast(state, player, pending, events)
+    match additional {
+        // CR 601.2b + CR 702.33a: Kicker "instead" — VERBATIM prior behavior.
+        // The kicker decision (and any repeated payment) is tracked through
+        // `additional_cost_flow` and drained by the kicker-specific arms of
+        // `finish_pending_cost_or_cast`.
+        Some(AdditionalCost::Kicker {
+            costs,
+            repeatability,
+        }) => {
+            let mut pending = PendingCast::new(object_id, card_id, ability, cost);
+            pending.base_cost = base_cost;
+            pending.casting_variant = casting_variant;
+            pending.casting_permission_index = casting_permission_index;
+            pending.cast_timing_permission = cast_timing_permission;
+            pending.distribute = distribute;
+            pending.origin_zone = origin_zone;
+            pending.payment_mode = payment_mode;
+            pending.deferred_target_selection = true;
+            pending.additional_cost_flow = Some(AdditionalCost::Kicker {
+                costs,
+                repeatability,
+            });
+            finish_pending_cost_or_cast(state, player, pending, events)
+        }
+        // CR 601.2b/f + CR 702.194c + CR 113.2c: every other target-dependent
+        // "instead" additional cost (e.g. Teamwork) is queue-synthesized —
+        // charged via the deferred queue drain (`OptionalCostChoice` ->
+        // `record_additional_cost_instance_payment` sets `additional_cost_paid`
+        // and, once the queue empties, `additional_cost_decided`, which skips
+        // post-target re-detection at `finish_pending_cast_cost_or_pay`).
+        // `additional_cost_flow` is deliberately left `None` here (not
+        // `Some(other)`): the synthesized keyword (e.g. `synthesize_teamwork`)
+        // already stores the same instance in `obj.additional_cost`, so
+        // carrying it as a flow would double-prompt for the same cost, and
+        // `finish_pending_cost_or_cast` has no arm that drains a `Some(other)`
+        // flow anyway (only Kicker and `Optional{Repeatable}` are handled) —
+        // it would be silently dropped. This is byte-identical to the prior
+        // behavior for every card with a non-empty effective queue (their
+        // `obj.additional_cost` already equals the queue instance).
+        _other => {
+            // Sole caller (`casting.rs::continue_with_prepared`'s non-kicker
+            // else-if) only reaches this arm when the effective queue is
+            // already non-empty, so no empty-queue fallback is needed here.
+            let queue = build_effective_additional_cost_queue(state, player, object_id);
+            let mut pending = PendingCast::new(object_id, card_id, ability, cost);
+            pending.base_cost = base_cost;
+            pending.casting_variant = casting_variant;
+            pending.casting_permission_index = casting_permission_index;
+            pending.cast_timing_permission = cast_timing_permission;
+            pending.distribute = distribute;
+            pending.origin_zone = origin_zone;
+            pending.payment_mode = payment_mode;
+            pending.deferred_target_selection = true;
+            pending.additional_cost_queue = queue;
+            pending.additional_cost_flow = None;
+            finish_pending_cost_or_cast(state, player, pending, events)
+        }
+    }
 }
 
 /// CR 601.2b: Present an optional additional cost (e.g. Casualty) to the player
@@ -5058,25 +5118,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     // independently functioning instances are announced through a queue. This
     // preserves one payment record per Casualty/Offspring/Squad/Replicate/
     // Bargain/Teamwork instance while leaving Kicker on its existing `kickers_paid` path.
-    let mut additional_cost_queue = Vec::new();
-    additional_cost_queue.extend(effective_casualty_additional_cost_instances(
-        state, player, object_id,
-    ));
-    additional_cost_queue.extend(effective_offspring_additional_cost_instances(
-        state, player, object_id,
-    ));
-    additional_cost_queue.extend(effective_squad_additional_cost_instances(
-        state, player, object_id,
-    ));
-    additional_cost_queue.extend(effective_replicate_additional_cost_instances(
-        state, player, object_id,
-    ));
-    additional_cost_queue.extend(effective_bargain_additional_cost_instances(
-        state, player, object_id,
-    ));
-    additional_cost_queue.extend(effective_teamwork_additional_cost_instances(
-        state, player, object_id,
-    ));
+    let additional_cost_queue = build_effective_additional_cost_queue(state, player, object_id);
     let obj_additional_matches_instance = obj_additional.as_ref().is_some_and(|cost| {
         additional_cost_queue
             .iter()
@@ -6334,11 +6376,20 @@ fn pay_additional_cost_with_source(
                 super::quantity::resolve_quantity(state, &amount, player, pending.object_id).max(0),
             )
             .unwrap_or(0);
-            let player_state = &mut state.players[player.0 as usize];
-            if player_state.energy < amount {
+            let energy = state.players[player.0 as usize].energy;
+            if energy < amount {
                 return Err(EngineError::ActionNotAllowed("Not enough energy".into()));
             }
-            player_state.energy -= amount;
+            if amount > 0 {
+                state
+                    .resolve_and_apply_player_edit(
+                        player,
+                        crate::types::resolved_commands::ResolvedPlayerEdit::Energy {
+                            delta: -(amount as i32),
+                        },
+                    )
+                    .expect("preflighted cast energy payment must apply");
+            }
             events.push(GameEvent::EnergyChanged {
                 player,
                 delta: -(amount as i32),
@@ -6540,10 +6591,109 @@ fn pay_additional_cost_with_source(
                 },
             });
         }
+        AbilityCost::Reveal { count, filter } => {
+            let mut pending = pending;
+            // CR 701.20a: A filter-less reveal is the spell revealing itself —
+            // there is no choice to make, the object is already known.
+            let Some(filter) = filter else {
+                if let Some(obj) = state.objects.get(&pending.object_id) {
+                    pending
+                        .ability
+                        .set_cost_paid_object_recursive(CostPaidObjectSnapshot {
+                            object_id: pending.object_id,
+                            lki: obj.snapshot_for_mana_spent(),
+                        });
+                    events.push(GameEvent::CardsRevealed {
+                        player,
+                        card_ids: vec![pending.object_id],
+                        card_names: vec![obj.name.clone()],
+                    });
+                }
+                return finish_pending_cost_or_cast(state, player, pending, events);
+            };
+            // CR 701.20a + CR 601.2b: A filtered reveal requires interactive
+            // card selection — return a WaitingFor, mirroring Discard.
+            let eligible = super::casting::find_eligible_reveal_targets(
+                state,
+                player,
+                pending.object_id,
+                &filter,
+            );
+            // CR 601.2b: Defense-in-depth — payability already gated this.
+            if eligible.len() < count as usize {
+                return Err(EngineError::ActionNotAllowed(
+                    "Not enough eligible cards in hand to reveal".to_string(),
+                ));
+            }
+            return Ok(WaitingFor::PayCost {
+                player,
+                kind: PayCostKind::Reveal,
+                choices: eligible,
+                count: count as usize,
+                min_count: 0,
+                resume: CostResume::Spell {
+                    spell: Box::new(pending),
+                },
+            });
+        }
         _ => {
             // Other cost types (Exile, etc.) — not yet interactive
         }
     }
+
+    finish_pending_cost_or_cast(state, player, pending, events)
+}
+
+/// CR 701.20a + CR 601.2b: Complete a filtered `AbilityCost::Reveal` payment
+/// after the player selects a matching card from hand. The card stays in
+/// hand — revealing doesn't move it (CR 701.20b) — and becomes the
+/// resolving ability's cost-paid-object referent (CR 608.2k), backing
+/// references like "the revealed card's mana value".
+pub(crate) fn handle_reveal_for_cost(
+    state: &mut GameState,
+    player: PlayerId,
+    mut pending: PendingCast,
+    expected: usize,
+    legal_cards: &[ObjectId],
+    chosen: &[ObjectId],
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    if chosen.len() != expected {
+        return Err(EngineError::InvalidAction(format!(
+            "Must reveal exactly {} card(s), got {}",
+            expected,
+            chosen.len()
+        )));
+    }
+    for card_id in chosen {
+        if !legal_cards.contains(card_id) {
+            return Err(EngineError::InvalidAction(
+                "Selected card not in hand".to_string(),
+            ));
+        }
+    }
+
+    let mut revealed_names = Vec::with_capacity(chosen.len());
+    for (index, &card_id) in chosen.iter().enumerate() {
+        let obj = state.objects.get(&card_id).ok_or_else(|| {
+            EngineError::InvalidAction("Selected card no longer exists".to_string())
+        })?;
+        revealed_names.push(obj.name.clone());
+        if index == 0 {
+            pending
+                .ability
+                .set_cost_paid_object_recursive(CostPaidObjectSnapshot {
+                    object_id: card_id,
+                    lki: obj.snapshot_for_mana_spent(),
+                });
+        }
+    }
+
+    events.push(GameEvent::CardsRevealed {
+        player,
+        card_ids: chosen.to_vec(),
+        card_names: revealed_names,
+    });
 
     finish_pending_cost_or_cast(state, player, pending, events)
 }
@@ -6818,6 +6968,40 @@ fn max_pay_life_x(state: &GameState, player: PlayerId) -> u32 {
     // CR 119.4a: in a team format the max X payable via life is bounded by the
     // team's shared total (off-team this is the player's own life).
     u32::try_from(super::players::team_life_total(state, player).max(0)).unwrap_or(0)
+}
+
+/// CR 601.2b/f + CR 113.2c: the effective queue of independently-functioning,
+/// non-Kicker additional-cost instances (Casualty/Offspring/Squad/Replicate/
+/// Bargain/Teamwork) available for `object_id` right now. Single authority for
+/// this extraction — both `check_additional_cost_or_pay_with_distribute` (the
+/// payment path) and the pre-target deferral gates in `casting.rs`/
+/// `ability_utils.rs` (which must defer to declare-before-targets iff this
+/// queue is non-empty) call this same function so they can never disagree.
+pub(super) fn build_effective_additional_cost_queue(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> Vec<AdditionalCostInstance> {
+    let mut additional_cost_queue = Vec::new();
+    additional_cost_queue.extend(effective_casualty_additional_cost_instances(
+        state, player, object_id,
+    ));
+    additional_cost_queue.extend(effective_offspring_additional_cost_instances(
+        state, player, object_id,
+    ));
+    additional_cost_queue.extend(effective_squad_additional_cost_instances(
+        state, player, object_id,
+    ));
+    additional_cost_queue.extend(effective_replicate_additional_cost_instances(
+        state, player, object_id,
+    ));
+    additional_cost_queue.extend(effective_bargain_additional_cost_instances(
+        state, player, object_id,
+    ));
+    additional_cost_queue.extend(effective_teamwork_additional_cost_instances(
+        state, player, object_id,
+    ));
+    additional_cost_queue
 }
 
 pub(super) fn effective_casualty_additional_cost(
@@ -8025,14 +8209,19 @@ fn finalize_cast_with_phyrexian_choices_inner(
         .unwrap_or_default();
     let convoked_creature_count = convoked_creatures.len();
 
-    // CR 601.2a + CR 702.27a + CR 702.51a: capture the object-growth recast snapshot the
-    // PR-7 Phase 4d-ii loop-shortcut hook replays. Gated to a buyback-paid,
-    // permanent-creating (token) spell so the hook's cheap precondition (`last_recast_context
-    // == Some`) is set ~never. Fail-safe note: a spurious capture from buyback + some OTHER
-    // optional cost only makes the clone-drive run — its cover/abort rejects any non-covering
-    // recast, so this can never false-certify. Cleared (set `None`) on any non-matching cast,
-    // so a stale context never lingers. `ability.effect` is read here before `ability` is
-    // moved into `stack_ability` below.
+    // CR 601.2a + CR 702.27a + CR 702.51a: capture the object-growth recast as a 1-element
+    // loop-action sequence the PR-7 Phase 4d-ii / P7 v3 loop-shortcut hook replays. Gated to a
+    // buyback-paid, permanent-creating (token) spell so the hook's cheap precondition
+    // (`!last_loop_action_sequence.is_empty()`) is set ~never. Fail-safe note: a spurious capture
+    // from buyback + some OTHER optional cost only makes the clone-drive run — its cover/abort
+    // rejects any non-covering recast, so this can never false-certify. Cleared (set `[]`) on any
+    // non-matching cast, so a stale sequence never lingers. Additionally gated on
+    // `!in_simulation_probe()` so the detection/materialize drive (which re-runs this same cast
+    // under a `SimulationProbeGuard`) does NOT re-write the field — the sequence must stay
+    // byte-stable across the cover's s_n/s_n1/s_n2 frames (it is COMPARED, resource.rs). Overwrite
+    // is idempotent for a recast, but the shared invariant keeps the multi-activation path (which
+    // APPENDS, engine.rs) honest. `ability.effect` is read here before `ability` is moved into
+    // `stack_ability` below.
     {
         let is_token_creating =
             matches!(ability.effect, crate::types::ability::Effect::Token { .. });
@@ -8049,20 +8238,34 @@ fn finalize_cast_with_phyrexian_choices_inner(
             (has_buyback, convoke)
         });
         // #4603 opt-in gate: OFF (`!samples()`) must be byte-identical to pre-PR-7 on the
-        // SERIALIZED surface too — `last_recast_context` is `skip_serializing_if=is_none`, so a
-        // spurious `Some(..)` in OFF mode would appear in a save/replay/scenario. Gate on the
-        // SAME accessor the consuming hook uses (engine.rs:448) so the mode gate has one source.
-        state.last_recast_context = (state.loop_detection.samples()
-            && additional_cost_paid
-            && has_buyback
-            && is_token_creating)
-            .then_some(crate::types::game_state::RecastContext {
-                card_id,
-                controller: player,
-                from_zone: source_zone,
-                uses_buyback: crate::types::game_state::BuybackUsage::Used,
-                convoke,
-            });
+        // SERIALIZED surface too — `last_loop_action_sequence` is `skip_serializing_if=is_empty`, so
+        // a spurious element in OFF mode would appear in a save/replay/scenario. Gate on the SAME
+        // accessor the consuming hook uses so the mode gate has one source. The whole
+        // set-or-clear is skipped inside a `SimulationProbeGuard` (the detection/materialize drive
+        // re-casts on a clone): the sequence must stay byte-STABLE across the cover's s_n/s_n1/s_n2
+        // frames (it is COMPARED, resource.rs), so the probe must LEAVE it untouched rather than
+        // clear it. Overwrite-with-`vec![ctx]`-or-`[]` is the real-cast behavior (idempotent for a
+        // homogeneous recast; a non-matching real cast clears a stale sequence).
+        if !crate::game::engine::in_simulation_probe() {
+            state.last_loop_action_sequence = (state.loop_detection.samples()
+                && additional_cost_paid
+                && has_buyback
+                && is_token_creating)
+                .then_some(crate::types::game_state::LoopActionContext {
+                    card_id,
+                    controller: player,
+                    action: crate::types::game_state::LoopAction::Recast {
+                        from_zone: source_zone,
+                        uses_buyback: crate::types::game_state::BuybackUsage::Used,
+                    },
+                    convoke,
+                    // FIX-1: a buyback recast pins its loop choices via `convoke`, not the
+                    // FIX-1 tap-cost/color/proliferate choices — recorded pinless.
+                    pins: Vec::new(),
+                })
+                .map(|ctx| vec![ctx])
+                .unwrap_or_default();
+        }
     }
 
     // Determine whether this spell has a meaningful on-resolve ability.
@@ -8390,7 +8593,12 @@ fn finalize_cast_with_phyrexian_choices_inner(
             frequency: crate::types::statics::CastFrequency::OncePerTurn,
             ..
         } => {
-            state.graveyard_cast_permissions_used.insert(source);
+            crate::game::ledger::consume_once_per_turn_permission(
+                state,
+                source,
+                crate::types::resolved_commands::ResolvedOncePerTurnPermission::GraveyardCast,
+            )
+            .expect("graveyard cast permission must have an unused ledger slot");
         }
         CastingVariant::GraveyardPermission {
             source,
@@ -8399,9 +8607,14 @@ fn finalize_cast_with_phyrexian_choices_inner(
             ..
         } => {
             // CR 110.4: Consume the chosen permanent-type slot for this source.
-            state
-                .graveyard_cast_permissions_used_per_type
-                .insert((source, slot));
+            crate::game::ledger::consume_once_per_turn_permission(
+                state,
+                source,
+                crate::types::resolved_commands::ResolvedOncePerTurnPermission::GraveyardCastPermanentType {
+                    permanent_type: slot,
+                },
+            )
+            .expect("graveyard permanent-type slot must be unused");
         }
         CastingVariant::GraveyardPermission {
             frequency: crate::types::statics::CastFrequency::OncePerTurnPerPermanentType,
@@ -8418,7 +8631,12 @@ fn finalize_cast_with_phyrexian_choices_inner(
             source,
             frequency: crate::types::statics::CastFrequency::OncePerTurn,
         } => {
-            state.hand_cast_free_permissions_used.insert(source);
+            crate::game::ledger::consume_once_per_turn_permission(
+                state,
+                source,
+                crate::types::resolved_commands::ResolvedOncePerTurnPermission::HandCastFree,
+            )
+            .expect("hand cast permission must have an unused ledger slot");
         }
         // CR 601.2a + CR 113.6b: Maralen-class exile-cast permission. Stamp
         // the per-source slot when the static is `OncePerTurn`; `Unlimited`
@@ -8431,7 +8649,12 @@ fn finalize_cast_with_phyrexian_choices_inner(
             source,
             frequency: crate::types::statics::CastFrequency::OncePerTurnPerPermanentType,
         } => {
-            state.exile_cast_permissions_used.insert(source);
+            crate::game::ledger::consume_once_per_turn_permission(
+                state,
+                source,
+                crate::types::resolved_commands::ResolvedOncePerTurnPermission::ExileCast,
+            )
+            .expect("exile cast permission must have an unused ledger slot");
         }
         _ => {}
     }
@@ -8444,12 +8667,22 @@ fn finalize_cast_with_phyrexian_choices_inner(
     // every sibling permission. As Foretold's grant rides `CastingVariant::Normal`,
     // so the `match casting_variant` above never covers it — this is a separate block.
     if let Some(src) = alt_cost_grant_source {
-        state.alt_cost_grant_permissions_used.insert(src);
+        crate::game::ledger::consume_once_per_turn_permission(
+            state,
+            src,
+            crate::types::resolved_commands::ResolvedOncePerTurnPermission::AlternativeCostGrant,
+        )
+        .expect("alternative-cost grant must have an unused ledger slot");
     }
     if let Some((source, crate::types::statics::CastFrequency::OncePerTurn)) =
         exile_play_permission_source
     {
-        state.exile_play_permissions_used.insert(source);
+        crate::game::ledger::consume_once_per_turn_permission(
+            state,
+            source,
+            crate::types::resolved_commands::ResolvedOncePerTurnPermission::ExilePlay,
+        )
+        .expect("exile play permission must have an unused ledger slot");
     }
     // CR 601.2a + CR 401.5: Consume the per-turn slot ONLY when the *selected*
     // authorizing top-of-library permission is `OncePerTurn` (Assemble the
@@ -8460,7 +8693,12 @@ fn finalize_cast_with_phyrexian_choices_inner(
     if let Some((source, crate::types::statics::CastFrequency::OncePerTurn)) =
         top_of_library_permission_source
     {
-        state.top_of_library_cast_permissions_used.insert(source);
+        crate::game::ledger::consume_once_per_turn_permission(
+            state,
+            source,
+            crate::types::resolved_commands::ResolvedOncePerTurnPermission::TopOfLibraryCast,
+        )
+        .expect("top-of-library cast permission must have an unused ledger slot");
     }
     // CR 601.2a + CR 603.7 + CR 611.2a: A single-use exile-cast grant is spent
     // on this cast. Record the group and strip the now-void `PlayFromExile` grant from
@@ -8736,11 +8974,28 @@ fn handle_resolution_cast_success(
             if remaining_hits.is_empty() {
                 // CR 702.60a: after the last accepted hit, put the revealed
                 // cards not cast this way on the library bottom.
+                //
+                // This marker is installed before the replacement-aware batch
+                // because that batch can pause. The resumed cast must still
+                // collect its eventual SpellCast trigger with the earlier
+                // accepted hits, rather than drain them during the prompt.
+                state.pending_resolution_completion =
+                    Some(crate::types::game_state::PendingResolutionCompletion {
+                        player,
+                        source_id,
+                        final_cast: Some(cast_object),
+                    });
                 match crate::game::effects::cascade::shuffle_to_bottom(
                     state,
                     &exiled_misses,
                     source_id,
-                    None,
+                    Some(
+                        crate::types::game_state::BatchCompletion::RippleTerminalComplete {
+                            player,
+                            source_id,
+                            final_cast: Some(cast_object),
+                        },
+                    ),
                     events,
                 ) {
                     crate::game::zone_pipeline::BatchMoveResult::Done => None,
@@ -8773,6 +9028,8 @@ fn handle_resolution_cast_success(
             filter,
             zones,
             exile_instead_of_graveyard,
+            source,
+            member_pool,
         } => {
             if exile_instead_of_graveyard {
                 // CR 614.1a: Invoke Calamity's free-cast rider redirects to exile.
@@ -8792,9 +9049,14 @@ fn handle_resolution_cast_success(
             let mut candidates = crate::game::effects::free_cast_from_zones::eligible_candidates(
                 state,
                 controller,
+                source,
                 &filter,
                 &zones,
                 budget_left,
+                // CR 607.2a: the re-offer stays confined to THIS resolution's
+                // "exiled this way" batch (Plargg and Nassari) — see the
+                // window's `member_pool` docs; empty means no restriction.
+                &member_pool,
             );
             // CR 608.2g: Finalize runs before the chosen card is removed from
             // its origin zone; it cannot be offered again while already cast.
@@ -8811,6 +9073,8 @@ fn handle_resolution_cast_success(
                     filter,
                     zones,
                     exile_instead_of_graveyard,
+                    source,
+                    member_pool,
                 },
             }))
         }
@@ -9316,11 +9580,24 @@ fn collect_sorted_auto_tap_source_options(
         .filter(|oid| !excluded_sources.contains(oid))
         .filter_map(|&oid| {
             let obj = state.objects.get(&oid)?;
+            if obj.controller != player {
+                return None;
+            }
+            // CR 106.12 + CR 302.6: The tapped prefilter only holds for `{T}`
+            // sources. A permanent whose payable mana ability is an unambiguous
+            // self-sacrifice (Gold's "Sacrifice this token: Add one mana of any
+            // color.") can still pay while tapped, so it must reach
+            // `auto_tap_mana_options`, which re-applies the per-ability `{T}`
+            // gate. Every other tapped source is dropped here as before.
+            if obj.tapped && !mana_sources::object_has_tapless_self_sacrifice_mana_ability(obj) {
+                return None;
+            }
             // CR 701.26a + CR 508.1f: a "can't become tapped" mana source (e.g. a
-            // goaded mana dork) can't be auto-tapped to pay for a spell.
-            if obj.controller != player
-                || obj.tapped
-                || crate::game::restrictions::object_cant_tap(state, oid)
+            // goaded mana dork) can't be auto-tapped for its `{T}` ability. A
+            // self-sacrifice source needs no tap, so this restriction does not
+            // apply to it; the per-ability gate keeps `{T}` costs off-limits.
+            if crate::game::restrictions::object_cant_tap(state, oid)
+                && !mana_sources::object_has_tapless_self_sacrifice_mana_ability(obj)
             {
                 return None;
             }
@@ -9615,7 +9892,7 @@ fn auto_tap_mana_sources_inner(
                 .objects
                 .get(&option.object_id)
                 .and_then(|obj| obj.abilities.get(ability_index))
-                .is_some_and(|ability| mana_sub_cost_of(&ability.cost).is_none())
+                .is_some_and(|ability| mana_abilities::mana_sub_cost_of(&ability.cost).is_none())
         });
         if option.atomic_combination.is_none()
             && option.mana_type == ManaType::Colorless
@@ -9768,6 +10045,22 @@ fn auto_tap_mana_sources_inner(
     }
 
     // Phase 3: activate each selected mana source.
+    //
+    // CR 601.2g permits mana-ability activation; CR 605.3b resolves it
+    // immediately; CR 605.3c prevents reactivation. Those rules do not prescribe
+    // this ordering. Engine scheduling policy: selected sources without a mana
+    // sub-cost resolve first, stably, so their mana is available to pay a later cost.
+    // This preserves the plan and `used_sources` reservation; it changes only order.
+    to_tap.sort_by_key(|option| {
+        option.ability_index.is_some_and(|ability_index| {
+            state
+                .objects
+                .get(&option.object_id)
+                .and_then(|object| object.abilities.get(ability_index))
+                .is_some_and(|ability| mana_abilities::mana_sub_cost_of(&ability.cost).is_some())
+        })
+    });
+
     // Sources with an explicit ability delegate to resolve_mana_ability (the single
     // authority for cost payment — handles tap, sacrifice, and future cost types).
     // The basic-land-subtype fallback (ability_index: None) uses inline tap + produce.
@@ -9777,10 +10070,10 @@ fn auto_tap_mana_sources_inner(
     // `resolve_triggered_mana_ability_inline` can thread the correct color into the
     // aura's triggered mana ability when `resolve_tap_mana_triggers_inline` fires.
     for option in to_tap {
-        for (aura_id, override_val) in &option.taps_for_mana_overrides {
+        for (trigger_ref, override_val) in &option.taps_for_mana_overrides {
             state
                 .pending_taps_for_mana_overrides
-                .insert(*aura_id, override_val.clone());
+                .insert(trigger_ref.clone(), override_val.clone());
         }
         if let Some(idx) = option.ability_index {
             let ability_def = state
@@ -9813,7 +10106,7 @@ fn auto_tap_mana_sources_inner(
                 // before resolving, so without this the sub-cost could grab a source
                 // the outer cost still needs. Unioning `used_sources` supersedes the
                 // prior `excluded.insert(option.object_id)`.
-                let sub_cost = mana_sub_cost_of(&ability_def.cost);
+                let sub_cost = mana_abilities::mana_sub_cost_of(&ability_def.cost);
                 let excluded_buf;
                 // CR 107.4b + CR 118.10: The outer cost's colored shards are
                 // reserved; computed once (only when a mana sub-cost is present, so
@@ -9890,32 +10183,39 @@ fn auto_tap_mana_sources_inner(
             }
         } else {
             // Basic-land-subtype fallback — no explicit ability, just tap + produce.
-            if let Some(obj) = state.objects.get_mut(&option.object_id) {
-                if !obj.tapped {
-                    obj.tapped = true;
+            let node = state.begin_activated_mana_journal_node(option.object_id);
+            state.with_rules_execution_node(node, |state| {
+                if crate::game::object_state::resolve_and_apply_object_edit(
+                    state,
+                    option.object_id,
+                    crate::types::resolved_commands::ResolvedObjectStatus::Tapped,
+                    true,
+                )
+                .expect("auto-tap source must remain a live exact object")
+                {
                     events.push(GameEvent::PermanentTapped {
                         object_id: option.object_id,
                         caused_by: None,
                     });
                 }
-            }
-            mana_payment::produce_mana(
-                state,
-                option.object_id,
-                option.mana_type,
-                player,
-                true,
-                events,
-            );
-            // CR 106.12 + CR 106.12a: a basic land's intrinsic mana ability
-            // always includes `{T}` in its cost, so this auto-tap fallback
-            // taps the land for mana. Emit one `TappedForMana` per resolution
-            // so `TapsForMana` triggers fire exactly once.
-            events.push(GameEvent::TappedForMana {
-                player_id: player,
-                source_id: option.object_id,
-                produced: vec![option.mana_type],
-                tap_state: ManaTapState::FromTap,
+                mana_payment::produce_mana(
+                    state,
+                    option.object_id,
+                    option.mana_type,
+                    player,
+                    true,
+                    events,
+                );
+                // CR 106.12 + CR 106.12a: a basic land's intrinsic mana ability
+                // always includes `{T}` in its cost, so this auto-tap fallback
+                // taps the land for mana. Emit one `TappedForMana` per resolution
+                // so `TapsForMana` triggers fire exactly once.
+                events.push(GameEvent::TappedForMana {
+                    player_id: player,
+                    source_id: option.object_id,
+                    produced: vec![option.mana_type],
+                    tap_state: ManaTapState::FromTap,
+                });
             });
         }
     }
@@ -9982,17 +10282,6 @@ pub(crate) fn production_override_for_option(
         | crate::types::ability::ManaProduction::ChoiceAmongCombinations { .. }
         | crate::types::ability::ManaProduction::DistinctColorsAmongPermanents { .. }
         | crate::types::ability::ManaProduction::TriggerEventManaType => None,
-    }
-}
-
-fn mana_sub_cost_of(cost: &Option<AbilityCost>) -> Option<&ManaCost> {
-    match cost {
-        Some(AbilityCost::Mana { cost }) => Some(cost),
-        Some(AbilityCost::Composite { costs }) => costs.iter().find_map(|sub| match sub {
-            AbilityCost::Mana { cost } => Some(cost),
-            _ => None,
-        }),
-        _ => None,
     }
 }
 
@@ -10640,12 +10929,36 @@ pub(super) fn apply_committed_assist(
             "Assist mana payment is awaiting a replacement choice".to_string(),
         ));
     }
-    if let Some(p) = state.players.iter_mut().find(|p| p.id == helper) {
-        mana_payment::pay_from_pool(&mut p.mana_pool, &probe).map_err(|e| {
+    if state.players.iter().any(|p| p.id == helper) {
+        state.restamp_pool_pip_ids(helper);
+        let (spent, _) = mana_payment::select_mana_payment(
+            &state
+                .players
+                .iter()
+                .find(|p| p.id == helper)
+                .expect("assisting player exists")
+                .mana_pool,
+            &probe,
+            None,
+            None,
+            false,
+            None,
+            crate::types::mana::LifePaymentColors::EMPTY,
+            &[],
+        )
+        .map_err(|e| {
             EngineError::ActionNotAllowed(format!(
                 "Assisting player could not pay {generic} generic mana at finalization: {e:?}"
             ))
         })?;
+        let recipient = state.mana_payment_recipient(pending.object_id, helper);
+        state
+            .resolve_and_apply_mana_spend(helper, recipient, &spent)
+            .map_err(|_| {
+                EngineError::ActionNotAllowed(
+                    "Assisting player's mana pool changed before payment applied".to_string(),
+                )
+            })?;
         if mana_payment::has_unspent_mana_continuous_effects(state) {
             state.layers_dirty.mark_full();
         }
@@ -12991,7 +13304,7 @@ mod tests {
             &mut state,
             CardId(100),
             caster,
-            "Spawn-Funded Spell".to_string(),
+            "Ironworks-Funded Spell".to_string(),
             Zone::Hand,
         );
         state.objects.get_mut(&spell).unwrap().card_types.core_types = vec![CoreType::Instant];
@@ -13031,18 +13344,21 @@ mod tests {
                 .cost(AbilityCost::Tap),
             );
         }
+        // CR 605.3a + CR 701.21: an ambiguous sacrifice cost (choosing among
+        // multiple artifacts, not just the source itself) still requires a
+        // manual player choice, so it must not be auto-tapped — unlike a
+        // self-sacrifice mana source (Gold, Treasure), which auto-tap can
+        // now select on its own (issue #6157).
         let spawn = create_object(
             &mut state,
             CardId(102),
             caster,
-            "Eldrazi Spawn".to_string(),
+            "Krark-Clan Ironworks".to_string(),
             Zone::Battlefield,
         );
         {
             let obj = state.objects.get_mut(&spawn).unwrap();
-            obj.card_types.core_types.push(CoreType::Creature);
-            obj.card_types.subtypes.push("Eldrazi".to_string());
-            obj.card_types.subtypes.push("Spawn".to_string());
+            obj.card_types.core_types.push(CoreType::Artifact);
             Arc::make_mut(&mut obj.abilities).push(
                 AbilityDefinition::new(
                     AbilityKind::Activated,
@@ -13057,7 +13373,7 @@ mod tests {
                     },
                 )
                 .cost(AbilityCost::Sacrifice(SacrificeCost::count(
-                    TargetFilter::SelfRef,
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
                     1,
                 ))),
             );

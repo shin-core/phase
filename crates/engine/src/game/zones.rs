@@ -1,12 +1,13 @@
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
-#[cfg(test)]
-use crate::types::game_state::ZoneChangeRecord;
 use crate::types::game_state::{
     GameState, ResolutionSourceRelatch, StackEntry, ZoneChangeCombatStatus,
 };
-use crate::types::identifiers::{CardId, ObjectId};
+use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
+use crate::types::resolved_commands::{
+    ResolvedZoneChangeCommand, ResolvedZoneChangeReplayInvariantError,
+};
 use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
 
@@ -109,6 +110,7 @@ pub(crate) fn capture_attachment_snapshot(
             };
             Some(crate::types::game_state::AttachmentSnapshot {
                 object_id: *id,
+                identity: Some(ObjectIncarnationRef::from_object(att)),
                 controller: att.controller,
                 kind,
             })
@@ -137,15 +139,15 @@ pub(crate) fn apply_zone_exit_cleanup(
     attachments: Vec<crate::types::game_state::AttachmentSnapshot>,
 ) {
     // CR 400.7: An object that changes zones becomes a new object with no
-    // memory of its previous existence. Both the short-lived `revealed_cards`
-    // (cleared at action boundaries) and the persistent `public_revealed_cards`
-    // (reveal memory that survives action boundaries so e.g. a Duress-revealed
-    // card stays visible in the opponent's hand) are keyed by ObjectId. Since
-    // ObjectId here is storage identity and persists across the zone change,
-    // we must drop both flags so a card shuffled back into the library and
-    // re-drawn does not surface as "still revealed."
-    state.revealed_cards.remove(&object_id);
-    state.public_revealed_cards.remove(&object_id);
+    // memory of its previous existence. The information authority receives the
+    // pre-move occurrence so the future Zone command can apply this same clear
+    // without ever exposing the new incarnation through the old reveal lease.
+    let occurrence = state
+        .objects
+        .get(&object_id)
+        .map(ObjectIncarnationRef::from_object)
+        .expect("zone-exit cleanup must reference a live object");
+    state.clear_revealed_information_on_zone_exit(occurrence);
     // CR 400.7 + CR 702.187b: The "discarded this turn" mark (Mayhem's gate)
     // belongs to the old object. Clear it on any zone change so a card that
     // leaves the graveyard and returns is not treated as still discarded; the
@@ -167,7 +169,10 @@ pub(crate) fn apply_zone_exit_cleanup(
     // Power/toughness reflect layer modifications on battlefield (Layer 7);
     // from exile they will be None (no layer computation), which is correct.
     if from == Zone::Battlefield || from == Zone::Exile {
+        let lki_copiable_values =
+            crate::game::layers::compute_current_copiable_values(state, object_id);
         if let Some(obj) = state.objects.get(&object_id) {
+            let incarnation = obj.incarnation;
             let lki = crate::types::game_state::LKISnapshot {
                 name: obj.name.clone(),
                 token_image_ref: obj.token_image_ref.clone(),
@@ -208,7 +213,15 @@ pub(crate) fn apply_zone_exit_cleanup(
                 // Supplied by the caller: the sever already ran by the time we get here.
                 attachments,
             };
-            state.lki_cache.insert(object_id, lki);
+            state.lki_cache.insert(object_id, lki.clone());
+            state
+                .lki_by_incarnation
+                .entry(object_id)
+                .or_default()
+                .insert(incarnation, lki);
+        }
+        if let Some(values) = lki_copiable_values {
+            state.lki_copiable_values.insert(object_id, values);
         }
     }
 
@@ -624,7 +637,7 @@ pub(crate) fn record_resolution_source_relatch(
         .resolving_stack_entry
         .as_ref()
         .and_then(StackEntry::ability)
-        .map(|a| (a.source_id, a.source_incarnation))
+        .map(|a| (a.source_id, a.trigger_source_incarnation()))
     else {
         return;
     };
@@ -648,6 +661,239 @@ pub(crate) fn record_resolution_source_relatch(
             current_incarnation: new_incarnation,
         });
     }
+}
+
+fn zone_container_len(
+    state: &GameState,
+    zone: Zone,
+    owner: PlayerId,
+    object_id: ObjectId,
+) -> usize {
+    match zone {
+        Zone::Library => state
+            .players
+            .iter()
+            .find(|player| player.id == owner)
+            .expect("zone command owner exists")
+            .library
+            .len(),
+        Zone::Hand => state
+            .players
+            .iter()
+            .find(|player| player.id == owner)
+            .expect("zone command owner exists")
+            .hand
+            .len(),
+        Zone::Graveyard => state
+            .players
+            .iter()
+            .find(|player| player.id == owner)
+            .expect("zone command owner exists")
+            .graveyard
+            .len(),
+        Zone::Battlefield => state.battlefield.len(),
+        Zone::Stack => state.stack.len(),
+        Zone::Exile => state.exile.len(),
+        Zone::Command => {
+            let object = state
+                .objects
+                .get(&object_id)
+                .expect("zone command object exists");
+            let player = state
+                .players
+                .iter()
+                .find(|player| player.id == owner)
+                .expect("zone command owner exists");
+            if object.in_attraction_deck {
+                player.attraction_deck.len()
+            } else if object.in_contraption_deck {
+                player.contraption_deck.len()
+            } else {
+                state.command_zone.len()
+            }
+        }
+    }
+}
+
+fn destination_position_after_removal(
+    state: &GameState,
+    object_id: ObjectId,
+    from: Zone,
+    to: Zone,
+    owner: PlayerId,
+) -> usize {
+    let destination_len = zone_container_len(state, to, owner, object_id);
+    if from == to {
+        destination_len
+            .checked_sub(1)
+            .expect("moving object must occupy its source container")
+    } else {
+        destination_len
+    }
+}
+
+/// Resolves, applies, and journals the transition core of one ordinary zone move.
+///
+/// CR 400.7 + CR 613.7d: the ordinary path consumes its timestamp, captures the
+/// resulting incarnation and destination position, then delegates the exact
+/// installation to [`apply_resolved_zone_change`]. Replay never allocates a
+/// timestamp or a new object identity.
+pub fn resolve_and_apply_zone_change(
+    state: &mut GameState,
+    object_id: ObjectId,
+    from: Zone,
+    to: Zone,
+    owner: PlayerId,
+    mut zone_change_record: crate::types::game_state::ZoneChangeRecord,
+) -> Result<ResolvedZoneChangeCommand, ResolvedZoneChangeReplayInvariantError> {
+    let object = state.objects.get(&object_id).ok_or(
+        ResolvedZoneChangeReplayInvariantError::UnknownObject(object_id),
+    )?;
+    let occurrence = ObjectIncarnationRef::from_object(object);
+    if object.zone != from {
+        return Err(ResolvedZoneChangeReplayInvariantError::SourceZoneMismatch {
+            expected: from,
+            found: object.zone,
+        });
+    }
+    if object.owner != owner {
+        return Err(ResolvedZoneChangeReplayInvariantError::OwnerMismatch {
+            expected: owner,
+            found: object.owner,
+        });
+    }
+
+    let entry_timestamp = (to == Zone::Battlefield).then(|| state.next_timestamp());
+    let resulting_incarnation = if to == Zone::Battlefield || from != to {
+        occurrence.incarnation + 1
+    } else {
+        occurrence.incarnation
+    };
+    let destination_position =
+        destination_position_after_removal(state, object_id, from, to, owner);
+    let turn_zone_change_index = state.zone_changes_this_turn.len();
+    zone_change_record.entered_incarnation =
+        (to == Zone::Battlefield).then_some(resulting_incarnation);
+    zone_change_record.turn_zone_change_index = turn_zone_change_index;
+
+    let command = ResolvedZoneChangeCommand {
+        object: occurrence,
+        resulting_incarnation,
+        from,
+        to,
+        destination_position,
+        owner,
+        entry_timestamp,
+        turn_zone_change_index,
+        zone_change_record,
+        cause: state.current_or_begin_rules_execution_node(),
+    };
+    apply_resolved_zone_change(state, &command)?;
+    state
+        .resolved_rules_journal
+        .record_zone_change(command.clone())
+        .expect("resolved zone change must have a live journal cause");
+    Ok(command)
+}
+
+/// Installs one recorded transition core without a replacement consult, query,
+/// timestamp allocation, or incarnation allocation.
+pub fn apply_resolved_zone_change(
+    state: &mut GameState,
+    command: &ResolvedZoneChangeCommand,
+) -> Result<(), ResolvedZoneChangeReplayInvariantError> {
+    let turn_number = state.turn_number;
+    let object = state.objects.get(&command.object.object_id).ok_or(
+        ResolvedZoneChangeReplayInvariantError::UnknownObject(command.object.object_id),
+    )?;
+    let found = ObjectIncarnationRef::from_object(object);
+    if found != command.object {
+        return Err(ResolvedZoneChangeReplayInvariantError::OccurrenceMismatch {
+            expected: command.object,
+            found,
+        });
+    }
+    if object.owner != command.owner {
+        return Err(ResolvedZoneChangeReplayInvariantError::OwnerMismatch {
+            expected: command.owner,
+            found: object.owner,
+        });
+    }
+    if object.zone != command.from {
+        return Err(ResolvedZoneChangeReplayInvariantError::SourceZoneMismatch {
+            expected: command.from,
+            found: object.zone,
+        });
+    }
+    if command.to == Zone::Battlefield && command.entry_timestamp.is_none() {
+        return Err(ResolvedZoneChangeReplayInvariantError::MissingBattlefieldEntryTimestamp);
+    }
+    if command.to != Zone::Battlefield && command.entry_timestamp.is_some() {
+        return Err(ResolvedZoneChangeReplayInvariantError::UnexpectedNonbattlefieldTimestamp);
+    }
+    if command.turn_zone_change_index != state.zone_changes_this_turn.len() {
+        return Err(
+            ResolvedZoneChangeReplayInvariantError::TurnRecordIndexMismatch {
+                expected: command.turn_zone_change_index,
+                found: state.zone_changes_this_turn.len(),
+            },
+        );
+    }
+
+    let destination_position = destination_position_after_removal(
+        state,
+        command.object.object_id,
+        command.from,
+        command.to,
+        command.owner,
+    );
+    if destination_position != command.destination_position {
+        return Err(
+            ResolvedZoneChangeReplayInvariantError::DestinationPositionMismatch {
+                expected: command.destination_position,
+                found: destination_position,
+            },
+        );
+    }
+
+    remove_from_zone(state, command.object.object_id, command.from, command.owner);
+    add_to_zone(state, command.object.object_id, command.to, command.owner);
+
+    let object = state
+        .objects
+        .get_mut(&command.object.object_id)
+        .expect("validated zone command object remains live");
+    object.zone = command.to;
+    if command.to == Zone::Battlefield {
+        object.reset_for_battlefield_entry(
+            turn_number,
+            command
+                .entry_timestamp
+                .expect("validated battlefield command has a timestamp"),
+        );
+    } else {
+        object.incarnation = command.resulting_incarnation;
+    }
+    if object.incarnation != command.resulting_incarnation {
+        return Err(
+            ResolvedZoneChangeReplayInvariantError::ResultingIncarnationMismatch {
+                expected: command.resulting_incarnation,
+                found: object.incarnation,
+            },
+        );
+    }
+
+    let turn_zone_change_index =
+        super::restrictions::record_zone_change(state, command.zone_change_record.clone());
+    if turn_zone_change_index != command.turn_zone_change_index {
+        return Err(
+            ResolvedZoneChangeReplayInvariantError::TurnRecordIndexMismatch {
+                expected: command.turn_zone_change_index,
+                found: turn_zone_change_index,
+            },
+        );
+    }
+    Ok(())
 }
 
 /// CR 400.7: Move an object to a new zone. An object that moves to a new zone becomes a new object.
@@ -795,6 +1041,13 @@ pub fn move_to_zone(
     // with" cards here, before CR 400.7 cleanup prunes `TrackedBySource`.
     zone_change_record.linked_exile_snapshot =
         capture_linked_exile_snapshot(state, object_id, from);
+    zone_change_record.sync_trigger_source_exiled_cards(
+        state
+            .cards_exiled_with_source_this_turn
+            .get(&object_id)
+            .cloned()
+            .unwrap_or_default(),
+    );
     // CR 607.2b + CR 603.10e: Persist the linked-exile snapshot as last-known
     // information so a self-sacrifice ability that refers to "cards exiled with
     // this permanent" (Rod of Absorption) still resolves correctly after its own
@@ -817,6 +1070,7 @@ pub fn move_to_zone(
     } else {
         capture_combat_status(state, object_id)
     };
+    zone_change_record.sync_trigger_source_context();
 
     sever_battlefield_attachment_graph_on_exit(state, object_id, &unattached_from);
 
@@ -837,17 +1091,60 @@ pub fn move_to_zone(
         zone_change_record.attachments.clone(),
     );
 
-    remove_from_zone(state, object_id, from, owner);
-    if redirect_attraction_to_command {
-        // CR 717.6a: Cards redirected this way are kept in the command-zone
-        // junkyard pile, separate from the Attraction deck.
-        state
-            .objects
-            .get_mut(&object_id)
-            .expect("object exists")
-            .in_attraction_deck = false;
-    }
-    add_to_zone(state, object_id, to, owner);
+    // Command-zone routes select between the ordinary command container and
+    // the owner-specific Attraction/Contraption containers. Stack routes have
+    // their `StackEntry` insertion/removal owned by the casting and resolution
+    // paths, not by `add_to_zone`. Those special containers are outside this
+    // first cut, so preserve their existing raw transition rather than encoding
+    // a partial container identity in this generic command.
+    let (pre_bump_incarnation, new_incarnation, transition_recorded) =
+        if matches!(from, Zone::Command | Zone::Stack) || matches!(to, Zone::Command | Zone::Stack)
+        {
+            remove_from_zone(state, object_id, from, owner);
+            if redirect_attraction_to_command {
+                // CR 717.6a: Cards redirected this way are kept in the command-zone
+                // junkyard pile, separate from the Attraction deck.
+                state
+                    .objects
+                    .get_mut(&object_id)
+                    .expect("object exists")
+                    .in_attraction_deck = false;
+            }
+            add_to_zone(state, object_id, to, owner);
+
+            // CR 613.7d: An object receives a timestamp when it enters a zone.
+            let entry_timestamp = (to == Zone::Battlefield).then(|| state.next_timestamp());
+            let obj_mut = state.objects.get_mut(&object_id).expect("object exists");
+            let pre_bump_incarnation = obj_mut.incarnation;
+            obj_mut.zone = to;
+            if to == Zone::Battlefield {
+                obj_mut.reset_for_battlefield_entry(
+                    state.turn_number,
+                    entry_timestamp.expect("battlefield entry draws a timestamp"),
+                );
+                zone_change_record.entered_incarnation = Some(obj_mut.incarnation);
+            } else if from != to {
+                // CR 400.7: a move between zones creates a new object.
+                obj_mut.bump_incarnation();
+            }
+            (pre_bump_incarnation, obj_mut.incarnation, false)
+        } else {
+            let resolved_zone_change = resolve_and_apply_zone_change(
+                state,
+                object_id,
+                from,
+                to,
+                owner,
+                zone_change_record,
+            )
+            .expect("ordinary zone transition must install its resolved core");
+            zone_change_record = resolved_zone_change.zone_change_record;
+            (
+                resolved_zone_change.object.incarnation,
+                resolved_zone_change.resulting_incarnation,
+                true,
+            )
+        };
 
     // CR 603.6c: Drop the leaving permanent from the TriggerIndex. The
     // leaves-battlefield last-known-information scan in
@@ -859,37 +1156,6 @@ pub fn move_to_zone(
         state.trigger_index.remove(object_id);
     }
 
-    // CR 613.7d: an object receives a timestamp when it enters a zone. Stage 2
-    // stamps battlefield entries only, so only draw a timestamp on a battlefield
-    // entry — a graveyard/exile/hand/library move must not burn one. Computed
-    // before the `get_mut` borrow because `next_timestamp` takes `&mut self` over
-    // the whole GameState.
-    let entry_timestamp = (to == Zone::Battlefield).then(|| state.next_timestamp());
-
-    let obj_mut = state.objects.get_mut(&object_id).unwrap();
-    // CR 400.7j: capture the pre-bump incarnation BEFORE any bump (the battlefield
-    // arm bumps inside `reset_for_battlefield_entry`, which has no state access) so
-    // the resolution re-latch can chain the source across a self-move.
-    let pre_bump_incarnation = obj_mut.incarnation;
-    obj_mut.zone = to;
-
-    if to == Zone::Battlefield {
-        obj_mut.reset_for_battlefield_entry(
-            state.turn_number,
-            entry_timestamp.expect("battlefield entry draws a timestamp"),
-        );
-        // CR 400.7: capture the entrant's incarnation AFTER the battlefield-entry
-        // bump so a later leave + re-entry (same ObjectId, higher incarnation) is
-        // distinguishable from the original entrant when an ETB intervening-if is
-        // rechecked at resolution (CR 603.4 + CR 608.2h).
-        zone_change_record.entered_incarnation = Some(obj_mut.incarnation);
-    } else if from != to {
-        // CR 400.7: a move FROM one zone TO another makes a new object. The
-        // `from != to` guard generalizes the BF→BF no-op guard (upstream) to every
-        // same-zone case (Exile→Exile, GY→GY) that can reach this else-arm.
-        obj_mut.bump_incarnation();
-    }
-    let new_incarnation = obj_mut.incarnation;
     if new_incarnation != pre_bump_incarnation {
         record_resolution_source_relatch(state, object_id, pre_bump_incarnation, new_incarnation);
     }
@@ -984,9 +1250,11 @@ pub fn move_to_zone(
         super::trigger_index::reindex_object_triggers(state, object_id);
     }
 
-    let turn_zone_change_index =
-        super::restrictions::record_zone_change(state, zone_change_record.clone());
-    zone_change_record.turn_zone_change_index = turn_zone_change_index;
+    if !transition_recorded {
+        let turn_zone_change_index =
+            super::restrictions::record_zone_change(state, zone_change_record.clone());
+        zone_change_record.turn_zone_change_index = turn_zone_change_index;
+    }
 
     if let Some(old_target) = unattached_from {
         events.push(GameEvent::Unattached {
@@ -1125,7 +1393,7 @@ pub fn stamp_simultaneous_from_slice(state: &GameState, slice: &mut [GameEvent])
     mark_simultaneous_departures(slice, &departed);
 }
 
-fn capture_linked_exile_snapshot(
+pub(crate) fn capture_linked_exile_snapshot(
     state: &GameState,
     source_id: ObjectId,
     from: Zone,
@@ -1195,7 +1463,10 @@ fn sever_battlefield_attachment_graph_on_exit(
     }
 }
 
-fn capture_combat_status(state: &GameState, object_id: ObjectId) -> ZoneChangeCombatStatus {
+pub(crate) fn capture_combat_status(
+    state: &GameState,
+    object_id: ObjectId,
+) -> ZoneChangeCombatStatus {
     let Some(combat) = &state.combat else {
         return ZoneChangeCombatStatus::default();
     };
@@ -1253,6 +1524,23 @@ pub fn move_to_library_position(
     move_to_library_at_index(state, object_id, index, events);
 }
 
+/// Digital-only Alchemy placement (no CR entry): resolve a uniformly-random
+/// 0-based insertion index for `LibraryPosition::RandomWithinTop { n }`. A card
+/// slotted "into the top `top_n` cards of a library at random" lands among the
+/// top `top_n` positions; with `slots_after_insert` total positions available
+/// (the destination library's length *including* the card being placed), the
+/// reachable range is `0..min(top_n, slots_after_insert)`. Consumes exactly one
+/// RNG draw. Single authority for the random-top-N index so the conjure resolver
+/// and the zone pipeline compute it identically.
+pub(crate) fn random_top_slot_index(
+    rng: &mut impl rand::Rng,
+    top_n: usize,
+    slots_after_insert: usize,
+) -> usize {
+    let upper = top_n.min(slots_after_insert).max(1);
+    rng.random_range(0..upper)
+}
+
 /// Move an object to a specific index in its owner's library.
 /// `index = Some(0)` = top, `index = None` = bottom, `index = Some(n)` = nth position.
 /// Handles full cross-zone cleanup (LKI, transform revert, layer pruning, restrictions)
@@ -1286,6 +1574,14 @@ pub fn move_to_library_at_index(
     // CR 603.10a + CR 603.6e: Capture attachment snapshot before SBA can detach.
     zone_change_record.attachments = capture_attachment_snapshot(state, obj);
     zone_change_record.combat_status = capture_combat_status(state, object_id);
+    zone_change_record.sync_trigger_source_exiled_cards(
+        state
+            .cards_exiled_with_source_this_turn
+            .get(&object_id)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    zone_change_record.sync_trigger_source_context();
 
     sever_battlefield_attachment_graph_on_exit(state, object_id, &unattached_from);
 
@@ -1552,6 +1848,7 @@ pub(crate) fn apply_battlefield_entry_controller_override(
         .find(|record| record.object_id == object_id && record.to_zone == Zone::Battlefield)
     {
         record.controller = controller;
+        record.sync_trigger_source_context();
     }
 
     if let Some(record) = state
@@ -1574,6 +1871,7 @@ pub(crate) fn apply_battlefield_entry_controller_override(
         )
     }) {
         record.controller = controller;
+        record.sync_trigger_source_context();
     }
 }
 
@@ -2404,18 +2702,25 @@ mod tests {
         move_to_zone(&mut state, id, Zone::Graveyard, &mut events);
 
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0],
-            GameEvent::ZoneChanged {
-                object_id: id,
-                from: Some(Zone::Hand),
-                to: Zone::Graveyard,
-                record: Box::new(ZoneChangeRecord {
-                    name: "Card".to_string(),
-                    ..ZoneChangeRecord::test_minimal(id, Some(Zone::Hand), Zone::Graveyard)
-                }),
-            }
-        );
+        let GameEvent::ZoneChanged {
+            object_id,
+            from,
+            to,
+            record,
+        } = &events[0]
+        else {
+            panic!("move_to_zone must emit ZoneChanged");
+        };
+        assert_eq!(*object_id, id);
+        assert_eq!(*from, Some(Zone::Hand));
+        assert_eq!(*to, Zone::Graveyard);
+        assert_eq!(record.name, "Card");
+        let context = record
+            .trigger_source_context()
+            .expect("real zone-change events carry their source context");
+        assert_eq!(context.identity.reference.object_id, id);
+        assert_eq!(context.identity.expected_zone, Zone::Hand);
+        assert_eq!(context.card_id, CardId(1));
     }
 
     #[test]

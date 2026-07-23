@@ -275,16 +275,14 @@ fn merged_copiable_values(
         triggers.extend(trig.iter().cloned());
         statics.extend(stat.iter().cloned());
         // CR 707.2 / CR 611.2b: merged copiable values are printed/defining
-        // characteristics, not the runtime "for as long as you control ~" locks
-        // another permanent installed on a component. Those gated defs live in
-        // base only for layer-reset survival; exclude them from this
-        // copiable-values surface (mirrors `intrinsic_copiable_values`) so a
-        // merged permanent does not inherit a component host's runtime lock.
+        // characteristics, not runtime locks or target-bound die-exile riders
+        // another effect installed on a component. Those defs live in base only
+        // for layer-reset survival; exclude them from this copiable-values
+        // surface (mirrors `intrinsic_copiable_values`) so a merged permanent
+        // does not inherit a component host's runtime replacement.
         replacements.extend(
             repl.iter()
-                .filter(|def| {
-                    !crate::game::printed_cards::is_runtime_control_gated_replacement(def)
-                })
+                .filter(|def| !crate::game::printed_cards::is_runtime_non_copiable_replacement(def))
                 .cloned(),
         );
         for kw in kws {
@@ -697,9 +695,9 @@ pub(crate) fn put_component_into_zone(
 }
 
 /// CR 702.140c + CR 730.2a: Resolve the controller's top/bottom choice for a
-/// paused mutating creature spell. Consumes `state.pending_mutate_merge`, performs
-/// the merge, and returns the engine to priority. Errors if no merge is pending or
-/// the acting player is not the spell's controller.
+/// paused mutating creature spell. Consumes the active `MutateMerge` frame,
+/// performs the merge, and returns the engine to priority. Errors if no merge is
+/// pending or the acting player is not the spell's controller.
 pub fn handle_mutate_merge_choice(
     state: &mut GameState,
     player: crate::types::player::PlayerId,
@@ -709,16 +707,18 @@ pub fn handle_mutate_merge_choice(
     use crate::game::engine::EngineError;
 
     let pending = state
-        .pending_mutate_merge
-        .take()
+        .active_mutate_merge_frame()
         .ok_or_else(|| EngineError::ActionNotAllowed("No mutate merge is pending".to_string()))?;
     if pending.controller != player {
-        // Restore the pending state so the correct player can still act.
-        state.pending_mutate_merge = Some(pending);
         return Err(EngineError::ActionNotAllowed(
             "Only the mutate spell's controller may choose the merge side".to_string(),
         ));
     }
+
+    let pending = state
+        .take_active_mutate_merge_frame()
+        .map_err(|error| EngineError::ActionNotAllowed(error.to_string()))?
+        .expect("active mutate-merge frame was checked before consuming it");
 
     merge_object_onto(state, pending.merging_id, pending.target_id, side, events);
 
@@ -734,9 +734,12 @@ mod tests {
     use super::*;
     use crate::game::layers::evaluate_layers;
     use crate::game::morph::apply_face_down_creature_characteristics;
+    use crate::game::printed_cards::is_runtime_target_die_exile_replacement;
     use crate::game::zones::create_object;
+    use crate::parser::oracle::parse_oracle_text;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, Effect, FaceDownProfile, QuantityExpr, TargetFilter,
+        AbilityDefinition, AbilityKind, Effect, FaceDownProfile, QuantityExpr,
+        ReplacementDefinition, TargetFilter,
     };
     use crate::types::card_type::{CardType, CoreType};
     use crate::types::identifiers::CardId;
@@ -910,6 +913,47 @@ mod tests {
         assert!(
             values2.keywords.contains(&Keyword::Trample), // allow-raw-authority: merged_copiable_values snapshot struct, not a GameObject
             "a face-up non-topmost component's keywords are unioned (CR 702.140e)"
+        );
+    }
+
+    #[test]
+    fn merged_copiable_values_exclude_a_target_bound_die_exile_rider() {
+        let mut state = GameState::new_two_player(42);
+        let player = PlayerId(0);
+        let top = make_creature(&mut state, 1, player, "Top", 3, 3);
+        let marked = make_creature(&mut state, 2, player, "Marked", 2, 4);
+        let parsed = parse_oracle_text(
+            "Touch of the Void deals 3 damage to any target. If a creature dealt damage this way would die this turn, exile it instead.",
+            "Touch of the Void",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        );
+        let mut cursor = Some(&parsed.abilities[0]);
+        let die_exile = loop {
+            let def = cursor.expect("the parsed spell must contain a die-exile rider");
+            if let Effect::AddTargetReplacement { replacement, .. } = def.effect.as_ref() {
+                break replacement.as_ref().clone();
+            }
+            cursor = def.sub_ability.as_deref();
+        };
+        assert!(is_runtime_target_die_exile_replacement(&die_exile));
+        let printed =
+            ReplacementDefinition::new(crate::types::replacements::ReplacementEvent::Moved)
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield);
+        let obj = state.objects.get_mut(&marked).unwrap();
+        Arc::make_mut(&mut obj.base_replacement_definitions)
+            .extend([die_exile.clone(), printed.clone()]);
+
+        let (values, _, _, _) = merged_copiable_values(&state, &[top, marked], top).unwrap();
+        assert!(
+            !values.replacement_definitions.contains(&die_exile),
+            "CR 707.2: merge/mutate must not copy a target-bound turn-long die-exile rider"
+        );
+        assert!(
+            values.replacement_definitions.contains(&printed),
+            "CR 707.2: genuine printed replacements remain copiable"
         );
     }
 }

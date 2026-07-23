@@ -465,7 +465,17 @@ pub(crate) fn prepare_effective_search(
                 .map(ObjectIncarnationRef::from_object)
         })
         .collect();
-    let learned_audience = crate::game::turn_control::decision_audience_for_player(state, searcher);
+    // CR 723.1a + CR 723.5: choose the newest applicable player-control effect
+    // before exposing hidden information, then use the same snapshotted
+    // controller for both audience and decision authority.
+    let effective_library_owner = searched_library.then_some(searched_zone_owner);
+    let controller = crate::game::turn_control::library_search_decision_controller(
+        state,
+        searcher,
+        effective_library_owner,
+    );
+    let learned_audience =
+        crate::game::turn_control::decision_audience_for_controller(searcher, controller);
     let has_hidden_view = !looked_at.is_empty();
     let active_search = has_hidden_view
         .then(|| {
@@ -484,10 +494,9 @@ pub(crate) fn prepare_effective_search(
         cards: viewed_cards,
         audience: learned_audience,
     });
-    let controller = crate::game::turn_control::authorized_submitter_for_player(state, searcher);
     Ok(Some(PreparedEffectiveSearch {
         searcher,
-        effective_library_owner: searched_library.then_some(searched_zone_owner),
+        effective_library_owner,
         candidates,
         filter: filter.clone(),
         count,
@@ -1655,8 +1664,8 @@ mod tests {
 
         assert_eq!(state.objects[&plains].zone, Zone::Battlefield);
         assert!(state.objects[&plains].tapped);
-        assert!(state.pending_continuation.is_none());
-        assert!(state.pending_repeat_iteration.is_none());
+        assert!(state.active_ability_continuation().is_none());
+        assert!(state.active_repeat_for().is_none());
         assert!(state.active_library_searches.is_empty());
         assert!(state.active_search_decision_controls.is_empty());
         assert!(all_events.iter().any(|event| matches!(

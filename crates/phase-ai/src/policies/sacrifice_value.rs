@@ -23,7 +23,7 @@ impl SacrificeValuePolicy {
         let WaitingFor::OptionalEffectChoice { source_id, .. } = &ctx.decision.waiting_for else {
             return None;
         };
-        let ability = ctx.state.pending_optional_effect.as_deref()?;
+        let ability = ctx.state.active_optional_effect_frame()?.ability.as_ref();
         if ability.source_id != *source_id || ability.controller != ctx.ai_player {
             return None;
         }
@@ -240,7 +240,11 @@ mod tests {
             source,
             PlayerId(0),
         )));
-        state.pending_optional_effect = Some(Box::new(sacrifice));
+        state.push_optional_effect_frame(engine::types::OptionalEffectFrame {
+            ability: Box::new(sacrifice),
+            trigger_event: None,
+            trigger_match_count: None,
+        });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: source,
@@ -257,10 +261,7 @@ mod tests {
         };
         let candidate = CandidateAction {
             action: GameAction::DecideOptionalEffect { accept },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Utility,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Utility),
         };
         let context = crate::context::AiContext::empty(&config.weights);
         let ctx = PolicyContext {
@@ -319,7 +320,10 @@ mod tests {
     fn optional_source_preservation_guard_does_not_block_explicit_self_sacrifice() {
         let (mut state, _) = optional_sacrifice_for_card_state();
         let config = create_config(AiDifficulty::VeryEasy, Platform::Native);
-        let ability = state.pending_optional_effect.as_mut().unwrap();
+        let ability = &mut state
+            .active_optional_effect_frame_mut()
+            .expect("fixture parks an optional-effect frame")
+            .ability;
         let Effect::Sacrifice { target, .. } = &mut ability.effect else {
             panic!("fixture must contain a sacrifice effect");
         };
@@ -404,10 +408,7 @@ mod tests {
             action: GameAction::SelectCards {
                 cards: vec![creature],
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Selection,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Selection),
         };
         let creature_ctx = PolicyContext {
             state: &state,
@@ -424,10 +425,7 @@ mod tests {
         // Score sacrificing the token
         let token_candidate = CandidateAction {
             action: GameAction::SelectCards { cards: vec![token] },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Selection,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Selection),
         };
         let token_ctx = PolicyContext {
             state: &state,
@@ -488,10 +486,7 @@ mod tests {
         };
         let candidate = CandidateAction {
             action: GameAction::SelectCards { cards: vec![big] },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Selection,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Selection),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -546,10 +541,7 @@ mod tests {
             action: GameAction::SelectCards {
                 cards: vec![ObjectId(1)],
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Selection,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Selection),
         };
         let ctx = PolicyContext {
             state: &state,
