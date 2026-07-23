@@ -6228,7 +6228,7 @@ fn apply_continuous_effect_filtered(
                 // Ward/Annihilator each apply independently). `evaluate_layers` resets
                 // `obj.keywords = obj.base_keywords.clone()` each pass, so this never
                 // accumulates unbounded across re-evaluations.
-                if resolved_keyword.sums_across_instances() {
+                if resolved_keyword.instances_must_coexist() {
                     obj.keywords.push(resolved_keyword.clone());
                 } else if resolved_keyword.overrides_same_kind_on_grant() {
                     // CR 613.7: this grant is a single-authoritative-value keyword — the
@@ -6325,7 +6325,7 @@ fn apply_continuous_effect_filtered(
                 for (keyword_output_index, kw) in add_chosen_keywords.iter().enumerate() {
                     // CR 702.164b: summing keywords (Toxic) accumulate rather
                     // than dedup, mirroring the plain `AddKeyword` arm above.
-                    if kw.sums_across_instances() || !obj.keywords.contains(kw) {
+                    if kw.instances_must_coexist() || !obj.keywords.contains(kw) {
                         obj.keywords.push(kw.clone());
                     }
                     for (companion_index, trigger) in KeywordTriggerInstaller::triggers_for(kw)

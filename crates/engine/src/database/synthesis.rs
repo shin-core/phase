@@ -7231,7 +7231,8 @@ pub fn synthesize_sunburst(face: &mut CardFace) {
 /// The single authority for building a Sunburst replacement, shared by:
 /// - build-time synthesis (`synthesize_sunburst`) for PRINTED Sunburst, and
 /// - the runtime granted-keyword replacement path
-///   (`granted_sunburst_replacements` → `find_applicable_replacements`), which
+///   (`granted_sunburst_instances` → `granted_etb_replacement_definitions` →
+///   `find_applicable_replacements`), which
 ///   surfaces one virtual candidate per *granted* Sunburst instance so a grant
 ///   ("that spell gains sunburst": Solar Array / Lux Artillery) also places
 ///   counters at entry (#5337).

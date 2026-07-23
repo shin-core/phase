@@ -314,22 +314,24 @@ fn is_granted_etb_keyword_replacement(rid: ReplacementId) -> bool {
 fn granted_keyword_etb_instances(
     state: &GameState,
     object_id: ObjectId,
+    live_keywords: &[crate::types::keywords::Keyword],
     predicate: impl Fn(&crate::types::keywords::Keyword) -> bool,
 ) -> usize {
     let Some(obj) = state.objects.get(&object_id) else {
         return 0;
     };
-    let live = crate::game::off_zone_characteristics::effective_off_zone_keywords(state, object_id)
-        .iter()
-        .filter(|kw| predicate(kw))
-        .count();
+    let live = live_keywords.iter().filter(|kw| predicate(kw)).count();
     let base = obj.base_keywords.iter().filter(|kw| predicate(kw)).count();
     live.saturating_sub(base)
 }
 
 /// CR 702.44d: number of GRANTED sunburst instances (parameter-less).
-fn granted_sunburst_instances(state: &GameState, object_id: ObjectId) -> usize {
-    granted_keyword_etb_instances(state, object_id, |kw| {
+fn granted_sunburst_instances(
+    state: &GameState,
+    object_id: ObjectId,
+    live_keywords: &[crate::types::keywords::Keyword],
+) -> usize {
+    granted_keyword_etb_instances(state, object_id, live_keywords, |kw| {
         matches!(kw, crate::types::keywords::Keyword::Sunburst)
     })
 }
@@ -342,12 +344,13 @@ fn granted_sunburst_instances(state: &GameState, object_id: ObjectId) -> usize {
 fn granted_bloodthirst_instances(
     state: &GameState,
     object_id: ObjectId,
+    live_keywords: &[crate::types::keywords::Keyword],
 ) -> Vec<crate::types::keywords::BloodthirstValue> {
     use crate::types::keywords::Keyword;
     let Some(obj) = state.objects.get(&object_id) else {
         return Vec::new();
     };
-    let live = crate::game::off_zone_characteristics::effective_off_zone_keywords(state, object_id);
+    let live = live_keywords;
     let distinct_values: Vec<_> = live
         .iter()
         .filter_map(|kw| match kw {
@@ -393,13 +396,14 @@ fn granted_etb_keyword_candidate_applies(
     object_id: ObjectId,
     kw: GrantedEtbKeyword,
     event: &ProposedEvent,
+    live_keywords: &[crate::types::keywords::Keyword],
 ) -> bool {
     let controller = state
         .objects
         .get(&object_id)
         .map(replacement_source_player)
         .unwrap_or(state.active_player);
-    granted_etb_replacement_definitions(state, object_id, kw)
+    granted_etb_replacement_definitions(state, object_id, kw, live_keywords)
         .iter()
         .any(|definition| match &definition.condition {
             Some(cond) => evaluate_replacement_condition(
@@ -527,33 +531,49 @@ fn apply_compleated_replacement(
 /// would (CR 702.44d / CR 702.54c: each instance works separately).
 ///
 /// - Sunburst: N identical copies of `sunburst_replacement_definition`, branching
-///   the counter type on the entering object's CURRENT core types (CR 702.44a).
+///   the counter type on the entering object's PRINTED core types (CR 702.44a).
 /// - Bloodthirst: one `bloodthirst_replacement_definition(value)` per granted
 ///   instance, each carrying its own `condition` (CR 702.54a fixed-N is gated on
 ///   an opponent having been dealt damage this turn).
+///
+/// `live_keywords` is the already-resolved off-zone keyword list for `object_id`
+/// (`effective_off_zone_keywords`). It is threaded in rather than re-derived per
+/// keyword family because that resolution runs a whole-game continuous-effect
+/// collect, and this function sits on the `find_applicable_replacements` hot path.
 fn granted_etb_replacement_definitions(
     state: &GameState,
     object_id: ObjectId,
     kw: GrantedEtbKeyword,
+    live_keywords: &[crate::types::keywords::Keyword],
 ) -> Vec<ReplacementDefinition> {
     match kw {
         GrantedEtbKeyword::Sunburst => {
-            let instances = granted_sunburst_instances(state, object_id);
-            // CR 702.44a: branch on the entering object's current core types.
+            let instances = granted_sunburst_instances(state, object_id, live_keywords);
+            // CR 702.44a: sunburst branches on whether the object is entering as a
+            // creature "ignoring any type-changing effects that would affect it" —
+            // i.e. on its PRINTED (characteristic-defining) core types. `card_types`
+            // is the LIVE layer result and type-changing effects do reach stack
+            // objects (CR 613.1d, via `remote_type_layer_recipients`), so reading it
+            // here would honor exactly the effects the rule says to ignore.
+            // `base_card_types` is seeded from the same `card_face.card_type` the
+            // printed synthesizer branches on (`synthesize_sunburst`), keeping the
+            // granted and printed paths identical.
             let counter_type = state
                 .objects
                 .get(&object_id)
-                .filter(|obj| obj.card_types.core_types.contains(&CoreType::Creature))
+                .filter(|obj| obj.base_card_types.core_types.contains(&CoreType::Creature))
                 .map(|_| CounterType::Plus1Plus1)
                 .unwrap_or_else(|| CounterType::Generic("charge".to_string()));
             let definition =
                 crate::database::synthesis::sunburst_replacement_definition(&counter_type);
             std::iter::repeat_n(definition, instances).collect()
         }
-        GrantedEtbKeyword::Bloodthirst => granted_bloodthirst_instances(state, object_id)
-            .iter()
-            .map(crate::database::synthesis::bloodthirst_replacement_definition)
-            .collect(),
+        GrantedEtbKeyword::Bloodthirst => {
+            granted_bloodthirst_instances(state, object_id, live_keywords)
+                .iter()
+                .map(crate::database::synthesis::bloodthirst_replacement_definition)
+                .collect()
+        }
     }
 }
 
@@ -597,7 +617,9 @@ fn apply_granted_keyword_etb_replacement(
         return event;
     }
 
-    let definitions = granted_etb_replacement_definitions(state, rid.source, kw);
+    let live_keywords =
+        crate::game::off_zone_characteristics::effective_off_zone_keywords(state, rid.source);
+    let definitions = granted_etb_replacement_definitions(state, rid.source, kw, &live_keywords);
     if definitions.is_empty() {
         return event;
     }
@@ -6774,11 +6796,26 @@ pub fn find_applicable_replacements(
         ..
     } = event
     {
+        // Hot path (`find_applicable_replacements` runs per proposed event, and
+        // AI search clones/replays states constantly): test the CHEAP term first.
+        // `already_applied` is a set lookup, whereas the granted-instance query
+        // resolves the object's live off-zone keyword list — a whole-game
+        // continuous-effect collect plus ordering and per-effect filter
+        // evaluation. That resolution is also hoisted out of the family loop and
+        // computed at most ONCE (lazily, so an all-applied event pays nothing),
+        // then shared by every family instead of being re-swept per family.
+        let mut live_keywords: Option<Vec<crate::types::keywords::Keyword>> = None;
         for kw in [GrantedEtbKeyword::Sunburst, GrantedEtbKeyword::Bloodthirst] {
             let rid = granted_etb_keyword_replacement_id(*object_id, kw);
-            if granted_etb_keyword_candidate_applies(state, *object_id, kw, event)
-                && !event.already_applied(&rid)
-            {
+            if event.already_applied(&rid) {
+                continue;
+            }
+            let live = live_keywords.get_or_insert_with(|| {
+                crate::game::off_zone_characteristics::effective_off_zone_keywords(
+                    state, *object_id,
+                )
+            });
+            if granted_etb_keyword_candidate_applies(state, *object_id, kw, event, live) {
                 candidates.push(rid);
             }
         }

@@ -222,6 +222,93 @@ fn solar_array_grants_sunburst_noncreature_two_colors_enters_with_two_charge() {
     assert_eq!(outcome.zone_of(spell), Zone::Battlefield);
 }
 
+/// CR 702.44a revert-canary for the PRINTED-vs-LIVE core-type branch.
+///
+/// Sunburst reads "if this object is entering as a creature, IGNORING ANY
+/// TYPE-CHANGING EFFECTS that would affect it". This spell is a PRINTED
+/// noncreature artifact whose LIVE card types include Creature while it is on the
+/// stack — exactly the state a type-changing effect leaves behind (Layer-6 type
+/// effects do reach off-battlefield objects via `remote_type_layer_recipients`,
+/// and the layer pass re-seeds live characteristics only for battlefield objects,
+/// so the divergence survives to the entry-replacement pipeline).
+///
+/// Branching on the LIVE types yields +1/+1 counters; the rule mandates the
+/// PRINTED types, so charge counters are correct. Every other fixture in this
+/// file sets `base_card_types == card_types`, so this is the only test that
+/// exercises the divergent arm — without it the branch is unverified.
+#[test]
+fn granted_sunburst_ignores_type_changing_effect_and_branches_on_printed_types() {
+    let mut scenario = GameScenario::new_n_player(2, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let solar = scenario
+        .add_creature_from_oracle(P0, "Solar Array", 0, 0, SOLAR_ARRAY_ORACLE)
+        .id();
+
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Test Relic", false, "")
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White, ManaCostShard::Green],
+            generic: 0,
+        })
+        .id();
+
+    let mut runner = scenario.build();
+    make_artifact(&mut runner, solar);
+    {
+        let obj = runner.state_mut().objects.get_mut(&spell).unwrap();
+        // PRINTED (characteristic-defining): a noncreature artifact.
+        obj.base_card_types.core_types = vec![CoreType::Artifact];
+        // LIVE: a type-changing effect has made it an artifact creature. CR 702.44a
+        // orders sunburst to ignore precisely this.
+        obj.card_types.core_types = vec![CoreType::Artifact, CoreType::Creature];
+    }
+
+    // Non-vacuity guard: the printed/live divergence this test turns on is really
+    // present at cast time. If a future change re-seeds stack objects from their
+    // printed types, this fires instead of the test silently going green.
+    {
+        let obj = runner.state().objects.get(&spell).unwrap();
+        assert!(
+            obj.card_types.core_types.contains(&CoreType::Creature),
+            "fixture precondition: the LIVE types must include Creature"
+        );
+        assert!(
+            !obj.base_card_types.core_types.contains(&CoreType::Creature),
+            "fixture precondition: the PRINTED types must NOT include Creature"
+        );
+    }
+
+    arm_solar_array(&mut runner, solar);
+    add_mana(&mut runner, ManaType::White, 1);
+    add_mana(&mut runner, ManaType::Green, 1);
+
+    let outcome = runner.cast(spell).resolve();
+    let runner_after = GameRunner::from_state(outcome.state().clone());
+
+    // Reach-guard: the spell actually entered, so the counter assertions below
+    // cannot pass vacuously on a spell that never resolved.
+    assert_eq!(
+        outcome.zone_of(spell),
+        Zone::Battlefield,
+        "the granted spell must have resolved onto the battlefield"
+    );
+    // REVERT-FAILING: branching on the live `card_types` makes this 0 (and the
+    // +1/+1 assertion below 2).
+    assert_eq!(
+        counters_of(&runner_after, spell, &charge()),
+        2,
+        "CR 702.44a: sunburst ignores type-changing effects, so a PRINTED noncreature \
+         artifact must enter with charge counters even while a type-changing effect \
+         makes it a creature"
+    );
+    assert_eq!(
+        counters_of(&runner_after, spell, &CounterType::Plus1Plus1),
+        0,
+        "CR 702.44a: the LIVE creature type must not redirect sunburst to +1/+1 counters"
+    );
+}
+
 /// Lux Artillery grants sunburst via a NON-delayed trigger ("it gains
 /// sunburst"). Revert-canary for gap 2 alone (its trigger already lowers to
 /// `TriggeringSource`, so gap 1's parser lift is not exercised).

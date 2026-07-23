@@ -1746,7 +1746,7 @@ impl Keyword {
     /// keyword merge (`casting.rs` `upsert_keyword_by_kind`/`merge_spell_keyword` —
     /// Toxic is inert at cast time) and the layers `AddDynamicKeyword` arm
     /// (`DynamicKeywordKind` is only Annihilator/Modular, never Toxic/Sunburst).
-    pub fn sums_across_instances(&self) -> bool {
+    pub fn instances_must_coexist(&self) -> bool {
         matches!(
             self,
             Keyword::Toxic(_) | Keyword::Sunburst | Keyword::Bloodthirst(_)
@@ -1762,7 +1762,7 @@ impl Keyword {
     /// (CR 702.122/702.171, vehicle/mount crew-power) and Enchant (CR 702.5a,
     /// an Aura's current legal-attachment filter, reachable via
     /// `AddKeyword{Enchant(_)}` from `install_aura_continuous_effect`) are the
-    /// currently known members. Contrast `sums_across_instances` (Toxic, which
+    /// currently known members. Contrast `instances_must_coexist` (Toxic, which
     /// accumulates) and the default (Protection/Ward/Annihilator, which coexist
     /// as separate instances per CR 702.16g).
     pub fn overrides_same_kind_on_grant(&self) -> bool {
