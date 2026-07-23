@@ -4735,24 +4735,7 @@ fn clear_post_collection_transients(state: &mut GameState) {
             // identity via reanimation.
             obj.clear_cast_payment_stamps();
         }
-        // CR 601.2h + CR 702.44b: `mana_spent_to_cast` / `colors_spent_to_cast`
-        // are live cast provenance for a spell still on the STACK. A spell's own
-        // as-enters ability that reads "mana spent to cast it" (sunburst,
-        // CR 702.44a, and the `ManaSpentToCast` quantity family) fires when the
-        // spell resolves onto the battlefield — which, for a GRANTED sunburst
-        // (Solar Array / Lux Artillery: "that spell/it gains sunburst"), happens
-        // AFTER the intervening cast-triggered grant resolves and this clear runs.
-        // Wiping it for stack objects erased the color count before the granted
-        // spell entered, so it placed zero counters (#5337). Preserve it while the
-        // object is on the stack, exactly as `cast_from_zone` is preserved above.
-        // Battlefield objects are still cleared here (the color breakdown is not a
-        // battlefield-resident fact; `mana_spent_to_cast_amount` — the historical
-        // total — is preserved elsewhere), and non-stack/non-battlefield objects
-        // (fizzled / bounced) are cleared as before.
-        if !matches!(obj.zone, Zone::Stack) {
-            obj.mana_spent_to_cast = false;
-            obj.colors_spent_to_cast = crate::types::mana::ColoredManaCount::default();
-        }
+        obj.mana_spent_to_cast = false;
     }
 }
 
