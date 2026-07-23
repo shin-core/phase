@@ -597,28 +597,25 @@ export function GameProvider({
   tRef.current = t;
 
   useEffect(() => {
-    const nativeEngineEnabled = usePreferencesStore.getState().nativeEngineEnabled;
-    const nativeAiCandidate =
-      source !== "draft"
-      && source !== "multiplayer"
-      && firstPlayer === undefined
-      && canAttemptNativeEngine(nativeEngineEnabled);
-    if (mode !== "ai" || nativeAiCandidate) return;
+    if (mode !== "ai") return;
     let applied = false;
-    const unsub = useGameStore.subscribe((state) => {
-      if (applied || !state.gameState?.command_zone?.length) return;
-      applied = true;
+    const applyCommanderAvatars = (state: ReturnType<typeof useGameStore.getState>) => {
+      if (state.gameId !== gameId || !state.gameState?.command_zone?.length) return false;
       setupCommanderAvatars(state.gameState);
+      return true;
+    };
+    const unsub = useGameStore.subscribe((state) => {
+      if (applied || !applyCommanderAvatars(state)) return;
+      applied = true;
       unsub();
     });
     const state = useGameStore.getState();
-    if (!applied && state.gameState?.command_zone?.length) {
+    if (!applied && applyCommanderAvatars(state)) {
       applied = true;
-      setupCommanderAvatars(state.gameState);
       unsub();
     }
     return unsub;
-  }, [mode, gameId, source, firstPlayer]);
+  }, [mode, gameId]);
 
   useEffect(() => {
     if (mode !== "online" && mode !== "p2p-host" && mode !== "p2p-join") return;
